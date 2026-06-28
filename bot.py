@@ -1,5 +1,5 @@
 """
-Samuga Travels Bot v1.1
+Samuga Travels Bot v1.2
 Multi-tenant speedboat booking platform for the Maldives.
 Single-file | asyncpg | Railway + PostgreSQL | Cloudinary
 """
@@ -50,6 +50,13 @@ CX_AWAIT_CONTACT="cx_await_contact"
 CX_AWAIT_PASSENGER_COUNT="cx_await_passenger_count"
 CX_COLLECTING_PASSENGERS="cx_collecting_passengers"; CX_AWAIT_PAYMENT_SLIP="cx_await_payment_slip"
 CX_BOOKING_COMPLETE="cx_booking_complete"
+# Fleet/boat states
+OP_AWAIT_BOAT_ADD_NAME="op_await_boat_add_name"
+OP_AWAIT_BOAT_ADD_CAPACITY="op_await_boat_add_capacity"
+# Schedule extra states
+OP_AWAIT_SCHEDULE_LOCATION="op_await_schedule_location"
+OP_AWAIT_SCHEDULE_DAYS="op_await_schedule_days"
+OP_AWAIT_CHANGE_NOTE="op_await_change_note"
 
 # ── DB POOL ───────────────────────────────────────────────────────────────────
 _pool = None
@@ -154,6 +161,36 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        # Fleet: multiple boats per operator
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS boats (
+                id SERIAL PRIMARY KEY,
+                operator_id INTEGER REFERENCES operators(id) ON DELETE CASCADE,
+                boat_name TEXT NOT NULL,
+                capacity INTEGER DEFAULT 0,
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        # Daily schedule overrides (boat swap, time change, cancellation)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS schedule_changes (
+                id SERIAL PRIMARY KEY,
+                schedule_id INTEGER REFERENCES schedules(id) ON DELETE CASCADE,
+                change_date DATE NOT NULL,
+                new_boat_name TEXT,
+                new_time TEXT,
+                note TEXT,
+                status TEXT DEFAULT 'active',
+                created_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        # Add columns to schedules if missing
+        await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'Jetty No. 1, Male'")
+        await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS run_days TEXT DEFAULT 'daily'")
+        await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS boat_name TEXT")
+        # Add columns to bookings if missing
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE")
     logger.info("✅ Database initialized")
 
 # ── DB HELPERS ────────────────────────────────────────────────────────────────
@@ -300,8 +337,10 @@ def main_kb(role="customer"):
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 My Profile",       callback_data="op_profile"),
              InlineKeyboardButton("🗓️ Add Schedule",     callback_data="op_schedules")],
-            [InlineKeyboardButton("📦 Pending Bookings", callback_data="op_bookings"),
-             InlineKeyboardButton("✏️ Edit Info",        callback_data="op_edit")],
+            [InlineKeyboardButton("🚤 My Fleet",         callback_data="op_fleet"),
+             InlineKeyboardButton("📦 Pending Bookings", callback_data="op_bookings")],
+            [InlineKeyboardButton("✏️ Edit Info",        callback_data="op_edit"),
+             InlineKeyboardButton("📅 Today's Schedule", callback_data="op_today")],
         ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 Search Boats",           callback_data="cx_search"),
@@ -606,6 +645,33 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "⏳ We\'ll verify your details and notify you here within 24 hours. Thank you! 🌊",
             parse_mode="Markdown")
 
+    # ── FLEET / BOAT ADD FLOW ────────────────────────────────────────────────────
+    elif state == OP_AWAIT_BOAT_ADD_NAME:
+        boat_name = text.strip()
+        await set_user_state(user.id, OP_AWAIT_BOAT_ADD_CAPACITY, {**temp, "new_boat_name": boat_name})
+        await update.message.reply_text(
+            f"🚤 *{boat_name}*\n\nHow many passengers can this boat carry?",
+            parse_mode="Markdown")
+
+    elif state == OP_AWAIT_BOAT_ADD_CAPACITY:
+        if not text.strip().isdigit():
+            await update.message.reply_text("⚠️ Enter a valid number.")
+            return
+        capacity = int(text.strip())
+        op = await get_operator(user.id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO boats (operator_id, boat_name, capacity) VALUES ($1,$2,$3)",
+                op["id"], temp.get("new_boat_name"), capacity)
+            boats = await conn.fetch("SELECT * FROM boats WHERE operator_id=$1 AND status='active'", op["id"])
+        await set_user_state(user.id, OP_IDLE, {})
+        fleet_list = "\n".join([f"  🚤 {b['boat_name']} ({b['capacity']} seats)" for b in boats])
+        await update.message.reply_text(
+            f"✅ *{temp.get('new_boat_name')}* added to your fleet!\n\n"
+            f"*Your Fleet:*\n{fleet_list}",
+            parse_mode="Markdown", reply_markup=main_kb("operator"))
+
     # ── SCHEDULE FLOW ─────────────────────────────────────────────────────────
     elif state == OP_AWAIT_SCHEDULE_ROUTE:
         stops = [s.strip().title() for s in text.split(",") if s.strip()]
@@ -668,12 +734,80 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             """, op["id"], t2.get("sched_from"), t2.get("sched_to"),
                 t2.get("sched_time"), t2.get("sched_price"), seats, seats,
                 _ji.dumps(t2.get("sched_stops", [])))
-        await set_user_state(user.id, OP_IDLE, {})
+        # Ask for location next
+        await set_user_state(user.id, OP_AWAIT_SCHEDULE_LOCATION,
+                             {**t2, "sched_seats": seats})
         await update.message.reply_text(
-            f"✅ *Schedule Added!*\n\n"
-            f"📍 {t2.get('sched_from')} → {t2.get('sched_to')}\n"
-            f"⏰ {t2.get('sched_time')}\n💰 MVR {t2.get('sched_price')}/seat\n👥 {seats} seats",
-            parse_mode="Markdown", reply_markup=main_kb("operator"))
+            f"✅ {seats} seats saved!\n\n"
+            f"📍 *What is the departure location/jetty?*\n\n"
+            f"_Example: Jetty No. 1, Male_ or _Thoddoo Jetty_",
+            parse_mode="Markdown")
+
+    elif state == OP_AWAIT_SCHEDULE_LOCATION:
+        location = text.strip() or "Jetty No. 1, Male"
+        await set_user_state(user.id, OP_AWAIT_SCHEDULE_DAYS, {**temp, "sched_location": location})
+        await update.message.reply_text(
+            f"✅ Location: *{location}*\n\n"
+            f"📅 *Which days does this schedule run?*\n\n"
+            f"_Type one of:_\n"
+            f"• `daily` — Every day\n"
+            f"• `sat-thu` — Saturday to Thursday\n"
+            f"• `fri` — Fridays only\n"
+            f"• `weekdays` — Sunday to Thursday\n"
+            f"• `weekend` — Friday & Saturday",
+            parse_mode="Markdown")
+
+    elif state == OP_AWAIT_SCHEDULE_DAYS:
+        days_input = text.strip().lower()
+        valid_days = ["daily","sat-thu","fri","weekdays","weekend","sun-thu","everyday"]
+        run_days = days_input if days_input in valid_days else "daily"
+        t2 = temp
+        op = await get_operator(user.id)
+        # Get operator's boats
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            boats_list = await conn.fetch("SELECT * FROM boats WHERE operator_id=$1 AND status='active'", op["id"])
+        if boats_list:
+            # Let operator pick which boat runs this schedule
+            boat_buttons = [[InlineKeyboardButton(f"🚤 {b['boat_name']} ({b['capacity']} seats)",
+                callback_data=f"sched_boat_{b['id']}_{b['boat_name']}")] for b in boats_list]
+            boat_buttons.append([InlineKeyboardButton("➕ Use Default (no specific boat)", callback_data="sched_boat_0_default")])
+            # Save days in state first
+            import json as _j
+            await set_user_state(user.id, OP_AWAIT_SCHEDULE_DAYS,
+                                 {**t2, "sched_location": t2.get("sched_location","Jetty No. 1, Male"),
+                                  "run_days": run_days, "awaiting_boat_select": True})
+            await update.message.reply_text(
+                f"✅ Days: *{run_days}*\n\n🚤 *Which boat runs this schedule?*",
+                parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(boat_buttons))
+        else:
+            # No boats added yet — save directly
+            import json as _j
+            seats = t2.get("sched_seats", t2.get("sched_price",0))
+            async with pool.acquire() as conn:
+                await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS sched_stops TEXT DEFAULT '[]'")
+                await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'Jetty No. 1, Male'")
+                await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS run_days TEXT DEFAULT 'daily'")
+                await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS boat_name TEXT")
+                await conn.execute("""
+                    INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
+                                           price_per_seat, total_seats, available_seats,
+                                           sched_stops, location, run_days)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+                """, op["id"], t2.get("sched_from"), t2.get("sched_to"),
+                    t2.get("sched_time"), t2.get("sched_price"),
+                    t2.get("sched_seats",0), t2.get("sched_seats",0),
+                    _j.dumps(t2.get("sched_stops",[])),
+                    t2.get("sched_location","Jetty No. 1, Male"), run_days)
+            await set_user_state(user.id, OP_IDLE, {})
+            await update.message.reply_text(
+                f"✅ *Schedule Added!*\n\n"
+                f"📍 {t2.get('sched_from')} → {t2.get('sched_to')}\n"
+                f"⏰ {t2.get('sched_time')} | 📅 {run_days}\n"
+                f"📌 {t2.get('sched_location','Jetty No. 1, Male')}\n"
+                f"💰 MVR {t2.get('sched_price')}/seat | 👥 {t2.get('sched_seats',0)} seats\n\n"
+                f"💡 Tip: Add your boats with the *🚤 My Fleet* button!",
+                parse_mode="Markdown", reply_markup=main_kb("operator"))
 
     # ── CUSTOMER FLOW ─────────────────────────────────────────────────────────
     elif state == CX_AWAIT_DATE:
@@ -1115,6 +1249,227 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
             await query.edit_message_text(f"❌ Operator *{row['business_name']}* rejected.", parse_mode="Markdown")
 
+    elif data.startswith("sched_boat_"):
+        # Format: sched_boat_{boat_id}_{boat_name}
+        parts_data = data.split("_", 3)
+        boat_id = int(parts_data[2])
+        boat_name_sel = parts_data[3] if len(parts_data) > 3 else "default"
+        sd2 = await get_user_state(user.id)
+        t2 = sd2.get("temp_data", {}) or {}
+        import json as _j
+        op = await get_operator(user.id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS sched_stops TEXT DEFAULT '[]'")
+            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'Jetty No. 1, Male'")
+            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS run_days TEXT DEFAULT 'daily'")
+            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS boat_name TEXT")
+            await conn.execute("""
+                INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
+                                       price_per_seat, total_seats, available_seats,
+                                       sched_stops, location, run_days, boat_name)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            """, op["id"], t2.get("sched_from"), t2.get("sched_to"),
+                t2.get("sched_time"), t2.get("sched_price"),
+                t2.get("sched_seats",0), t2.get("sched_seats",0),
+                _j.dumps(t2.get("sched_stops",[])),
+                t2.get("sched_location","Jetty No. 1, Male"),
+                t2.get("run_days","daily"),
+                None if boat_name_sel == "default" else boat_name_sel)
+        await set_user_state(user.id, OP_IDLE, {})
+        boat_display = boat_name_sel if boat_name_sel != "default" else "Default"
+        await query.edit_message_text(
+            f"✅ *Schedule Added!*\n\n"
+            f"📍 {t2.get('sched_from')} → {t2.get('sched_to')}\n"
+            f"⏰ {t2.get('sched_time')} | 📅 {t2.get('run_days','daily')}\n"
+            f"📌 {t2.get('sched_location','Jetty No. 1, Male')}\n"
+            f"🚤 Boat: {boat_display}\n"
+            f"💰 MVR {t2.get('sched_price')}/seat | 👥 {t2.get('sched_seats',0)} seats",
+            parse_mode="Markdown")
+
+    elif data == "op_fleet":
+        op = await get_operator(user.id)
+        if not op:
+            await query.message.reply_text("⚠️ No operator profile.")
+            return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            boats = await conn.fetch("SELECT * FROM boats WHERE operator_id=$1 ORDER BY created_at", op["id"])
+        if not boats:
+            await query.message.reply_text(
+                "🚤 *Your Fleet*\n\nNo boats added yet.\n\nAdd your first boat:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("➕ Add a Boat", callback_data="op_add_boat")
+                ]]))
+            return
+        msg = "🚤 *Your Fleet:*\n\n"
+        buttons = []
+        for b in boats:
+            status_icon = "✅" if b["status"] == "active" else "🔧"
+            msg += f"{status_icon} *{b['boat_name']}* — {b['capacity']} seats\n"
+            buttons.append([
+                InlineKeyboardButton(f"🔧 Maintenance — {b['boat_name']}", callback_data=f"boat_maintenance_{b['id']}"),
+                InlineKeyboardButton(f"✅ Active", callback_data=f"boat_active_{b['id']}")
+            ])
+        buttons.append([InlineKeyboardButton("➕ Add Another Boat", callback_data="op_add_boat")])
+        await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data == "op_add_boat":
+        await set_user_state(user.id, OP_AWAIT_BOAT_ADD_NAME, {})
+        await query.message.reply_text(
+            "🚤 *Add a Boat*\n\nWhat is this boat's name?\n\n_Example: SamugaTravels 1, Ocean Star_",
+            parse_mode="Markdown")
+
+    elif data.startswith("boat_maintenance_"):
+        boat_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("UPDATE boats SET status='maintenance' WHERE id=$1 RETURNING boat_name", boat_id)
+        if row:
+            await query.answer(f"🔧 {row['boat_name']} set to maintenance.", show_alert=True)
+            await query.edit_message_text(f"🔧 *{row['boat_name']}* is now under maintenance.\nCustomers won't see it in available boats.", parse_mode="Markdown")
+
+    elif data.startswith("boat_active_"):
+        boat_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("UPDATE boats SET status='active' WHERE id=$1 RETURNING boat_name", boat_id)
+        if row:
+            await query.answer(f"✅ {row['boat_name']} is now active!", show_alert=True)
+            await query.edit_message_text(f"✅ *{row['boat_name']}* is now active.", parse_mode="Markdown")
+
+    elif data == "op_today":
+        op = await get_operator(user.id)
+        if not op:
+            return
+        from datetime import timedelta as _td
+        today = datetime.now().date()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            scheds = await conn.fetch("""
+                SELECT s.*, COALESCE(sc.new_boat_name, s.boat_name) as active_boat,
+                       COALESCE(sc.new_time, s.departure_time) as active_time,
+                       sc.note as change_note
+                FROM schedules s
+                LEFT JOIN schedule_changes sc ON sc.schedule_id=s.id AND sc.change_date=$1
+                WHERE s.operator_id=$2 AND s.is_active=TRUE
+                ORDER BY s.departure_time
+            """, today, op["id"])
+            # Count bookings for each schedule today
+            bookings_today = await conn.fetch("""
+                SELECT schedule_id, COUNT(*) as count, SUM(passenger_count) as pax
+                FROM bookings WHERE travel_date=$1 AND status='confirmed' AND operator_id=$2
+                GROUP BY schedule_id
+            """, today, op["id"])
+        booking_map = {b["schedule_id"]: b for b in bookings_today}
+        if not scheds:
+            await query.message.reply_text("📅 No schedules found.")
+            return
+        msg = f"📅 *Today's Schedule — {today.strftime('%A, %d %b')}*\n\n"
+        buttons = []
+        for s in scheds:
+            bk = booking_map.get(s["id"])
+            pax = bk["pax"] if bk else 0
+            count = bk["count"] if bk else 0
+            change_note = f"\n⚠️ *Change:* {s['change_note']}" if s.get("change_note") else ""
+            msg += (
+                f"⏰ *{s['active_time']}* — {s['route_from']} → {s['route_to']}\n"
+                f"🚤 {s['active_boat'] or 'Default boat'}\n"
+                f"📌 {s.get('location','Jetty No. 1, Male')}\n"
+                f"🎫 {count} bookings | 👥 {pax} passengers{change_note}\n\n"
+            )
+            buttons.append([InlineKeyboardButton(
+                f"✏️ Change {s['active_time']} schedule",
+                callback_data=f"change_sched_{s['id']}")])
+        await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("change_sched_"):
+        sched_id = int(data.split("_")[-1])
+        op = await get_operator(user.id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
+            boats = await conn.fetch("SELECT * FROM boats WHERE operator_id=$1 AND status='active'", op["id"])
+        if not sched:
+            await query.answer("Schedule not found.", show_alert=True)
+            return
+        buttons = []
+        for b in boats:
+            buttons.append([InlineKeyboardButton(
+                f"🚤 Swap to {b['boat_name']}",
+                callback_data=f"swap_boat_{sched_id}_{b['boat_name']}")])
+        buttons.append([InlineKeyboardButton("⏰ Change Time", callback_data=f"swap_time_{sched_id}")])
+        buttons.append([InlineKeyboardButton("❌ Cancel Today's Departure", callback_data=f"cancel_today_{sched_id}")])
+        await query.message.reply_text(
+            f"✏️ *Change Today's Schedule*\n\n"
+            f"⏰ {sched['departure_time']} — {sched['route_from']} → {sched['route_to']}\n"
+            f"📌 {sched.get('location','Jetty No. 1, Male')}\n\n"
+            f"What would you like to change?",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("swap_boat_"):
+        parts_s = data.split("_", 3)
+        sched_id = int(parts_s[2])
+        new_boat = parts_s[3]
+        today = datetime.now().date()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO schedule_changes (schedule_id, change_date, new_boat_name, note)
+                VALUES ($1,$2,$3,'Boat swapped by operator')
+                ON CONFLICT DO NOTHING
+            """, sched_id, today, new_boat)
+            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
+            # Notify confirmed customers for today
+            bookings = await conn.fetch("""
+                SELECT customer_telegram_id, booking_ref FROM bookings
+                WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
+            """, sched_id, today)
+        await query.edit_message_text(
+            f"✅ Today's {sched['departure_time']} departure now uses *{new_boat}*.",
+            parse_mode="Markdown")
+        # Notify customers
+        for bk in bookings:
+            try:
+                await ctx.bot.send_message(bk["customer_telegram_id"],
+                    f"🚤 *Schedule Update*\n\n"
+                    f"Your booking `{bk['booking_ref']}` has a small update:\n\n"
+                    f"The boat for your *{sched['departure_time']}* departure has been changed to *{new_boat}*.\n"
+                    f"📌 Location: {sched.get('location','Jetty No. 1, Male')}\n\n"
+                    f"All other details remain the same. Safe travels! 🌊",
+                    parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Customer notify error: {e}")
+
+    elif data.startswith("cancel_today_"):
+        sched_id = int(data.split("_")[-1])
+        today = datetime.now().date()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO schedule_changes (schedule_id, change_date, note, status)
+                VALUES ($1,$2,'Departure cancelled for today','cancelled')
+                ON CONFLICT DO NOTHING
+            """, sched_id, today)
+            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
+            bookings = await conn.fetch("""
+                SELECT customer_telegram_id, booking_ref FROM bookings
+                WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
+            """, sched_id, today)
+        await query.edit_message_text(f"❌ Today's {sched['departure_time']} departure marked as cancelled.")
+        for bk in bookings:
+            try:
+                await ctx.bot.send_message(bk["customer_telegram_id"],
+                    f"❌ *Departure Cancelled*\n\n"
+                    f"We regret to inform you that your *{sched['departure_time']}* departure\n"
+                    f"{sched['route_from']} → {sched['route_to']} has been cancelled today.\n\n"
+                    f"Booking `{bk['booking_ref']}`\n\n"
+                    f"Please contact the operator for rebooking or refund. Sorry for the inconvenience. 🙏",
+                    parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Cancel notify error: {e}")
+
     elif data.startswith("urgent_review_"):
         op_id = int(data.split("_")[-1])
         pool = await get_pool()
@@ -1143,6 +1498,227 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Urgent notify error: {e}")
                 await query.answer("Failed to send. Try again.", show_alert=True)
+
+    elif data.startswith("sched_boat_"):
+        # Format: sched_boat_{boat_id}_{boat_name}
+        parts_data = data.split("_", 3)
+        boat_id = int(parts_data[2])
+        boat_name_sel = parts_data[3] if len(parts_data) > 3 else "default"
+        sd2 = await get_user_state(user.id)
+        t2 = sd2.get("temp_data", {}) or {}
+        import json as _j
+        op = await get_operator(user.id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS sched_stops TEXT DEFAULT '[]'")
+            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'Jetty No. 1, Male'")
+            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS run_days TEXT DEFAULT 'daily'")
+            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS boat_name TEXT")
+            await conn.execute("""
+                INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
+                                       price_per_seat, total_seats, available_seats,
+                                       sched_stops, location, run_days, boat_name)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            """, op["id"], t2.get("sched_from"), t2.get("sched_to"),
+                t2.get("sched_time"), t2.get("sched_price"),
+                t2.get("sched_seats",0), t2.get("sched_seats",0),
+                _j.dumps(t2.get("sched_stops",[])),
+                t2.get("sched_location","Jetty No. 1, Male"),
+                t2.get("run_days","daily"),
+                None if boat_name_sel == "default" else boat_name_sel)
+        await set_user_state(user.id, OP_IDLE, {})
+        boat_display = boat_name_sel if boat_name_sel != "default" else "Default"
+        await query.edit_message_text(
+            f"✅ *Schedule Added!*\n\n"
+            f"📍 {t2.get('sched_from')} → {t2.get('sched_to')}\n"
+            f"⏰ {t2.get('sched_time')} | 📅 {t2.get('run_days','daily')}\n"
+            f"📌 {t2.get('sched_location','Jetty No. 1, Male')}\n"
+            f"🚤 Boat: {boat_display}\n"
+            f"💰 MVR {t2.get('sched_price')}/seat | 👥 {t2.get('sched_seats',0)} seats",
+            parse_mode="Markdown")
+
+    elif data == "op_fleet":
+        op = await get_operator(user.id)
+        if not op:
+            await query.message.reply_text("⚠️ No operator profile.")
+            return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            boats = await conn.fetch("SELECT * FROM boats WHERE operator_id=$1 ORDER BY created_at", op["id"])
+        if not boats:
+            await query.message.reply_text(
+                "🚤 *Your Fleet*\n\nNo boats added yet.\n\nAdd your first boat:",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("➕ Add a Boat", callback_data="op_add_boat")
+                ]]))
+            return
+        msg = "🚤 *Your Fleet:*\n\n"
+        buttons = []
+        for b in boats:
+            status_icon = "✅" if b["status"] == "active" else "🔧"
+            msg += f"{status_icon} *{b['boat_name']}* — {b['capacity']} seats\n"
+            buttons.append([
+                InlineKeyboardButton(f"🔧 Maintenance — {b['boat_name']}", callback_data=f"boat_maintenance_{b['id']}"),
+                InlineKeyboardButton(f"✅ Active", callback_data=f"boat_active_{b['id']}")
+            ])
+        buttons.append([InlineKeyboardButton("➕ Add Another Boat", callback_data="op_add_boat")])
+        await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data == "op_add_boat":
+        await set_user_state(user.id, OP_AWAIT_BOAT_ADD_NAME, {})
+        await query.message.reply_text(
+            "🚤 *Add a Boat*\n\nWhat is this boat's name?\n\n_Example: SamugaTravels 1, Ocean Star_",
+            parse_mode="Markdown")
+
+    elif data.startswith("boat_maintenance_"):
+        boat_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("UPDATE boats SET status='maintenance' WHERE id=$1 RETURNING boat_name", boat_id)
+        if row:
+            await query.answer(f"🔧 {row['boat_name']} set to maintenance.", show_alert=True)
+            await query.edit_message_text(f"🔧 *{row['boat_name']}* is now under maintenance.\nCustomers won't see it in available boats.", parse_mode="Markdown")
+
+    elif data.startswith("boat_active_"):
+        boat_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("UPDATE boats SET status='active' WHERE id=$1 RETURNING boat_name", boat_id)
+        if row:
+            await query.answer(f"✅ {row['boat_name']} is now active!", show_alert=True)
+            await query.edit_message_text(f"✅ *{row['boat_name']}* is now active.", parse_mode="Markdown")
+
+    elif data == "op_today":
+        op = await get_operator(user.id)
+        if not op:
+            return
+        from datetime import timedelta as _td
+        today = datetime.now().date()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            scheds = await conn.fetch("""
+                SELECT s.*, COALESCE(sc.new_boat_name, s.boat_name) as active_boat,
+                       COALESCE(sc.new_time, s.departure_time) as active_time,
+                       sc.note as change_note
+                FROM schedules s
+                LEFT JOIN schedule_changes sc ON sc.schedule_id=s.id AND sc.change_date=$1
+                WHERE s.operator_id=$2 AND s.is_active=TRUE
+                ORDER BY s.departure_time
+            """, today, op["id"])
+            # Count bookings for each schedule today
+            bookings_today = await conn.fetch("""
+                SELECT schedule_id, COUNT(*) as count, SUM(passenger_count) as pax
+                FROM bookings WHERE travel_date=$1 AND status='confirmed' AND operator_id=$2
+                GROUP BY schedule_id
+            """, today, op["id"])
+        booking_map = {b["schedule_id"]: b for b in bookings_today}
+        if not scheds:
+            await query.message.reply_text("📅 No schedules found.")
+            return
+        msg = f"📅 *Today's Schedule — {today.strftime('%A, %d %b')}*\n\n"
+        buttons = []
+        for s in scheds:
+            bk = booking_map.get(s["id"])
+            pax = bk["pax"] if bk else 0
+            count = bk["count"] if bk else 0
+            change_note = f"\n⚠️ *Change:* {s['change_note']}" if s.get("change_note") else ""
+            msg += (
+                f"⏰ *{s['active_time']}* — {s['route_from']} → {s['route_to']}\n"
+                f"🚤 {s['active_boat'] or 'Default boat'}\n"
+                f"📌 {s.get('location','Jetty No. 1, Male')}\n"
+                f"🎫 {count} bookings | 👥 {pax} passengers{change_note}\n\n"
+            )
+            buttons.append([InlineKeyboardButton(
+                f"✏️ Change {s['active_time']} schedule",
+                callback_data=f"change_sched_{s['id']}")])
+        await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("change_sched_"):
+        sched_id = int(data.split("_")[-1])
+        op = await get_operator(user.id)
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
+            boats = await conn.fetch("SELECT * FROM boats WHERE operator_id=$1 AND status='active'", op["id"])
+        if not sched:
+            await query.answer("Schedule not found.", show_alert=True)
+            return
+        buttons = []
+        for b in boats:
+            buttons.append([InlineKeyboardButton(
+                f"🚤 Swap to {b['boat_name']}",
+                callback_data=f"swap_boat_{sched_id}_{b['boat_name']}")])
+        buttons.append([InlineKeyboardButton("⏰ Change Time", callback_data=f"swap_time_{sched_id}")])
+        buttons.append([InlineKeyboardButton("❌ Cancel Today's Departure", callback_data=f"cancel_today_{sched_id}")])
+        await query.message.reply_text(
+            f"✏️ *Change Today's Schedule*\n\n"
+            f"⏰ {sched['departure_time']} — {sched['route_from']} → {sched['route_to']}\n"
+            f"📌 {sched.get('location','Jetty No. 1, Male')}\n\n"
+            f"What would you like to change?",
+            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("swap_boat_"):
+        parts_s = data.split("_", 3)
+        sched_id = int(parts_s[2])
+        new_boat = parts_s[3]
+        today = datetime.now().date()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO schedule_changes (schedule_id, change_date, new_boat_name, note)
+                VALUES ($1,$2,$3,'Boat swapped by operator')
+                ON CONFLICT DO NOTHING
+            """, sched_id, today, new_boat)
+            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
+            # Notify confirmed customers for today
+            bookings = await conn.fetch("""
+                SELECT customer_telegram_id, booking_ref FROM bookings
+                WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
+            """, sched_id, today)
+        await query.edit_message_text(
+            f"✅ Today's {sched['departure_time']} departure now uses *{new_boat}*.",
+            parse_mode="Markdown")
+        # Notify customers
+        for bk in bookings:
+            try:
+                await ctx.bot.send_message(bk["customer_telegram_id"],
+                    f"🚤 *Schedule Update*\n\n"
+                    f"Your booking `{bk['booking_ref']}` has a small update:\n\n"
+                    f"The boat for your *{sched['departure_time']}* departure has been changed to *{new_boat}*.\n"
+                    f"📌 Location: {sched.get('location','Jetty No. 1, Male')}\n\n"
+                    f"All other details remain the same. Safe travels! 🌊",
+                    parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Customer notify error: {e}")
+
+    elif data.startswith("cancel_today_"):
+        sched_id = int(data.split("_")[-1])
+        today = datetime.now().date()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO schedule_changes (schedule_id, change_date, note, status)
+                VALUES ($1,$2,'Departure cancelled for today','cancelled')
+                ON CONFLICT DO NOTHING
+            """, sched_id, today)
+            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
+            bookings = await conn.fetch("""
+                SELECT customer_telegram_id, booking_ref FROM bookings
+                WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
+            """, sched_id, today)
+        await query.edit_message_text(f"❌ Today's {sched['departure_time']} departure marked as cancelled.")
+        for bk in bookings:
+            try:
+                await ctx.bot.send_message(bk["customer_telegram_id"],
+                    f"❌ *Departure Cancelled*\n\n"
+                    f"We regret to inform you that your *{sched['departure_time']}* departure\n"
+                    f"{sched['route_from']} → {sched['route_to']} has been cancelled today.\n\n"
+                    f"Booking `{bk['booking_ref']}`\n\n"
+                    f"Please contact the operator for rebooking or refund. Sorry for the inconvenience. 🙏",
+                    parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Cancel notify error: {e}")
 
     elif data.startswith("urgent_review_"):
         op_id = int(data.split("_")[-1])
@@ -1461,10 +2037,96 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
 
+# ── SCHEDULED JOBS ───────────────────────────────────────────────────────────
+async def job_morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
+    """6:00 AM MVT — ping all operators about today's schedules"""
+    today = datetime.now().date()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Get all approved operators with schedules today
+        operators = await conn.fetch("""
+            SELECT DISTINCT o.telegram_id, o.business_name, o.id as op_id
+            FROM operators o
+            JOIN schedules s ON s.operator_id = o.id
+            WHERE o.status = 'approved' AND s.is_active = TRUE
+        """)
+        for op in operators:
+            scheds = await conn.fetch("""
+                SELECT * FROM schedules WHERE operator_id=$1 AND is_active=TRUE
+                ORDER BY departure_time
+            """, op["op_id"])
+            if not scheds:
+                continue
+            sched_lines = "\n".join([
+                f"  ⏰ {s['departure_time']} — {s['route_from']} → {s['route_to']} | 📌 {s.get('location','Jetty No. 1, Male')}"
+                for s in scheds
+            ])
+            buttons = [[InlineKeyboardButton("📅 View & Manage Today", callback_data="op_today")]]
+            try:
+                await ctx.bot.send_message(op["telegram_id"],
+                    f"🌅 *Good morning, {op['business_name']}!*\n\n"
+                    f"Today's schedules:\n{sched_lines}\n\n"
+                    f"⚠️ Any changes? Tap below to swap boats, update times, or cancel a departure.",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup(buttons))
+            except Exception as e:
+                logger.error(f"Morning ping failed for {op['telegram_id']}: {e}")
+
+async def job_departure_reminders(ctx: ContextTypes.DEFAULT_TYPE):
+    """Run every 5 minutes — send 45-min reminders to confirmed customers"""
+    from datetime import timedelta
+    now = datetime.now()
+    today = now.date()
+    # Target: departures happening in 40-50 minutes from now
+    remind_from = (now.replace(second=0, microsecond=0) + timedelta(minutes=40)).strftime("%H:%M")
+    remind_to   = (now.replace(second=0, microsecond=0) + timedelta(minutes=50)).strftime("%H:%M")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Find bookings with departures in ~45 min, not yet reminded
+        bookings = await conn.fetch("""
+            SELECT b.customer_telegram_id, b.booking_ref, b.passenger_count,
+                   COALESCE(sc.new_time, s.departure_time) as dep_time,
+                   COALESCE(sc.new_boat_name, s.boat_name, o.boat_name) as boat_name,
+                   s.location, s.route_from, s.route_to, o.business_name
+            FROM bookings b
+            JOIN schedules s ON b.schedule_id = s.id
+            JOIN operators o ON b.operator_id = o.id
+            LEFT JOIN schedule_changes sc ON sc.schedule_id=s.id AND sc.change_date=$1 AND sc.status='active'
+            WHERE b.travel_date = $1
+              AND b.status = 'confirmed'
+              AND b.reminder_sent = FALSE
+              AND COALESCE(sc.new_time, s.departure_time) >= $2
+              AND COALESCE(sc.new_time, s.departure_time) <= $3
+        """, today, remind_from, remind_to)
+
+        for bk in bookings:
+            try:
+                await ctx.bot.send_message(bk["customer_telegram_id"],
+                    f"🌊 *Almost time to set sail!*\n\n"
+                    f"Hey there! Just a friendly reminder that your boat departs in about *45 minutes*. "
+                    f"Please make your way to the jetty soon! 😊\n\n"
+                    f"🚤 *{bk['boat_name'] or bk['business_name']}*\n"
+                    f"📍 *{bk['route_from']} → {bk['route_to']}*\n"
+                    f"⏰ Departure: *{bk['dep_time']}*\n"
+                    f"📌 Location: *{bk.get('location') or 'Jetty No. 1, Male'}*\n"
+                    f"🎫 Booking: `{bk['booking_ref']}` | 👥 {bk['passenger_count']} pax\n\n"
+                    f"📱 You can use the *FollowMe* app to track your boat in real time.\n\n"
+                    f"Wishing you a safe, smooth and wonderful journey! 🌟\n"
+                    f"Safe travels from all of us at *Samuga Travels* 🌊🤝",
+                    parse_mode="Markdown")
+                # Mark as reminded
+                await conn.execute(
+                    "UPDATE bookings SET reminder_sent=TRUE WHERE booking_ref=$1",
+                    bk["booking_ref"])
+                logger.info(f"✅ Reminder sent to {bk['customer_telegram_id']} for {bk['booking_ref']}")
+            except Exception as e:
+                logger.error(f"Reminder failed for {bk['customer_telegram_id']}: {e}")
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def main():
     # Init DB first before anything else
-    logger.info("🌊 Starting Samuga Travels Bot v1.1...")
+    logger.info("🌊 Starting Samuga Travels Bot v1.2...")
     await init_db()
     logger.info("✅ DB ready — building bot...")
 
@@ -1486,10 +2148,19 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(error_handler)
 
+    # ── Scheduled jobs ──
+    from datetime import time as dt_time
+    jq = app.job_queue
+    # Morning ping: 6:00 AM MVT = 01:00 UTC
+    jq.run_daily(job_morning_ping, time=dt_time(1, 0, 0), name="morning_ping")
+    # Departure reminders: every 5 minutes
+    jq.run_repeating(job_departure_reminders, interval=300, first=30, name="departure_reminders")
+    logger.info("✅ Scheduled jobs registered")
+
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    logger.info("🌊 Samuga Travels Bot v1.1 LIVE!")
+    logger.info("🌊 Samuga Travels Bot v1.2 LIVE!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
