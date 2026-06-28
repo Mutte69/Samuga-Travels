@@ -458,8 +458,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             acct_name = parts[1].strip() if len(parts) > 1 else ""
             mib_entry = f"{acct_num}|{acct_name}" if acct_name else acct_num
         final_temp = {**temp, "mib_account": mib_entry}
-        await save_operator(user, final_temp)
-        await notify_admin_new_op(ctx, user, final_temp)
+        op_id = await save_operator(user, final_temp)
+        await notify_admin_new_op(ctx, user, final_temp, op_id=op_id)
         await set_user_state(user.id, OP_REGISTERED, {})
         await update.message.reply_text(
             "🎉 *Registration Complete!*\n\n"
@@ -983,12 +983,16 @@ async def save_operator(user, temp: dict):
             temp.get("routes",[]), temp.get("owner_name"), temp.get("owner_contact"),
             temp.get("owner_id_photo_url"), temp.get("bml_account",""),
             payment_accounts_json)
-
-async def notify_admin_new_op(ctx, user, temp: dict):
-    pool = await get_pool()
-    async with pool.acquire() as conn:
+        # Fetch the saved operator id
         row = await conn.fetchrow("SELECT id FROM operators WHERE telegram_id=$1", user.id)
-    op_id = row["id"] if row else 0
+        return row["id"] if row else 0
+
+async def notify_admin_new_op(ctx, user, temp: dict, op_id: int = 0):
+    if op_id == 0:
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT id FROM operators WHERE telegram_id=$1", user.id)
+        op_id = row["id"] if row else 0
 
     msg = (
         f"🆕 *New Operator Application*\n\n"
