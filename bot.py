@@ -962,12 +962,17 @@ async def do_confirm_booking(ctx, booking_id: int, query):
         caption=f"✅ Booking `{booking['booking_ref']}` confirmed! Ticket sent.", parse_mode="Markdown")
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
-async def post_init(app):
+async def post_init(app: Application) -> None:
     await init_db()
     logger.info("🌊 Samuga Travels Bot v1.1 ready!")
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+async def main():
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
     app.add_handler(CommandHandler("start",     cmd_start))
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
     app.add_handler(CommandHandler("register",  cmd_register))
@@ -976,7 +981,11 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     logger.info("🌊 Starting Samuga Travels Bot v1.1...")
-    app.run_polling(drop_pending_updates=True)
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    # Keep running
+    await asyncio.Event().wait()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
