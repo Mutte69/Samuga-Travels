@@ -3,3 +3,5 @@ psycopg2-binary==2.9.9
 cloudinary==1.36.0
 reportlab==4.1.0
 requests==2.31.0
+urllib3==1.26.18
+charset-normalizer==3.3.2
