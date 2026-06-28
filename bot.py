@@ -639,9 +639,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif state == OP_AWAIT_SCHEDULE_PRICE:
         try:
-            price = float(text)
+            price = float(text.upper().replace("MVR","").replace(",","").strip())
         except ValueError:
-            await update.message.reply_text("⚠️ Enter a valid price e.g. `535`", parse_mode="Markdown")
+            await update.message.reply_text("⚠️ Enter a valid price e.g. `535` or `535MVR`", parse_mode="Markdown")
             return
         await set_user_state(user.id, OP_AWAIT_SCHEDULE_SEATS, {**temp, "sched_price": price})
         await update.message.reply_text("✅ Price saved!\n\nHow many *available seats* for this schedule?",
@@ -677,11 +677,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── CUSTOMER FLOW ─────────────────────────────────────────────────────────
     elif state == CX_AWAIT_DATE:
-        try:
-            travel_date = datetime.strptime(text, "%d-%m-%Y").date()
-        except ValueError:
+        # Accept multiple formats: DD-MM-YYYY, DD/MM/YYYY
+        travel_date = None
+        for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y"):
+            try:
+                travel_date = datetime.strptime(text.strip(), fmt).date()
+                break
+            except ValueError:
+                continue
+        if not travel_date:
             await update.message.reply_text(
-                "⚠️ Invalid date. Use DD-MM-YYYY\n\nExample: `30-06-2026`", parse_mode="Markdown")
+                "⚠️ Invalid date format.\n\nAccepted formats:\n`30-06-2026` or `30/06/2026`",
+                parse_mode="Markdown")
             return
         if travel_date < datetime.now().date():
             await update.message.reply_text("⚠️ Date cannot be in the past.")
@@ -711,8 +718,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
 
         schedules = [dict(r) for r in rows]
+        # Store only IDs in state to avoid temp_data size limit; cache full data in context
+        sched_ids = [s["id"] for s in schedules]
+        ctx.user_data["schedules_cache"] = schedules
         await set_user_state(user.id, CX_AWAIT_PASSENGER_COUNT,
-                             {**temp, "travel_date": str(travel_date), "schedules": schedules})
+                             {**temp, "travel_date": str(travel_date), "sched_ids": sched_ids})
 
         msg = f"🚢 *Available Boats — {route_from} → {route_to}*\n📅 *{text}*\n\n"
         buttons = []
@@ -758,12 +768,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         cx_name = parts[0].strip()
         cx_phone = parts[1].strip()
         await set_user_state(user.id, CX_AWAIT_PASSENGER_COUNT, {**temp, "cx_name": cx_name, "cx_phone": cx_phone})
-        schedules = temp.get("schedules", [])
-        idx = temp.get("selected_schedule_idx", 0)
-        sel = schedules[idx] if schedules else {}
         await update.message.reply_text(
             f"✅ *{cx_name}* saved!\n\n"
-            f"💺 How many seats would you like to book?\n_(Max 10, available: {sel.get('available_seats',0)})_",
+            f"💺 How many seats would you like to book?\n_(Max 10, available: {temp.get('sel_seats',0)})_",
             parse_mode="Markdown")
 
     elif state == CX_AWAIT_PASSENGER_COUNT:
@@ -774,11 +781,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if count > 10:
             await update.message.reply_text("⚠️ Maximum 10 seats per booking.")
             return
-        schedules = temp.get("schedules", [])
-        idx = temp.get("selected_schedule_idx", 0)
-        selected = schedules[idx] if schedules else {}
-        if count > int(selected.get("available_seats", 0)):
-            await update.message.reply_text(f"⚠️ Only *{selected.get('available_seats')} seats* available.", parse_mode="Markdown")
+        if count > int(temp.get("sel_seats", 0)):
+            await update.message.reply_text(f"⚠️ Only *{temp.get('sel_seats')} seats* available.", parse_mode="Markdown")
             return
         await set_user_state(user.id, CX_COLLECTING_PASSENGERS,
                              {**temp, "passenger_count": count, "passengers_collected": [], "current_passenger": 1})
@@ -806,38 +810,33 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"👤 *Passenger {current+1} of {total}*\n\nEnter *Full Name* and *ID / Passport Number*:\n\n_Format: Ahmed Ali, A123456_",
                 parse_mode="Markdown")
         else:
-            # All collected — show summary + payment
             sd3 = await get_user_state(user.id)
             t3  = sd3.get("temp_data", {}) or {}
             t3["passengers_collected"] = passengers
-            schedules = t3.get("schedules", [])
-            idx = t3.get("selected_schedule_idx", 0)
-            sel = schedules[idx] if schedules else {}
-            total_amt = float(sel.get("price_per_seat",0)) * total
+            total_amt = float(t3.get("sel_price", 0)) * total
             pax_lines = "\n".join([f"  {i+1}. {p['name']} ({p['id_number']})" for i,p in enumerate(passengers)])
-            # Build payment accounts display
             import json as _json
             pay_str = ""
             try:
-                accounts = _json.loads(sel.get("payment_accounts") or "[]")
+                accounts = _json.loads(t3.get("sel_payment_accounts") or "[]")
                 if accounts:
                     for acc in accounts:
                         pay_str += f"🏦 *{acc['bank']}:* `{acc['number']}`"
                         if acc.get("name"): pay_str += f" — {acc['name']}"
                         pay_str += "\n"
                 else:
-                    pay_str = f"🏦 *BML:* `{sel.get('bml_account','N/A')}`\n"
+                    pay_str = f"🏦 *BML:* `{t3.get('sel_bml','N/A')}`\n"
             except Exception:
-                pay_str = f"🏦 *BML:* `{sel.get('bml_account','N/A')}`\n"
+                pay_str = f"🏦 *BML:* `{t3.get('sel_bml','N/A')}`\n"
 
             summary = (
                 f"📝 *Booking Summary*\n\n"
                 f"👤 *Booker:* {t3.get('cx_name','N/A')} | 📞 {t3.get('cx_phone','N/A')}\n"
-                f"🚤 *Operator:* {sel.get('business_name')}\n"
-                f"🛥️ *Boat:* {sel.get('boat_name')}\n"
+                f"🚤 *Operator:* {t3.get('sel_business')}\n"
+                f"🛥️ *Boat:* {t3.get('sel_boat')}\n"
                 f"📍 *Route:* {t3.get('route_from')} → {t3.get('route_to')}\n"
                 f"📅 *Date:* {t3.get('travel_date')}\n"
-                f"⏰ *Departure:* {sel.get('departure_time')}\n"
+                f"⏰ *Departure:* {t3.get('sel_time')}\n"
                 f"👥 *Passengers ({total}):*\n{pax_lines}\n\n"
                 f"💰 *Total:* MVR {total_amt:.2f}\n\n"
                 f"{'─'*30}\n"
@@ -857,9 +856,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             rf = parts[0].strip().title()
             rt = parts[1].strip().title()
             await set_user_state(user.id, CX_AWAIT_DATE, {"route_from": rf, "route_to": rt})
+            from datetime import timedelta
+            today = datetime.now().date()
+            dates = [today + timedelta(days=i) for i in range(4)]
+            date_buttons = [[InlineKeyboardButton(
+                f"{'Today' if i==0 else 'Tomorrow' if i==1 else d.strftime('%a %d %b')}",
+                callback_data=f"date_select_{d.strftime('%d-%m-%Y')}"
+            )] for i, d in enumerate(dates)]
             await update.message.reply_text(
-                f"🔍 Searching: *{rf} → {rt}*\n\n📅 What is your *travel date*?\n\n_Format: DD-MM-YYYY (e.g. 30-06-2026)_",
-                parse_mode="Markdown")
+                f"🔍 *{rf} → {rt}*\n\n📅 Select your *travel date* or type manually:\n_(DD-MM-YYYY or DD/MM/YYYY)_",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(date_buttons))
         else:
             sd2 = await get_user_state(user.id)
             role = sd2.get("role","customer")
@@ -909,9 +916,6 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         url = await upload_image(file_bytes, "payment_slips", f"slip_{ref}")
         sd2 = await get_user_state(user.id)
         t2  = sd2.get("temp_data", {}) or {}
-        schedules = t2.get("schedules", [])
-        idx = t2.get("selected_schedule_idx", 0)
-        sel = schedules[idx] if schedules else {}
 
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -922,7 +926,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending_confirmation')
                 RETURNING id
             """, ref, user.id, f"{t2.get('cx_name','')} | {t2.get('cx_phone','')}",
-                sel.get("operator_id"), sel.get("id"),
+                t2.get("sel_operator_id"), t2.get("sel_schedule_id"),
                 t2.get("travel_date"), t2.get("passenger_count"),
                 json.dumps(t2.get("passengers_collected",[])),
                 t2.get("total_amount"), url)
@@ -933,10 +937,18 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ *Payment slip received!*\n\n"
             f"📋 Booking Ref: `{ref}`\n\n"
             f"Your booking is being reviewed by the operator. "
-            f"You'll receive your ticket here within 5 minutes. 🌊",
+            f"You\'ll receive your ticket here within 5 minutes. 🌊",
             parse_mode="Markdown")
 
+        # Build sel dict from flat keys for notify
+        sel = {
+            "operator_id": t2.get("sel_operator_id"),
+            "id": t2.get("sel_schedule_id"),
+            "departure_time": t2.get("sel_time"),
+            "op_telegram_id": t2.get("sel_op_tg"),
+        }
         await notify_operator_payment(ctx, booking_id, sel, t2, ref, user, photo.file_id)
+
 
     else:
         await update.message.reply_text("⚠️ Wasn't expecting an image. Use /start to go back.")
@@ -959,6 +971,63 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "🔍 *Search for Boats*\n\nType your route:\n`Male to Thoddoo`\n`Thoddoo to Male`",
             parse_mode="Markdown")
 
+    elif data.startswith("date_select_"):
+        selected_date_str = data.replace("date_select_", "")
+        # Inject as if user typed the date
+        sd2 = await get_user_state(user.id)
+        t2 = sd2.get("temp_data", {}) or {}
+        # Fake a message with this date into the state handler
+        travel_date = datetime.strptime(selected_date_str, "%d-%m-%Y").date()
+        route_from = t2.get("route_from","")
+        route_to   = t2.get("route_to","")
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT s.*, s.sched_stops, o.id as operator_id, o.business_name, o.boat_name, o.logo_url,
+                       o.is_recommended, o.average_rating, o.total_reviews,
+                       o.review_text, o.bml_account, o.payment_accounts, o.telegram_id as op_telegram_id
+                FROM schedules s
+                JOIN operators o ON s.operator_id = o.id
+                WHERE LOWER(s.route_from) LIKE $1 AND LOWER(s.route_to) LIKE $2
+                  AND o.status='approved' AND s.is_active=TRUE AND s.available_seats>0
+                ORDER BY o.is_recommended DESC, s.departure_time ASC
+            """, f"%{route_from.lower()}%", f"%{route_to.lower()}%")
+        if not rows:
+            await query.message.reply_text(
+                f"😔 No boats for *{route_from} → {route_to}* on *{selected_date_str}*. Try another date.",
+                parse_mode="Markdown")
+            return
+        schedules = [dict(r) for r in rows]
+        ctx.user_data["schedules_cache"] = schedules
+        sched_ids = [s["id"] for s in schedules]
+        await set_user_state(user.id, CX_AWAIT_PASSENGER_COUNT,
+                             {**t2, "travel_date": str(travel_date), "sched_ids": sched_ids})
+        import json as _j
+        msg = f"🚢 *Available Boats — {route_from} → {route_to}*\n📅 *{selected_date_str}*\n\n"
+        buttons = []
+        for i, s in enumerate(schedules):
+            rating_val = float(s.get("average_rating") or 0)
+            stars = "⭐" * int(rating_val) if rating_val else "No ratings yet"
+            rec = "✨ *Recommended by Samuga Travels*\n" if s.get("is_recommended") else ""
+            try:
+                stops_list = _j.loads(s.get("sched_stops") or "[]")
+                stops_line = "🛑 " + " → ".join(stops_list) + "\n" if stops_list and len(stops_list) > 2 else ""
+            except: stops_line = ""
+            msg += (
+                f"{'─'*30}\n"
+                f"🚤 *{s['business_name']}* — _{s['boat_name']}_\n"
+                f"{rec}"
+                f"📍 {s['route_from']} → {s['route_to']}\n"
+                f"{stops_line}"
+                f"⏰ *{s['departure_time']}*\n"
+                f"💺 {s['available_seats']} seats | 💰 MVR {s['price_per_seat']}/seat\n"
+                f"⭐ {stars}\n\n"
+            )
+            buttons.append([InlineKeyboardButton(
+                f"Book — {s['business_name']} ({s['departure_time']})",
+                callback_data=f"book_sched_{i}")])
+        await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
     elif data == "cx_my_bookings":
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -979,16 +1048,37 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("book_sched_"):
         idx = int(data.split("_")[-1])
-        schedules = temp.get("schedules", [])
+        schedules = ctx.user_data.get("schedules_cache", [])
+        if not schedules:
+            await query.message.reply_text("⚠️ Session expired. Please search again.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔍 Search Again", callback_data="cx_search")]]))
+            return
         if idx >= len(schedules):
             await query.message.reply_text("⚠️ Invalid selection.")
             return
         sel = schedules[idx]
-        await set_user_state(user.id, CX_AWAIT_CONTACT, {**temp, "selected_schedule_idx": idx})
+        # Store flat keys to avoid large JSON in temp_data
+        await set_user_state(user.id, CX_AWAIT_CONTACT, {
+            **temp,
+            "sel_operator_id": sel.get("operator_id"),
+            "sel_schedule_id": sel.get("id"),
+            "sel_business": sel.get("business_name"),
+            "sel_boat": sel.get("boat_name"),
+            "sel_time": sel.get("departure_time"),
+            "sel_price": str(sel.get("price_per_seat", 0)),
+            "sel_seats": int(sel.get("available_seats", 0)),
+            "sel_bml": sel.get("bml_account", ""),
+            "sel_payment_accounts": sel.get("payment_accounts", "[]"),
+            "sel_op_tg": sel.get("op_telegram_id", 0),
+            "route_from": temp.get("route_from", ""),
+            "route_to": temp.get("route_to", ""),
+            "travel_date": temp.get("travel_date", ""),
+        })
         await query.message.reply_text(
             f"✅ *{sel['business_name']}* selected!\n\n"
-            f"⏰ {sel['departure_time']} | 💺 {sel['available_seats']} seats available\n\n"
-            f"👤 *Your contact details:*\n\nEnter your *Full Name* and *Phone Number*:\n\n_Format: Ahmed Ali, 7771234_",
+            f"📍 {temp.get('route_from')} → {temp.get('route_to')}\n"
+            f"⏰ {sel['departure_time']} | 💺 {sel['available_seats']} seats\n\n"
+            f"👤 *Your contact details:*\nEnter *Full Name* and *Phone Number*:\n\n_Format: Ahmed Ali, 7771234_",
             parse_mode="Markdown")
 
     elif data.startswith("type_"):
@@ -1279,23 +1369,27 @@ async def notify_admin_new_op(ctx, user, temp: dict, op_id: int = 0):
         logger.error(f"❌ Admin photo send FAILED: {e}")
 
 async def notify_operator_payment(ctx, booking_id, sel, temp, ref, customer, slip_file_id):
-    op_tg_id = sel.get("op_telegram_id") or sel.get("operator_telegram_id")
+    # Get operator telegram ID from sel dict or flat temp keys or DB
+    op_tg_id = sel.get("op_telegram_id") or temp.get("sel_op_tg")
     if not op_tg_id:
         pool = await get_pool()
         async with pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT telegram_id FROM operators WHERE id=$1", sel.get("operator_id"))
+            op_id = sel.get("operator_id") or temp.get("sel_operator_id")
+            row = await conn.fetchrow("SELECT telegram_id FROM operators WHERE id=$1", op_id)
         if not row:
+            logger.error(f"Could not find operator for booking {booking_id}")
             return
         op_tg_id = row["telegram_id"]
 
     pax = temp.get("passengers_collected",[])
     pax_lines = "\n".join([f"  {i+1}. {p['name']} ({p['id_number']})" for i,p in enumerate(pax)])
+    dep_time = sel.get("departure_time") or temp.get("sel_time","")
     msg = (
         f"💳 *New Payment Received!*\n\n"
         f"🔖 Ref: `{ref}`\n"
         f"👤 *Customer:* {temp.get('cx_name','N/A')} | 📞 {temp.get('cx_phone','N/A')}\n"
         f"📍 {temp.get('route_from')} → {temp.get('route_to')}\n"
-        f"📅 {temp.get('travel_date')} @ {sel.get('departure_time')}\n"
+        f"📅 {temp.get('travel_date')} @ {dep_time}\n"
         f"👥 {temp.get('passenger_count')} passengers:\n{pax_lines}\n"
         f"💰 MVR {temp.get('total_amount')}\n\n"
         f"Review the slip and confirm below 👇"
@@ -1305,6 +1399,7 @@ async def notify_operator_payment(ctx, booking_id, sel, temp, ref, customer, sli
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{booking_id}")
             ]]))
+        logger.info(f"✅ Operator {op_tg_id} notified for booking {booking_id}")
     except Exception as e:
         logger.error(f"Operator notify error: {e}")
 
