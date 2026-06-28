@@ -53,8 +53,20 @@ _pool = None
 async def get_pool():
     global _pool
     if _pool is None:
-        db_url = DATABASE_URL.replace("postgresql://", "postgresql://").replace("postgres://", "postgresql://")
-        _pool = await asyncpg.create_pool(db_url, min_size=1, max_size=10)
+        if not DATABASE_URL:
+            raise RuntimeError("DATABASE_URL is not set! Add it in Railway Variables.")
+        db_url = DATABASE_URL.replace("postgres://", "postgresql://")
+        for attempt in range(5):
+            try:
+                _pool = await asyncpg.create_pool(db_url, min_size=1, max_size=10)
+                logger.info("✅ Database pool created")
+                break
+            except Exception as e:
+                logger.error(f"DB pool attempt {attempt+1} failed: {e}")
+                if attempt < 4:
+                    await asyncio.sleep(3)
+                else:
+                    raise
     return _pool
 
 async def init_db():
