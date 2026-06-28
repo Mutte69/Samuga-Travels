@@ -966,14 +966,28 @@ async def notify_admin_new_op(ctx, user, temp: dict):
         InlineKeyboardButton("✅ Approve", callback_data=f"approve_op_{op_id}"),
         InlineKeyboardButton("❌ Reject",  callback_data=f"reject_op_{op_id}")
     ]])
-    await ctx.bot.send_message(ADMIN_GROUP_ID, msg, parse_mode="Markdown",
-                               message_thread_id=ADMIN_THREAD_ID, reply_markup=kb)
-    if temp.get("logo_url"):
-        await ctx.bot.send_photo(ADMIN_GROUP_ID, photo=temp["logo_url"],
-                                 caption="🖼️ Operator Logo", message_thread_id=ADMIN_THREAD_ID)
-    if temp.get("owner_id_photo_url"):
-        await ctx.bot.send_photo(ADMIN_GROUP_ID, photo=temp["owner_id_photo_url"],
-                                 caption="🪪 Owner ID", message_thread_id=ADMIN_THREAD_ID)
+    try:
+        logger.info(f"Sending admin notification to group {ADMIN_GROUP_ID} thread {ADMIN_THREAD_ID}")
+        await ctx.bot.send_message(ADMIN_GROUP_ID, msg, parse_mode="Markdown",
+                                   message_thread_id=ADMIN_THREAD_ID, reply_markup=kb)
+        logger.info("✅ Admin notification sent")
+    except Exception as e:
+        logger.error(f"❌ Admin notify FAILED: {e}")
+        # Try without thread ID as fallback
+        try:
+            await ctx.bot.send_message(ADMIN_GROUP_ID, msg, parse_mode="Markdown", reply_markup=kb)
+            logger.info("✅ Admin notification sent (no thread)")
+        except Exception as e2:
+            logger.error(f"❌ Admin notify fallback FAILED: {e2}")
+    try:
+        if temp.get("logo_url"):
+            await ctx.bot.send_photo(ADMIN_GROUP_ID, photo=temp["logo_url"],
+                                     caption="🖼️ Operator Logo", message_thread_id=ADMIN_THREAD_ID)
+        if temp.get("owner_id_photo_url"):
+            await ctx.bot.send_photo(ADMIN_GROUP_ID, photo=temp["owner_id_photo_url"],
+                                     caption="🪪 Owner ID", message_thread_id=ADMIN_THREAD_ID)
+    except Exception as e:
+        logger.error(f"❌ Admin photo send FAILED: {e}")
 
 async def notify_operator_payment(ctx, booking_id, sel, temp, ref, customer, slip_file_id):
     op_tg_id = sel.get("op_telegram_id") or sel.get("operator_telegram_id")
