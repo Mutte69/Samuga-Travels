@@ -4,7 +4,7 @@ Multi-tenant speedboat booking platform for the Maldives.
 Single-file | asyncpg | Railway + PostgreSQL | Cloudinary
 """
 
-import os, io, logging, asyncio, json, random, string
+import os, io, logging, asyncio, json, random, string, signal
 import cloudinary, cloudinary.uploader, requests
 import asyncpg
 from datetime import datetime
@@ -2161,7 +2161,20 @@ async def main():
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("🌊 Samuga Travels Bot v1.2 LIVE!")
-    await asyncio.Event().wait()
+
+    # Graceful shutdown on SIGTERM (Railway stop signal)
+    stop_event = asyncio.Event()
+    def _handle_sigterm(*_):
+        logger.info("🛑 SIGTERM received — shutting down gracefully...")
+        stop_event.set()
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+    signal.signal(signal.SIGINT, _handle_sigterm)
+
+    await stop_event.wait()
+    logger.info("👋 Stopping bot...")
+    await app.updater.stop()
+    await app.stop()
+    await app.shutdown()
 
 if __name__ == "__main__":
     asyncio.run(main())
