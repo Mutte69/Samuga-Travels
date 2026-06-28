@@ -27,6 +27,9 @@ DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 ADMIN_GROUP_ID   = int(os.environ.get("ADMIN_GROUP_ID",  "-1004397030483"))
 ADMIN_THREAD_ID  = int(os.environ.get("ADMIN_THREAD_ID", "2"))
 GENERAL_THREAD_ID= int(os.environ.get("GENERAL_THREAD_ID","1"))
+# Your personal Telegram ID — gets full admin access
+SUPER_ADMINS    = [int(x) for x in os.environ.get("SUPER_ADMINS", "").split(",") if x.strip().isdigit()]
+
 CLOUDINARY_CLOUD = os.environ.get("CLOUDINARY_CLOUD", "dfhj3clbh")
 CLOUDINARY_KEY   = os.environ.get("CLOUDINARY_KEY",   "324844414354471")
 CLOUDINARY_SECRET= os.environ.get("CLOUDINARY_SECRET","F4cmCOwLzIcSyXBhKZFzQDHevOk")
@@ -355,6 +358,60 @@ async def cmd_recommend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🌟 *Congratulations!*\n\nYour business has been marked *Recommended by Samuga Travels!*\n\n💬 _{review_text}_",
             parse_mode="Markdown")
 
+# ── ADMIN COMMANDS ────────────────────────────────────────────────────────────
+async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in SUPER_ADMINS and update.effective_chat.id != ADMIN_GROUP_ID:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        ops = await conn.fetch("SELECT * FROM operators ORDER BY created_at DESC LIMIT 20")
+    if not ops:
+        await update.message.reply_text("No operators found.")
+        return
+    for op in ops:
+        status_icon = {"pending":"⏳","approved":"✅","rejected":"❌"}.get(op["status"],"❓")
+        rec_icon = "🌟" if op["is_recommended"] else ""
+        msg = (
+            f"{status_icon}{rec_icon} *{op['business_name']}*\n"
+            f"🛥️ {op['boat_name']} | 👤 @{op['telegram_username'] or 'N/A'} (`{op['telegram_id']}`)\n"
+            f"📊 Status: *{op['status'].upper()}*\n"
+            f"📅 Registered: {str(op['created_at'])[:10]}"
+        )
+        buttons = []
+        if op["status"] != "approved":
+            buttons.append(InlineKeyboardButton("✅ Approve", callback_data=f"approve_op_{op['id']}"))
+        if op["status"] != "rejected":
+            buttons.append(InlineKeyboardButton("❌ Reject", callback_data=f"reject_op_{op['id']}"))
+        row2 = []
+        if not op["is_recommended"]:
+            row2.append(InlineKeyboardButton("🌟 Recommend", callback_data=f"admin_recommend_{op['id']}"))
+        else:
+            row2.append(InlineKeyboardButton("⭐ Remove Badge", callback_data=f"admin_unrecommend_{op['id']}"))
+        row2.append(InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_delete_{op['id']}"))
+        row2.append(InlineKeyboardButton("🔄 Reset", callback_data=f"admin_reset_{op['id']}"))
+        kb = InlineKeyboardMarkup([buttons, row2] if buttons else [row2])
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+async def cmd_ops(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """List all approved operators"""
+    user = update.effective_user
+    if user.id not in SUPER_ADMINS and update.effective_chat.id != ADMIN_GROUP_ID:
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        ops = await conn.fetch("SELECT id, business_name, boat_name, status, telegram_id FROM operators ORDER BY status, business_name")
+    if not ops:
+        await update.message.reply_text("No operators.")
+        return
+    msg = "📋 *All Operators:*\n\n"
+
+    for op in ops:
+        icon = {"pending":"⏳","approved":"✅","rejected":"❌"}.get(op["status"],"❓")
+        msg += f"{icon} `{op['id']}` *{op['business_name']}* — {op['boat_name']}\n"
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 # ── OPERATOR REGISTRATION ─────────────────────────────────────────────────────
 async def start_op_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -367,11 +424,19 @@ async def start_op_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if s == "approved":
             await set_user_state(user.id, OP_IDLE, {}, role="operator")
             await msg.reply_text("✅ You're already a verified operator! Use /start to manage.")
+            return
         elif s == "pending":
-            await msg.reply_text("⏳ Your application is under review. We'll notify you once approved.")
-        else:
-            await msg.reply_text("❌ Your application was rejected. Contact @SamugaTravels for support.")
-        return
+            await msg.reply_text(
+                "⏳ Your application is still under review.\n\n"
+                "Our team will notify you once approved. If you need to update your details, "
+                "contact @SamugaTravels.")
+            return
+        elif s == "rejected":
+            # Allow re-registration after rejection
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute("DELETE FROM operators WHERE telegram_id=$1", user.id)
+            # Fall through to registration below
 
     await set_user_state(user.id, OP_AWAIT_BUSINESS_NAME, {}, role="operator_pending")
     await msg.reply_text(
@@ -886,6 +951,54 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
             await query.edit_message_text(f"❌ Operator *{row['business_name']}* rejected.", parse_mode="Markdown")
 
+    elif data.startswith("admin_delete_"):
+        op_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow("DELETE FROM operators WHERE id=$1 RETURNING telegram_id, business_name", op_id)
+        if row:
+            # Also reset user state so they can re-register
+            await set_user_state(row["telegram_id"], CX_IDLE, {}, role="customer")
+            await query.edit_message_text(f"🗑️ Operator *{row['business_name']}* deleted. They can now re-register.", parse_mode="Markdown")
+            try:
+                await ctx.bot.send_message(row["telegram_id"],
+                    "ℹ️ Your operator profile has been removed by Samuga Travels admin.\n"
+                    "You may register again with /register.", parse_mode="Markdown")
+            except: pass
+
+    elif data.startswith("admin_reset_"):
+        op_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE operators SET status='pending' WHERE id=$1 RETURNING telegram_id, business_name", op_id)
+        if row:
+            await set_user_state(row["telegram_id"], CX_IDLE, {}, role="customer")
+            await query.edit_message_text(f"🔄 Operator *{row['business_name']}* reset to pending.", parse_mode="Markdown")
+
+    elif data.startswith("admin_recommend_"):
+        op_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE operators SET is_recommended=TRUE WHERE id=$1 RETURNING telegram_id, business_name", op_id)
+        if row:
+            await query.edit_message_text(f"🌟 *{row['business_name']}* is now Recommended!", parse_mode="Markdown")
+            try:
+                await ctx.bot.send_message(row["telegram_id"],
+                    "🌟 *Congratulations!* Your business is now *Recommended by Samuga Travels!*\n\n"
+                    "Customers will see your badge when browsing boats. 🎉", parse_mode="Markdown")
+            except: pass
+
+    elif data.startswith("admin_unrecommend_"):
+        op_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE operators SET is_recommended=FALSE, review_text=NULL WHERE id=$1 RETURNING business_name", op_id)
+        if row:
+            await query.edit_message_text(f"⭐ Recommended badge removed from *{row['business_name']}*.", parse_mode="Markdown")
+
     elif data.startswith("confirm_booking_"):
         booking_id = int(data.split("_")[-1])
         await do_confirm_booking(ctx, booking_id, query)
@@ -1136,6 +1249,8 @@ async def main():
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
     app.add_handler(CommandHandler("register",  cmd_register))
     app.add_handler(CommandHandler("recommend", cmd_recommend))
+    app.add_handler(CommandHandler("admin",     cmd_admin))
+    app.add_handler(CommandHandler("ops",       cmd_ops))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
