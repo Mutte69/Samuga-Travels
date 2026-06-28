@@ -108,6 +108,7 @@ async def init_db():
                 total_seats INTEGER NOT NULL,
                 available_seats INTEGER NOT NULL,
                 is_active BOOLEAN DEFAULT TRUE,
+                sched_stops TEXT DEFAULT '[]',
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
@@ -409,13 +410,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown", reply_markup=boat_type_kb())
 
     elif state == OP_AWAIT_ROUTES:
-        routes = [r.strip() for r in text.split(",") if r.strip()]
-        if not routes:
-            await update.message.reply_text("⚠️ Please enter at least one route.")
+        stops = [s.strip() for s in text.split(",") if s.strip()]
+        if len(stops) < 2:
+            await update.message.reply_text(
+                "⚠️ Enter at least 2 stops separated by commas.\n\n"
+                "_Example: `Male, Dhigurah, Thoddoo, Dhagethi`_",
+                parse_mode="Markdown")
             return
-        await set_user_state(user.id, OP_AWAIT_OWNER_NAME, {**temp, "routes": routes})
+        route_display = " → ".join(stops)
+        await set_user_state(user.id, OP_AWAIT_OWNER_NAME, {**temp, "routes": stops, "route_display": route_display})
         await update.message.reply_text(
-            "✅ Routes saved!\n\n*Step 6 of 9:* What is the *owner's full name*?",
+            f"✅ Route saved!\n\n📍 *{route_display}*\n\n*Step 6 of 9:* What is the *owner's full name*?",
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_OWNER_NAME:
@@ -464,14 +469,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── SCHEDULE FLOW ─────────────────────────────────────────────────────────
     elif state == OP_AWAIT_SCHEDULE_ROUTE:
-        parts = [p.strip() for p in text.lower().split("to", 1)]
-        if len(parts) != 2 or not parts[0] or not parts[1]:
-            await update.message.reply_text("⚠️ Format: `Male to Thoddoo`", parse_mode="Markdown")
-            return
+        stops = [s.strip().title() for s in text.split(",") if s.strip()]
+        if len(stops) < 2:
+            # Also support "Male to Thoddoo" format as 2-stop
+            parts = [p.strip().title() for p in text.split("to", 1)]
+            if len(parts) == 2 and parts[0] and parts[1]:
+                stops = parts
+            else:
+                await update.message.reply_text(
+                    "⚠️ Enter stops comma-separated or use 'from to destination'\n\n"
+                    "_Single route: `Male, Thoddoo`_\n"
+                    "_Multi-stop: `Male, Dhigurah, Thoddoo, Dhagethi`_",
+                    parse_mode="Markdown")
+                return
+        route_display = " → ".join(stops)
+        sched_from = stops[0]
+        sched_to = stops[-1]
         await set_user_state(user.id, OP_AWAIT_SCHEDULE_TIME,
-                             {**temp, "sched_from": parts[0].title(), "sched_to": parts[1].title()})
+                             {**temp, "sched_from": sched_from, "sched_to": sched_to,
+                              "sched_stops": stops, "route_display": route_display})
         await update.message.reply_text(
-            "✅ Route saved!\n\nWhat is the *departure time*?\n\n_Example: 04:00 PM_",
+            f"✅ Route saved!\n\n📍 *{route_display}*\n\nWhat is the *departure time*?\n\n_Example: 04:00 PM_",
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_SCHEDULE_TIME:
@@ -500,12 +518,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         op  = await get_operator(user.id)
         pool = await get_pool()
         async with pool.acquire() as conn:
+            import json as _ji
+            await conn.execute("""
+                ALTER TABLE schedules ADD COLUMN IF NOT EXISTS sched_stops TEXT DEFAULT '[]'
+            """)
             await conn.execute("""
                 INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
-                                       price_per_seat, total_seats, available_seats)
-                VALUES ($1,$2,$3,$4,$5,$6,$7)
+                                       price_per_seat, total_seats, available_seats, sched_stops)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
             """, op["id"], t2.get("sched_from"), t2.get("sched_to"),
-                t2.get("sched_time"), t2.get("sched_price"), seats, seats)
+                t2.get("sched_time"), t2.get("sched_price"), seats, seats,
+                _ji.dumps(t2.get("sched_stops", [])))
         await set_user_state(user.id, OP_IDLE, {})
         await update.message.reply_text(
             f"✅ *Schedule Added!*\n\n"
@@ -530,7 +553,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pool = await get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT s.*, o.id as operator_id, o.business_name, o.boat_name, o.logo_url,
+                SELECT s.*, s.sched_stops, o.id as operator_id, o.business_name, o.boat_name, o.logo_url,
                        o.is_recommended, o.average_rating, o.total_reviews,
                        o.review_text, o.bml_account, o.payment_accounts, o.telegram_id as op_telegram_id
                 FROM schedules s
@@ -558,10 +581,22 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             rating_val = float(s.get("average_rating") or 0)
             stars = "⭐" * int(rating_val) if rating_val else "No ratings yet"
             rec = "✨ *Recommended by Samuga Travels*\n" if s.get("is_recommended") else ""
+            # Build stops line for multi-stop ferries
+            import json as _j
+            try:
+                stops_list = _j.loads(s.get("sched_stops") or "[]")
+                if stops_list and len(stops_list) > 2:
+                    stops_line = "🛑 " + " → ".join(stops_list) + "\n"
+                else:
+                    stops_line = ""
+            except Exception:
+                stops_line = ""
             msg += (
                 f"{'─'*30}\n"
                 f"🚤 *{s['business_name']}* — _{s['boat_name']}_\n"
                 f"{rec}"
+                f"📍 {s['route_from']} → {s['route_to']}\n"
+                f"{stops_line}"
                 f"⏰ Departure: *{s['departure_time']}*\n"
                 f"💺 Available: *{s['available_seats']} seats*\n"
                 f"💰 Price: *MVR {s['price_per_seat']}/seat*\n"
@@ -712,8 +747,12 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         url = await upload_image(file_bytes, "logos", f"logo_{user.id}")
         await set_user_state(user.id, OP_AWAIT_ROUTES, {**temp, "logo_url": url})
         await update.message.reply_text(
-            "✅ Logo uploaded!\n\n*Step 5 of 9:* What *routes* does your boat cover?\n\n"
-            "_Comma-separated: Male to Thoddoo, Male to Dhidhdhoo_",
+            "✅ Logo uploaded!\n\n*Step 5 of 9:* Enter your *route with all stops in order*\n\n"
+            "_For a ferry with multiple stops:_\n"
+            "`Male, Dhigurah, Thoddoo, Dhagethi`\n\n"
+            "_For a direct route:_\n"
+            "`Male, Thoddoo`\n\n"
+            "_Separate each stop with a comma in travel order._",
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_OWNER_ID_PHOTO:
