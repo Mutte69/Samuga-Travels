@@ -394,6 +394,76 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         kb = InlineKeyboardMarkup([buttons, row2] if buttons else [row2])
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
 
+async def cmd_urgent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Operator sends urgent review request"""
+    user = update.effective_user
+    op = await get_operator(user.id)
+    if not op:
+        await update.message.reply_text("⚠️ You don't have a pending application.")
+        return
+    if op["status"] == "approved":
+        await update.message.reply_text("✅ Your account is already approved!")
+        return
+    if op["status"] == "rejected":
+        await update.message.reply_text("❌ Your application was rejected. Contact @SamugaTravels.")
+        return
+
+    # Notify admin group with urgent flag
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT id FROM operators WHERE telegram_id=$1", user.id)
+    op_id = row["id"] if row else 0
+
+    urgent_msg = (
+        f"🚨 *URGENT REVIEW REQUEST*\n\n"
+        f"👤 @{user.username or user.first_name} (`{user.id}`)\n"
+        f"🏢 *{op['business_name']}*\n"
+        f"🛥️ {op['boat_name']}\n\n"
+        f"⚡ Operator is requesting urgent approval."
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve Now", callback_data=f"approve_op_{op_id}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"reject_op_{op_id}")
+    ]])
+    try:
+        await ctx.bot.send_message(ADMIN_GROUP_ID, urgent_msg, parse_mode="Markdown",
+                                   message_thread_id=ADMIN_THREAD_ID, reply_markup=kb)
+        await update.message.reply_text(
+            "🚨 *Urgent request sent!*\n\n"
+            "Our team has been notified and will review your application as soon as possible.\n\n"
+            "Thank you for your patience! 🙏",
+            parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Urgent notify error: {e}")
+        await update.message.reply_text("⚠️ Could not send request. Please contact @SamugaTravels directly.")
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Check application status"""
+    user = update.effective_user
+    op = await get_operator(user.id)
+    if not op:
+        await update.message.reply_text(
+            "📋 You don't have an operator application.\n\nTap below to register!",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🤝 Register as Operator", callback_data="register_operator")
+            ]]))
+        return
+    status_map = {
+        "pending":  ("⏳", "Under Review", "Our team is reviewing your application."),
+        "approved": ("✅", "Approved", "Your account is active. Use /start to manage."),
+        "rejected": ("❌", "Rejected", "Contact @SamugaTravels for more info.")
+    }
+    icon, label, note = status_map.get(op["status"], ("❓","Unknown",""))
+    rec = "🌟 *Recommended by Samuga Travels*\n" if op.get("is_recommended") else ""
+    await update.message.reply_text(
+        f"{icon} *Application Status: {label}*\n\n"
+        f"🏢 {op['business_name']}\n"
+        f"🛥️ {op['boat_name']}\n"
+        f"{rec}"
+        f"\n_{note}_\n\n"
+        f"{'Type /urgent if you need urgent review.' if op['status'] == 'pending' else ''}",
+        parse_mode="Markdown")
+
 async def cmd_ops(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """List all approved operators"""
     user = update.effective_user
@@ -426,10 +496,14 @@ async def start_op_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await msg.reply_text("✅ You're already a verified operator! Use /start to manage.")
             return
         elif s == "pending":
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🚨 Request Urgent Review", callback_data=f"urgent_review_{existing['id']}")
+            ]])
             await msg.reply_text(
-                "⏳ Your application is still under review.\n\n"
-                "Our team will notify you once approved. If you need to update your details, "
-                "contact @SamugaTravels.")
+                "⏳ *Your application is under review.*\n\n"
+                "Our team will notify you once approved.\n\n"
+                "Need it urgently? Tap the button below to flag your application:",
+                parse_mode="Markdown", reply_markup=kb)
             return
         elif s == "rejected":
             # Allow re-registration after rejection
@@ -951,6 +1025,65 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
             await query.edit_message_text(f"❌ Operator *{row['business_name']}* rejected.", parse_mode="Markdown")
 
+    elif data.startswith("urgent_review_"):
+        op_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            op = await conn.fetchrow("SELECT * FROM operators WHERE id=$1", op_id)
+        if op:
+            urgency_msg = (
+                f"🚨 *URGENT REVIEW REQUEST*\n\n"
+                f"👤 @{op['telegram_username'] or op['telegram_id']} (`{op['telegram_id']}`)\n"
+                f"🏢 *{op['business_name']}*\n"
+                f"🛥️ {op['boat_name']}\n\n"
+                f"Operator is requesting urgent approval."
+            )
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Approve Now", callback_data=f"approve_op_{op_id}"),
+                InlineKeyboardButton("❌ Reject", callback_data=f"reject_op_{op_id}")
+            ]])
+            try:
+                await ctx.bot.send_message(ADMIN_GROUP_ID, urgency_msg,
+                    parse_mode="Markdown", message_thread_id=ADMIN_THREAD_ID, reply_markup=kb)
+                await query.answer("🚨 Urgent request sent to admin!", show_alert=True)
+                await query.edit_message_text(
+                    "🚨 *Urgent review request sent!*\n\n"
+                    "Our team has been notified. You will hear back shortly.",
+                    parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Urgent notify error: {e}")
+                await query.answer("Failed to send. Try again.", show_alert=True)
+
+    elif data.startswith("urgent_review_"):
+        op_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            op = await conn.fetchrow("SELECT * FROM operators WHERE id=$1", op_id)
+        if not op:
+            await query.answer("Application not found.", show_alert=True)
+            return
+        urgent_msg = (
+            f"🚨 *URGENT REVIEW REQUEST*\n\n"
+            f"👤 @{op['telegram_username'] or 'N/A'} (`{op['telegram_id']}`)\n"
+            f"🏢 *{op['business_name']}*\n"
+            f"🛥️ {op['boat_name']}\n\n"
+            f"⚡ Operator is requesting urgent approval."
+        )
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Approve Now", callback_data=f"approve_op_{op_id}"),
+            InlineKeyboardButton("❌ Reject", callback_data=f"reject_op_{op_id}")
+        ]])
+        try:
+            await ctx.bot.send_message(ADMIN_GROUP_ID, urgent_msg, parse_mode="Markdown",
+                                       message_thread_id=ADMIN_THREAD_ID, reply_markup=kb)
+            await query.edit_message_text(
+                "🚨 *Urgent request sent to admin!*\n\n"
+                "Our team has been notified and will review your application as soon as possible. 🙏",
+                parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Urgent cb error: {e}")
+            await query.answer("Could not send. Contact @SamugaTravels.", show_alert=True)
+
     elif data.startswith("admin_delete_"):
         op_id = int(data.split("_")[-1])
         pool = await get_pool()
@@ -1251,6 +1384,8 @@ async def main():
     app.add_handler(CommandHandler("recommend", cmd_recommend))
     app.add_handler(CommandHandler("admin",     cmd_admin))
     app.add_handler(CommandHandler("ops",       cmd_ops))
+    app.add_handler(CommandHandler("urgent",    cmd_urgent))
+    app.add_handler(CommandHandler("status",    cmd_status))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
