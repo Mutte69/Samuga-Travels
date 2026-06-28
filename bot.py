@@ -43,6 +43,7 @@ OP_AWAIT_BML_ACCOUNT="op_await_bml_account"; OP_AWAIT_MIB_ACCOUNT="op_await_mib_
 OP_AWAIT_SCHEDULE_ROUTE="op_await_schedule_route"; OP_AWAIT_SCHEDULE_TIME="op_await_schedule_time"
 OP_AWAIT_SCHEDULE_PRICE="op_await_schedule_price"; OP_AWAIT_SCHEDULE_SEATS="op_await_schedule_seats"
 CX_IDLE="cx_idle"; CX_AWAIT_DATE="cx_await_date"
+CX_AWAIT_CONTACT="cx_await_contact"
 CX_AWAIT_PASSENGER_COUNT="cx_await_passenger_count"
 CX_COLLECTING_PASSENGERS="cx_collecting_passengers"; CX_AWAIT_PAYMENT_SLIP="cx_await_payment_slip"
 CX_BOOKING_COMPLETE="cx_booking_complete"
@@ -575,6 +576,22 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
 
+    elif state == CX_AWAIT_CONTACT:
+        parts = text.split(",", 1)
+        if len(parts) != 2:
+            await update.message.reply_text("⚠️ Format: `Full Name, Phone Number`\n\nExample: `Ahmed Ali, 7771234`", parse_mode="Markdown")
+            return
+        cx_name = parts[0].strip()
+        cx_phone = parts[1].strip()
+        await set_user_state(user.id, CX_AWAIT_PASSENGER_COUNT, {**temp, "cx_name": cx_name, "cx_phone": cx_phone})
+        schedules = temp.get("schedules", [])
+        idx = temp.get("selected_schedule_idx", 0)
+        sel = schedules[idx] if schedules else {}
+        await update.message.reply_text(
+            f"✅ *{cx_name}* saved!\n\n"
+            f"💺 How many seats would you like to book?\n_(Max 10, available: {sel.get('available_seats',0)})_",
+            parse_mode="Markdown")
+
     elif state == CX_AWAIT_PASSENGER_COUNT:
         if not text.isdigit() or int(text) < 1:
             await update.message.reply_text("⚠️ Enter a valid number (1-10).")
@@ -641,6 +658,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
             summary = (
                 f"📝 *Booking Summary*\n\n"
+                f"👤 *Booker:* {t3.get('cx_name','N/A')} | 📞 {t3.get('cx_phone','N/A')}\n"
                 f"🚤 *Operator:* {sel.get('business_name')}\n"
                 f"🛥️ *Boat:* {sel.get('boat_name')}\n"
                 f"📍 *Route:* {t3.get('route_from')} → {t3.get('route_to')}\n"
@@ -720,12 +738,13 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pool = await get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow("""
-                INSERT INTO bookings (booking_ref, customer_telegram_id, operator_id, schedule_id,
+                INSERT INTO bookings (booking_ref, customer_telegram_id, customer_name, operator_id, schedule_id,
                                       travel_date, passenger_count, passengers, total_amount,
                                       payment_slip_url, status)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending_confirmation')
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending_confirmation')
                 RETURNING id
-            """, ref, user.id, sel.get("operator_id"), sel.get("id"),
+            """, ref, user.id, f"{t2.get('cx_name','')} | {t2.get('cx_phone','')}",
+                sel.get("operator_id"), sel.get("id"),
                 t2.get("travel_date"), t2.get("passenger_count"),
                 json.dumps(t2.get("passengers_collected",[])),
                 t2.get("total_amount"), url)
@@ -787,11 +806,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.message.reply_text("⚠️ Invalid selection.")
             return
         sel = schedules[idx]
-        await set_user_state(user.id, CX_AWAIT_PASSENGER_COUNT, {**temp, "selected_schedule_idx": idx})
+        await set_user_state(user.id, CX_AWAIT_CONTACT, {**temp, "selected_schedule_idx": idx})
         await query.message.reply_text(
             f"✅ *{sel['business_name']}* selected!\n\n"
             f"⏰ {sel['departure_time']} | 💺 {sel['available_seats']} seats available\n\n"
-            f"How many seats? _(Max 10)_",
+            f"👤 *Your contact details:*\n\nEnter your *Full Name* and *Phone Number*:\n\n_Format: Ahmed Ali, 7771234_",
             parse_mode="Markdown")
 
     elif data.startswith("type_"):
@@ -971,6 +990,7 @@ async def notify_operator_payment(ctx, booking_id, sel, temp, ref, customer, sli
     msg = (
         f"💳 *New Payment Received!*\n\n"
         f"🔖 Ref: `{ref}`\n"
+        f"👤 *Customer:* {temp.get('cx_name','N/A')} | 📞 {temp.get('cx_phone','N/A')}\n"
         f"📍 {temp.get('route_from')} → {temp.get('route_to')}\n"
         f"📅 {temp.get('travel_date')} @ {sel.get('departure_time')}\n"
         f"👥 {temp.get('passenger_count')} passengers:\n{pax_lines}\n"
