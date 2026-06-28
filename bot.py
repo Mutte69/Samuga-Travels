@@ -973,16 +973,26 @@ async def do_confirm_booking(ctx, booking_id: int, query):
     await query.edit_message_caption(
         caption=f"✅ Booking `{booking['booking_ref']}` confirmed! Ticket sent.", parse_mode="Markdown")
 
-# ── MAIN ──────────────────────────────────────────────────────────────────────
-async def post_init(app: Application) -> None:
-    await init_db()
-    logger.info("🌊 Samuga Travels Bot v1.1 ready!")
+# ── ERROR HANDLER ─────────────────────────────────────────────────────────────
+async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"Exception while handling update: {ctx.error}", exc_info=ctx.error)
+    if isinstance(update, Update) and update.effective_message:
+        try:
+            await update.effective_message.reply_text(
+                "⚠️ Something went wrong. Please try again or send /start")
+        except Exception:
+            pass
 
+# ── MAIN ──────────────────────────────────────────────────────────────────────
 async def main():
+    # Init DB first before anything else
+    logger.info("🌊 Starting Samuga Travels Bot v1.1...")
+    await init_db()
+    logger.info("✅ DB ready — building bot...")
+
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(post_init)
         .build()
     )
     app.add_handler(CommandHandler("start",     cmd_start))
@@ -992,11 +1002,12 @@ async def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    logger.info("🌊 Starting Samuga Travels Bot v1.1...")
+    app.add_error_handler(error_handler)
+
     await app.initialize()
     await app.start()
     await app.updater.start_polling(drop_pending_updates=True)
-    # Keep running
+    logger.info("🌊 Samuga Travels Bot v1.1 LIVE!")
     await asyncio.Event().wait()
 
 if __name__ == "__main__":
