@@ -39,7 +39,7 @@ OP_AWAIT_LOGO="op_await_logo"; OP_AWAIT_BOAT_NAME="op_await_boat_name"
 OP_AWAIT_SEATS="op_await_seats"; OP_AWAIT_TYPE="op_await_type"
 OP_AWAIT_ROUTES="op_await_routes"; OP_AWAIT_OWNER_NAME="op_await_owner_name"
 OP_AWAIT_OWNER_CONTACT="op_await_owner_contact"; OP_AWAIT_OWNER_ID_PHOTO="op_await_owner_id_photo"
-OP_AWAIT_BML_ACCOUNT="op_await_bml_account"; OP_REGISTERED="op_registered"
+OP_AWAIT_BML_ACCOUNT="op_await_bml_account"; OP_AWAIT_MIB_ACCOUNT="op_await_mib_account"; OP_REGISTERED="op_registered"
 OP_AWAIT_SCHEDULE_ROUTE="op_await_schedule_route"; OP_AWAIT_SCHEDULE_TIME="op_await_schedule_time"
 OP_AWAIT_SCHEDULE_PRICE="op_await_schedule_price"; OP_AWAIT_SCHEDULE_SEATS="op_await_schedule_seats"
 CX_IDLE="cx_idle"; CX_AWAIT_DATE="cx_await_date"
@@ -87,6 +87,7 @@ async def init_db():
                 owner_contact TEXT,
                 owner_id_photo_url TEXT,
                 bml_account TEXT,
+                payment_accounts TEXT DEFAULT '[]',
                 status TEXT DEFAULT 'pending',
                 is_recommended BOOLEAN DEFAULT FALSE,
                 review_text TEXT,
@@ -430,14 +431,34 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_BML_ACCOUNT:
-        final_temp = {**temp, "bml_account": text}
+        parts = text.strip().split(" ", 1)
+        acct_num = parts[0].strip()
+        acct_name = parts[1].strip() if len(parts) > 1 else ""
+        bml_entry = f"{acct_num}|{acct_name}" if acct_name else acct_num
+        await set_user_state(user.id, OP_AWAIT_MIB_ACCOUNT, {**temp, "bml_account": bml_entry})
+        await update.message.reply_text(
+            "✅ *BML account saved!*\n\n"
+            "Do you also have an *MIB (Maldives Islamic Bank)* account?\n\n"
+            "_Enter number and account name e.g:_\n`90101480050561001 Samuga Travels`\n\n"
+            "_Or type_ *skip* _if not._",
+            parse_mode="Markdown")
+
+    elif state == OP_AWAIT_MIB_ACCOUNT:
+        if text.strip().lower() == "skip":
+            mib_entry = ""
+        else:
+            parts = text.strip().split(" ", 1)
+            acct_num = parts[0].strip()
+            acct_name = parts[1].strip() if len(parts) > 1 else ""
+            mib_entry = f"{acct_num}|{acct_name}" if acct_name else acct_num
+        final_temp = {**temp, "mib_account": mib_entry}
         await save_operator(user, final_temp)
         await notify_admin_new_op(ctx, user, final_temp)
         await set_user_state(user.id, OP_REGISTERED, {})
         await update.message.reply_text(
             "🎉 *Registration Complete!*\n\n"
             "Your application has been submitted to Samuga Travels for review.\n\n"
-            "⏳ We'll verify your details and notify you here within 24 hours. Thank you! 🌊",
+            "⏳ We\'ll verify your details and notify you here within 24 hours. Thank you! 🌊",
             parse_mode="Markdown")
 
     # ── SCHEDULE FLOW ─────────────────────────────────────────────────────────
@@ -510,7 +531,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             rows = await conn.fetch("""
                 SELECT s.*, o.id as operator_id, o.business_name, o.boat_name, o.logo_url,
                        o.is_recommended, o.average_rating, o.total_reviews,
-                       o.review_text, o.bml_account, o.telegram_id as op_telegram_id
+                       o.review_text, o.bml_account, o.payment_accounts, o.telegram_id as op_telegram_id
                 FROM schedules s
                 JOIN operators o ON s.operator_id = o.id
                 WHERE LOWER(s.route_from) LIKE $1 AND LOWER(s.route_to) LIKE $2
@@ -603,6 +624,21 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sel = schedules[idx] if schedules else {}
             total_amt = float(sel.get("price_per_seat",0)) * total
             pax_lines = "\n".join([f"  {i+1}. {p['name']} ({p['id_number']})" for i,p in enumerate(passengers)])
+            # Build payment accounts display
+            import json as _json
+            pay_str = ""
+            try:
+                accounts = _json.loads(sel.get("payment_accounts") or "[]")
+                if accounts:
+                    for acc in accounts:
+                        pay_str += f"🏦 *{acc['bank']}:* `{acc['number']}`"
+                        if acc.get("name"): pay_str += f" — {acc['name']}"
+                        pay_str += "\n"
+                else:
+                    pay_str = f"🏦 *BML:* `{sel.get('bml_account','N/A')}`\n"
+            except Exception:
+                pay_str = f"🏦 *BML:* `{sel.get('bml_account','N/A')}`\n"
+
             summary = (
                 f"📝 *Booking Summary*\n\n"
                 f"🚤 *Operator:* {sel.get('business_name')}\n"
@@ -613,11 +649,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"👥 *Passengers ({total}):*\n{pax_lines}\n\n"
                 f"💰 *Total:* MVR {total_amt:.2f}\n\n"
                 f"{'─'*30}\n"
-                f"💳 *Payment — Transfer to BML:*\n\n"
-                f"🏦 Account: `{sel.get('bml_account','N/A')}`\n"
-                f"📛 Name: {sel.get('business_name')}\n"
+                f"💳 *Payment Details:*\n\n"
+                f"{pay_str}"
                 f"💰 Amount: *MVR {total_amt:.2f}*\n\n"
-                f"👉 After transferring, *upload your BML screenshot here.*"
+                f"👉 After transferring, *upload your payment screenshot here.*"
             )
             await set_user_state(user.id, CX_AWAIT_PAYMENT_SLIP,
                                  {**t3, "total_amount": str(total_amt), "passengers_collected": passengers})
@@ -668,8 +703,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         url = await upload_image(file_bytes, "id_photos", f"id_{user.id}")
         await set_user_state(user.id, OP_AWAIT_BML_ACCOUNT, {**temp, "owner_id_photo_url": url})
         await update.message.reply_text(
-            "✅ ID uploaded!\n\n*Step 9 of 9:* Your *BML bank account number*?\n\n"
-            "_Customers will transfer payments here_\n_Example: 7730001234567_",
+            "✅ ID uploaded!\n\n*Step 9 of 10:* Your *BML bank account number and account name*?\n\n"
+            "_Format: AccountNumber AccountName_\n_Example: 7770000234231 Samuga Art_",
             parse_mode="Markdown")
 
     elif state == CX_AWAIT_PAYMENT_SLIP:
@@ -852,20 +887,44 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 async def save_operator(user, temp: dict):
+    import json as _json
+    # Build payment accounts list
+    accounts = []
+    if temp.get("bml_account"):
+        parts = temp["bml_account"].split("|", 1)
+        accounts.append({"bank": "BML", "number": parts[0].strip(), "name": parts[1].strip() if len(parts) > 1 else ""})
+    if temp.get("mib_account"):
+        parts = temp["mib_account"].split("|", 1)
+        accounts.append({"bank": "MIB", "number": parts[0].strip(), "name": parts[1].strip() if len(parts) > 1 else ""})
+    payment_accounts_json = _json.dumps(accounts)
+
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # Add payment_accounts column if it doesn't exist
+        await conn.execute("""
+            ALTER TABLE operators ADD COLUMN IF NOT EXISTS payment_accounts TEXT DEFAULT '[]'
+        """)
         await conn.execute("""
             INSERT INTO operators (telegram_id, telegram_username, business_name, boat_name,
                                    logo_url, seat_count, boat_type, routes, owner_name,
-                                   owner_contact, owner_id_photo_url, bml_account, status)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'pending')
+                                   owner_contact, owner_id_photo_url, bml_account,
+                                   payment_accounts, status)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,'pending')
             ON CONFLICT (telegram_id) DO UPDATE SET
-                business_name=EXCLUDED.business_name, boat_name=EXCLUDED.boat_name,
-                logo_url=EXCLUDED.logo_url, status='pending'
+                business_name=EXCLUDED.business_name,
+                boat_name=EXCLUDED.boat_name,
+                logo_url=EXCLUDED.logo_url,
+                owner_name=EXCLUDED.owner_name,
+                owner_contact=EXCLUDED.owner_contact,
+                owner_id_photo_url=EXCLUDED.owner_id_photo_url,
+                bml_account=EXCLUDED.bml_account,
+                payment_accounts=EXCLUDED.payment_accounts,
+                status='pending'
         """, user.id, user.username, temp.get("business_name"), temp.get("boat_name"),
-            temp.get("logo_url"), temp.get("seat_count"), temp.get("boat_type"),
+            temp.get("logo_url"), int(temp.get("seat_count") or 0), temp.get("boat_type"),
             temp.get("routes",[]), temp.get("owner_name"), temp.get("owner_contact"),
-            temp.get("owner_id_photo_url"), temp.get("bml_account"))
+            temp.get("owner_id_photo_url"), temp.get("bml_account",""),
+            payment_accounts_json)
 
 async def notify_admin_new_op(ctx, user, temp: dict):
     pool = await get_pool()
@@ -881,7 +940,8 @@ async def notify_admin_new_op(ctx, user, temp: dict):
         f"📍 {temp.get('boat_type','ferry').title()}\n"
         f"🗺️ {', '.join(temp.get('routes',[]))}\n"
         f"👤 {temp.get('owner_name')} | 📞 {temp.get('owner_contact')}\n"
-        f"🏦 BML: `{temp.get('bml_account')}`"
+        f"🏦 BML: `{temp.get('bml_account','N/A')}`\n"
+        f"🏦 MIB: `{temp.get('mib_account','—')}`"
     )
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Approve", callback_data=f"approve_op_{op_id}"),
