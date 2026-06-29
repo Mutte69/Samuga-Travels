@@ -67,6 +67,8 @@ OP_BULK_FRI_DEPS="op_bulk_fri_deps"
 ADMIN_AWAIT_BROADCAST="admin_await_broadcast"
 ADMIN_AWAIT_LOGO="admin_await_logo"
 ADMIN_AWAIT_REVIEW_TEXT="admin_await_review_text"
+# Subscription states
+OP_AWAIT_SUB_SLIP="op_await_sub_slip"
 
 # ── SMART INPUT HELPERS ──────────────────────────────────────────────────────
 def normalize_input(text: str) -> str:
@@ -331,6 +333,33 @@ async def init_db():
             INSERT INTO settings (key, value) VALUES ('samuga_logo_url', '')
             ON CONFLICT (key) DO NOTHING
         """)
+        await conn.execute("""
+            INSERT INTO settings (key, value) VALUES ('subscription_fee', '500')
+            ON CONFLICT (key) DO NOTHING
+        """)
+        await conn.execute("""
+            INSERT INTO settings (key, value) VALUES ('subscription_accounts', '[]')
+            ON CONFLICT (key) DO NOTHING
+        """)
+        # Subscriptions table
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                id SERIAL PRIMARY KEY,
+                operator_id INTEGER REFERENCES operators(id) ON DELETE CASCADE,
+                plan TEXT DEFAULT 'trial',
+                trial_started_at TIMESTAMP DEFAULT NOW(),
+                trial_ends_at TIMESTAMP,
+                paid_until TIMESTAMP,
+                status TEXT DEFAULT 'trial',
+                payment_slip_url TEXT,
+                payment_amount DECIMAL(10,2),
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        # Add trial columns to operators if missing
+        await conn.execute("ALTER TABLE operators ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP DEFAULT NOW()")
+        await conn.execute("ALTER TABLE operators ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'trial'")
     logger.info("✅ Database initialized")
 
 # ── DB HELPERS ────────────────────────────────────────────────────────────────
@@ -386,6 +415,79 @@ async def set_setting(key: str, value: str):
             INSERT INTO settings (key, value, updated_at) VALUES ($1,$2,NOW())
             ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()
         """, key, value)
+
+async def get_subscription(operator_id: int) -> dict | None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM subscriptions WHERE operator_id=$1 ORDER BY created_at DESC LIMIT 1",
+            operator_id)
+    return dict(row) if row else None
+
+async def create_trial(operator_id: int):
+    """Create a 2-month free trial when operator is first approved."""
+    from datetime import timedelta
+    trial_end = datetime.now() + timedelta(days=60)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO subscriptions (operator_id, plan, trial_ends_at, status)
+            VALUES ($1, 'trial', $2, 'trial')
+            ON CONFLICT DO NOTHING
+        """, operator_id, trial_end)
+        await conn.execute("""
+            UPDATE operators SET subscription_status='trial', trial_started_at=NOW()
+            WHERE id=$1
+        """, operator_id)
+
+async def get_sub_status(operator_id: int) -> dict:
+    """
+    Returns subscription status dict:
+    {
+      "status": "trial" | "active" | "expired" | "grace",
+      "days_left": int,
+      "trial": bool,
+      "message": str
+    }
+    """
+    from datetime import timedelta
+    sub = await get_subscription(operator_id)
+    now = datetime.now()
+
+    if not sub:
+        return {"status": "trial", "days_left": 60, "trial": True,
+                "message": "Free trial active"}
+
+    if sub["status"] == "trial":
+        trial_end = sub["trial_ends_at"]
+        if trial_end and now < trial_end:
+            days_left = (trial_end - now).days
+            return {"status": "trial", "days_left": days_left, "trial": True,
+                    "message": f"Free trial — {days_left} days remaining"}
+        else:
+            return {"status": "expired", "days_left": 0, "trial": False,
+                    "message": "Free trial ended — please subscribe to continue"}
+
+    if sub["status"] == "active":
+        paid_until = sub["paid_until"]
+        if paid_until and now < paid_until:
+            days_left = (paid_until - now).days
+            if days_left <= 7:
+                return {"status": "grace", "days_left": days_left, "trial": False,
+                        "message": f"⚠️ Subscription expires in {days_left} days!"}
+            return {"status": "active", "days_left": days_left, "trial": False,
+                    "message": f"Subscription active — {days_left} days remaining"}
+        else:
+            return {"status": "expired", "days_left": 0, "trial": False,
+                    "message": "Subscription expired — renew to stay listed"}
+
+    return {"status": "expired", "days_left": 0, "trial": False,
+            "message": "Subscription required"}
+
+async def operator_is_active(operator_id: int) -> bool:
+    """Check if operator can receive bookings (trial or paid)."""
+    status = await get_sub_status(operator_id)
+    return status["status"] in ["trial", "active", "grace"]
 
 async def get_operator(telegram_id: int):
     pool = await get_pool()
@@ -918,7 +1020,42 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     # ── ADMIN MESSAGE STATES ─────────────────────────────────────────────────
-    if state == ADMIN_AWAIT_BROADCAST:
+    if state == "admin_await_sub_fee":
+        fee = parse_price(text)
+        if not fee or fee <= 0:
+            await update.message.reply_text("⚠️ Enter valid amount e.g. `500`", parse_mode="Markdown")
+            return
+        await set_setting("subscription_fee", str(int(fee)))
+        await set_user_state(user.id, CX_IDLE, {})
+        await update.message.reply_text(
+            f"✅ Subscription fee set to *MVR {int(fee)}/month*", parse_mode="Markdown")
+        return
+
+    elif state == "admin_await_sub_accounts":
+        import json as _j
+        lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+        accounts = []
+        for line in lines:
+            parts = line.split(" ", 2)
+            if len(parts) >= 2:
+                accounts.append({
+                    "bank": parts[0].upper(),
+                    "number": parts[1],
+                    "name": parts[2] if len(parts) > 2 else ""
+                })
+        if not accounts:
+            await update.message.reply_text("⚠️ Couldn't read accounts. Try:\n`BML 7770001234 Samuga Travels`", parse_mode="Markdown")
+            return
+        await set_setting("subscription_accounts", _j.dumps(accounts))
+        await set_user_state(user.id, CX_IDLE, {})
+        lines_out = "\n".join([f"🏦 {a['bank']}: {a['number']} — {a['name']}" for a in accounts])
+        await update.message.reply_text(
+            f"✅ *Payment accounts saved!*\n\n{lines_out}\n\n"
+            f"Operators will see these when paying their subscription.",
+            parse_mode="Markdown")
+        return
+
+    elif state == ADMIN_AWAIT_BROADCAST:
         if is_cancel(text):
             await set_user_state(user.id, CX_IDLE, {})
             await update.message.reply_text("❌ Broadcast cancelled.")
@@ -1776,6 +1913,47 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
 
 
+    elif state == OP_AWAIT_SUB_SLIP:
+        op_id = (temp or {}).get("sub_operator_id")
+        amount = (temp or {}).get("sub_amount", "500")
+        if not op_id:
+            await update.message.reply_text("⚠️ Session expired. Try again from My Subscription.")
+            return
+        await update.message.reply_text("⏳ Uploading payment slip...")
+        slip_url = await upload_image(file_bytes, "subscription_slips", f"sub_{op_id}_{int(datetime.now().timestamp())}")
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            sub_row = await conn.fetchrow("""
+                INSERT INTO subscriptions (operator_id, plan, status, payment_slip_url, payment_amount)
+                VALUES ($1, 'monthly', 'pending', $2, $3)
+                RETURNING id
+            """, op_id, slip_url, float(amount))
+            op_row = await conn.fetchrow("SELECT business_name, telegram_id FROM operators WHERE id=$1", op_id)
+        sub_id = sub_row["id"]
+        await set_user_state(user.id, OP_IDLE, {})
+        await update.message.reply_text(
+            f"✅ *Payment slip received!*\n\n"
+            f"Our team will verify and activate your subscription within a few hours. 🙏",
+            parse_mode="Markdown")
+        # Notify admin
+        try:
+            await ctx.bot.send_photo(ADMIN_GROUP_ID,
+                photo=photo.file_id,
+                caption=(
+                    f"💳 *Subscription Payment*\n\n"
+                    f"🏢 *{op_row['business_name']}*\n"
+                    f"💰 Amount: MVR {amount}\n\n"
+                    f"Approve to activate 30 days."
+                ),
+                parse_mode="Markdown",
+                message_thread_id=ADMIN_THREAD_ID,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Approve — Activate 30 Days", callback_data=f"sub_approve_{sub_id}")],
+                    [InlineKeyboardButton("❌ Reject Payment", callback_data=f"sub_reject_{sub_id}")]
+                ]))
+        except Exception as e:
+            logger.error(f"Sub admin notify error: {e}")
+
     elif state == ADMIN_AWAIT_LOGO:
         if not is_admin(user.id, update.effective_chat.id):
             await update.message.reply_text("⛔ Admin only.")
@@ -1937,11 +2115,22 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "UPDATE operators SET status='approved' WHERE id=$1 RETURNING telegram_id, business_name", op_id)
         if row:
             await set_user_state(row["telegram_id"], OP_IDLE, {}, role="operator")
+            # Start 2-month free trial
+            await create_trial(op_id)
+            from datetime import timedelta
+            trial_end = (datetime.now() + timedelta(days=60)).strftime("%d %b %Y")
             await ctx.bot.send_message(row["telegram_id"],
-                f"🎉 *Congratulations!*\n\n*{row['business_name']}* has been *approved* by Samuga Travels!\n\n"
-                f"You can now add schedules and receive bookings.\n\nUse /start to manage your account. 🌊",
+                f"🎉 *Congratulations! You're approved!*\n\n"
+                f"*{row['business_name']}* is now live on Samuga Travels!\n\n"
+                f"🎁 *Free Trial: 2 Months*\n"
+                f"Your free trial runs until *{trial_end}* — no payment needed now.\n\n"
+                f"After that, a small monthly fee of *MVR 500* keeps you listed.\n"
+                f"We'll remind you before your trial ends. 🙏\n\n"
+                f"Use /start to add your schedules and start receiving bookings! 🌊",
                 parse_mode="Markdown")
-            await query.edit_message_text(f"✅ Operator *{row['business_name']}* approved!", parse_mode="Markdown")
+            await query.edit_message_text(
+                f"✅ Operator *{row['business_name']}* approved! 2-month trial started.",
+                parse_mode="Markdown")
 
     elif data.startswith("reject_op_"):
         op_id = int(data.split("_")[-1])
@@ -2327,16 +2516,63 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "adm_settings":
         if not await admin_check(query, ctx): return
         samuga_logo = await get_setting("samuga_logo_url", "Not set")
+        sub_fee = await get_setting("subscription_fee", "500")
+        sub_accounts = await get_setting("subscription_accounts", "[]")
         msg = (
             f"⚙️ *Settings*\n\n"
-            f"🖼️ Samuga Logo URL:\n`{samuga_logo[:60]}...`\n\n"
-            f"_More settings coming soon_"
+            f"🖼️ Samuga Logo: {'✅ Set' if samuga_logo else '❌ Not set'}\n\n"
+            f"💳 *Subscription:*\n"
+            f"  Monthly fee: *MVR {sub_fee}*\n"
+            f"  Payment accounts: {'✅ Set' if sub_accounts != '[]' else '❌ Not set'}\n"
         )
         await query.message.reply_text(msg, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🖼️ Update Logo", callback_data="adm_upload_logo")],
+                [InlineKeyboardButton("💳 Subscriptions", callback_data="adm_subscriptions")],
                 [InlineKeyboardButton("🔙 Back to Admin", callback_data="adm_back")]
             ]))
+
+    elif data == "adm_subscriptions":
+        if not await admin_check(query, ctx): return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            subs = await conn.fetch("""
+                SELECT s.*, o.business_name, o.telegram_id
+                FROM subscriptions s JOIN operators o ON s.operator_id=o.id
+                ORDER BY s.created_at DESC LIMIT 20
+            """)
+        fee = await get_setting("subscription_fee", "500")
+        sub_icons = {"trial":"🎁","active":"✅","expired":"❌","pending":"⏳","grace":"⚠️"}
+        msg = f"💳 *Subscriptions* | Fee: MVR {fee}/month\n\n"
+        for s in subs:
+            ic = sub_icons.get(s["status"],"❓")
+            end = s["trial_ends_at"] or s["paid_until"]
+            end_str = end.strftime("%d %b %Y") if end else "N/A"
+            msg += f"{ic} *{s['business_name']}* — {s['status'].upper()} until {end_str}\n"
+        if not subs: msg += "_No subscriptions yet._"
+        await query.message.reply_text(msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💰 Set Fee", callback_data="adm_set_fee")],
+                [InlineKeyboardButton("🏦 Set Payment Accounts", callback_data="adm_set_sub_accounts")],
+            ]))
+
+    elif data == "adm_set_fee":
+        if not await admin_check(query, ctx): return
+        await set_user_state(user.id, "admin_await_sub_fee", {})
+        await query.message.reply_text(
+            "💰 *Set Subscription Fee*\n\nEnter the monthly fee in MVR:\n_Example: 500_",
+            parse_mode="Markdown")
+
+    elif data == "adm_set_sub_accounts":
+        if not await admin_check(query, ctx): return
+        await set_user_state(user.id, "admin_await_sub_accounts", {})
+        await query.message.reply_text(
+            "🏦 *Set Samuga Travels Payment Accounts*\n\n"
+            "Enter one per line: BANK NUMBER NAME\n\n"
+            "_Example:_\n"
+            "`BML 7770001234567 Samuga Travels`\n"
+            "`MIB 90101234567890 Samuga Travels`",
+            parse_mode="Markdown")
 
     elif data == "adm_schedules":
         if not await admin_check(query, ctx): return
@@ -2768,16 +3004,63 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data == "adm_settings":
         if not await admin_check(query, ctx): return
         samuga_logo = await get_setting("samuga_logo_url", "Not set")
+        sub_fee = await get_setting("subscription_fee", "500")
+        sub_accounts = await get_setting("subscription_accounts", "[]")
         msg = (
             f"⚙️ *Settings*\n\n"
-            f"🖼️ Samuga Logo URL:\n`{samuga_logo[:60]}...`\n\n"
-            f"_More settings coming soon_"
+            f"🖼️ Samuga Logo: {'✅ Set' if samuga_logo else '❌ Not set'}\n\n"
+            f"💳 *Subscription:*\n"
+            f"  Monthly fee: *MVR {sub_fee}*\n"
+            f"  Payment accounts: {'✅ Set' if sub_accounts != '[]' else '❌ Not set'}\n"
         )
         await query.message.reply_text(msg, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🖼️ Update Logo", callback_data="adm_upload_logo")],
+                [InlineKeyboardButton("💳 Subscriptions", callback_data="adm_subscriptions")],
                 [InlineKeyboardButton("🔙 Back to Admin", callback_data="adm_back")]
             ]))
+
+    elif data == "adm_subscriptions":
+        if not await admin_check(query, ctx): return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            subs = await conn.fetch("""
+                SELECT s.*, o.business_name, o.telegram_id
+                FROM subscriptions s JOIN operators o ON s.operator_id=o.id
+                ORDER BY s.created_at DESC LIMIT 20
+            """)
+        fee = await get_setting("subscription_fee", "500")
+        sub_icons = {"trial":"🎁","active":"✅","expired":"❌","pending":"⏳","grace":"⚠️"}
+        msg = f"💳 *Subscriptions* | Fee: MVR {fee}/month\n\n"
+        for s in subs:
+            ic = sub_icons.get(s["status"],"❓")
+            end = s["trial_ends_at"] or s["paid_until"]
+            end_str = end.strftime("%d %b %Y") if end else "N/A"
+            msg += f"{ic} *{s['business_name']}* — {s['status'].upper()} until {end_str}\n"
+        if not subs: msg += "_No subscriptions yet._"
+        await query.message.reply_text(msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💰 Set Fee", callback_data="adm_set_fee")],
+                [InlineKeyboardButton("🏦 Set Payment Accounts", callback_data="adm_set_sub_accounts")],
+            ]))
+
+    elif data == "adm_set_fee":
+        if not await admin_check(query, ctx): return
+        await set_user_state(user.id, "admin_await_sub_fee", {})
+        await query.message.reply_text(
+            "💰 *Set Subscription Fee*\n\nEnter the monthly fee in MVR:\n_Example: 500_",
+            parse_mode="Markdown")
+
+    elif data == "adm_set_sub_accounts":
+        if not await admin_check(query, ctx): return
+        await set_user_state(user.id, "admin_await_sub_accounts", {})
+        await query.message.reply_text(
+            "🏦 *Set Samuga Travels Payment Accounts*\n\n"
+            "Enter one per line: BANK NUMBER NAME\n\n"
+            "_Example:_\n"
+            "`BML 7770001234567 Samuga Travels`\n"
+            "`MIB 90101234567890 Samuga Travels`",
+            parse_mode="Markdown")
 
     elif data == "adm_schedules":
         if not await admin_check(query, ctx): return
@@ -2886,6 +3169,156 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if row:
             await query.edit_message_text(f"⭐ Recommended badge removed from *{row['business_name']}*.", parse_mode="Markdown")
 
+    elif data == "op_subscription":
+        op = await get_operator(user.id)
+        if not op:
+            return
+        sub_info = await get_sub_status(op["id"])
+        fee = await get_setting("subscription_fee", "500")
+
+        status_icons = {
+            "trial": "🎁", "active": "✅", "grace": "⚠️", "expired": "❌"
+        }
+        icon = status_icons.get(sub_info["status"], "❓")
+
+        msg = (
+            f"💳 *Subscription — {op['business_name']}*\n\n"
+            f"{icon} *Status:* {sub_info['status'].upper()}\n"
+            f"📅 {sub_info['message']}\n\n"
+        )
+
+        if sub_info["status"] == "trial":
+            msg += (
+                f"🎁 *You're on the Free Trial!*\n"
+                f"Enjoy 2 months completely free.\n\n"
+                f"After your trial, the monthly fee is *MVR {fee}*.\n"
+                f"We'll remind you 7 days before it ends. 🙏"
+            )
+            buttons = [[InlineKeyboardButton("ℹ️ How does billing work?", callback_data="sub_billing_info")]]
+
+        elif sub_info["status"] in ["active", "grace"]:
+            msg += f"💰 Monthly fee: *MVR {fee}*\n\n"
+            if sub_info["status"] == "grace":
+                msg += "⚠️ *Renew soon to avoid interruption!*\n"
+            msg += "Tap below to renew your subscription:"
+            buttons = [[InlineKeyboardButton("💳 Pay & Renew Now", callback_data="sub_pay")]]
+
+        else:  # expired
+            msg += (
+                f"❌ *Your subscription has expired.*\n\n"
+                f"Your schedules are currently hidden from customers.\n\n"
+                f"Monthly fee: *MVR {fee}*\n"
+                f"Tap below to reactivate:"
+            )
+            buttons = [[InlineKeyboardButton("💳 Pay & Reactivate", callback_data="sub_pay")]]
+
+        await query.message.reply_text(msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data == "sub_billing_info":
+        fee = await get_setting("subscription_fee", "500")
+        accounts_raw = await get_setting("subscription_accounts", "[]")
+        try:
+            import json as _j
+            accounts = _j.loads(accounts_raw)
+        except: accounts = []
+        acc_lines = ""
+        for a in accounts:
+            acc_lines += f"🏦 *{a["bank"]}:* `{a["number"]}` — {a.get("name","")}\n"
+        if not acc_lines:
+            acc_lines = "_Payment accounts will be added by admin soon._"
+        await query.message.reply_text(
+            f"ℹ️ *How Billing Works*\n\n"
+            f"💰 *Monthly Fee:* MVR {fee}\n\n"
+            f"After your 2-month free trial:\n"
+            f"• Pay MVR {fee} monthly to stay listed\n"
+            f"• Transfer to our account & send slip\n"
+            f"• Admin confirms within a few hours\n"
+            f"• You get 30 more days instantly\n\n"
+            f"*Samuga Travels Payment Accounts:*\n{acc_lines}\n"
+            f"Questions? Contact @SamugaTravels 🙏",
+            parse_mode="Markdown")
+
+    elif data == "sub_pay":
+        op = await get_operator(user.id)
+        fee = await get_setting("subscription_fee", "500")
+        accounts_raw = await get_setting("subscription_accounts", "[]")
+        try:
+            import json as _j
+            accounts = _j.loads(accounts_raw)
+        except: accounts = []
+        acc_lines = ""
+        for a in accounts:
+            bank = str(a.get("bank","")); num = str(a.get("number","")); nm = str(a.get("name",""))
+            acc_lines += bank + chr(10)
+        if not acc_lines:
+            acc_lines = "_Admin will share payment details soon. Contact @SamugaTravels_"
+        await set_user_state(user.id, OP_AWAIT_SUB_SLIP,
+                             {"sub_operator_id": op["id"], "sub_amount": fee})
+        await query.message.reply_text(
+            f"💳 *Subscribe to Samuga Travels*\n\n"
+            f"💰 Amount: *MVR {fee}*\n\n"
+            f"*Transfer to:*\n{acc_lines}\n"
+            f"After transferring, *send your payment screenshot here* 👇\n\n"
+            f"_Admin will approve within a few hours._",
+            parse_mode="Markdown")
+
+    elif data.startswith("sub_approve_"):
+        # Admin approves subscription payment
+        if not await admin_check(query, ctx): return
+        sub_id = int(data.split("_")[-1])
+        from datetime import timedelta
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            sub = await conn.fetchrow("SELECT * FROM subscriptions WHERE id=$1", sub_id)
+            if not sub:
+                await query.answer("Subscription not found.", show_alert=True)
+                return
+            # Extend 30 days from now (or from current paid_until if still active)
+            now = datetime.now()
+            base = sub["paid_until"] if sub["paid_until"] and sub["paid_until"] > now else now
+            new_until = base + timedelta(days=30)
+            await conn.execute("""
+                UPDATE subscriptions SET status='active', paid_until=$1, updated_at=NOW()
+                WHERE id=$2
+            """, new_until, sub_id)
+            await conn.execute("""
+                UPDATE operators SET subscription_status='active' WHERE id=$1
+            """, sub["operator_id"])
+            op_row = await conn.fetchrow("SELECT telegram_id, business_name FROM operators WHERE id=$1",
+                                          sub["operator_id"])
+        await query.edit_message_text(
+            f"✅ Subscription approved for *{op_row['business_name']}*\n"
+            f"Active until: *{new_until.strftime('%d %b %Y')}*",
+            parse_mode="Markdown")
+        try:
+            await ctx.bot.send_message(op_row["telegram_id"],
+                f"✅ *Subscription Activated!*\n\n"
+                f"Thank you for your payment! *{op_row['business_name']}* is active on Samuga Travels.\n\n"
+                f"📅 Active until: *{new_until.strftime('%d %b %Y')}*\n\n"
+                f"Your schedules are live and customers can book. 🌊",
+                parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Sub notify error: {e}")
+
+    elif data.startswith("sub_reject_"):
+        if not await admin_check(query, ctx): return
+        sub_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            sub = await conn.fetchrow("SELECT * FROM subscriptions WHERE id=$1", sub_id)
+            op_row = await conn.fetchrow("SELECT telegram_id, business_name FROM operators WHERE id=$1",
+                                          sub["operator_id"] if sub else 0)
+        await query.edit_message_text("❌ Subscription payment rejected.")
+        if op_row:
+            try:
+                await ctx.bot.send_message(op_row["telegram_id"],
+                    f"❌ *Payment Not Confirmed*\n\n"
+                    f"We couldn't verify your subscription payment.\n\n"
+                    f"Please check the amount and account number and try again, or contact @SamugaTravels. 🙏",
+                    parse_mode="Markdown")
+            except: pass
+
     elif data.startswith("not_received_"):
         booking_id = int(data.split("_")[-1])
         pool = await get_pool()
@@ -2984,6 +3417,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                  InlineKeyboardButton("📦 Pending Bookings",    callback_data="op_bookings")],
                 [InlineKeyboardButton("📅 Today & Tomorrow",    callback_data="op_today"),
                  InlineKeyboardButton("✏️ Edit Info",           callback_data="op_edit")],
+                [InlineKeyboardButton("💳 My Subscription",     callback_data="op_subscription")],
             ]))
 
     elif data == "op_bookings":
@@ -3252,6 +3686,91 @@ async def job_morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Morning ping failed for {op['telegram_id']}: {e}")
 
+async def job_subscription_check(ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Runs daily at 9AM MVT.
+    - Warns operators 7 days before trial/subscription ends
+    - Suspends expired operators (hides schedules from customers)
+    """
+    from datetime import timedelta
+    now = datetime.now()
+    warn_threshold = now + timedelta(days=7)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        subs = await conn.fetch("""
+            SELECT s.*, o.telegram_id, o.business_name, o.id as op_id
+            FROM subscriptions s
+            JOIN operators o ON s.operator_id = o.id
+            WHERE o.status = 'approved'
+        """)
+    for sub in subs:
+        tg_id = sub["telegram_id"]
+        name  = sub["business_name"]
+        fee   = await get_setting("subscription_fee", "500")
+
+        if sub["status"] == "trial":
+            trial_end = sub["trial_ends_at"]
+            if not trial_end: continue
+            if now >= trial_end:
+                # Trial expired — suspend
+                pool2 = await get_pool()
+                async with pool2.acquire() as conn2:
+                    await conn2.execute(
+                        "UPDATE subscriptions SET status='expired' WHERE id=$1", sub["id"])
+                    await conn2.execute(
+                        "UPDATE operators SET subscription_status='expired' WHERE id=$1", sub["op_id"])
+                try:
+                    await ctx.bot.send_message(tg_id,
+                        f"❌ *Trial Ended — {name}*\n\n"
+                        f"Your 2-month free trial has ended.\n\n"
+                        f"Your schedules are currently hidden from customers.\n\n"
+                        f"Subscribe for *MVR {fee}/month* to reactivate.\n"
+                        f"Tap /start → 💳 My Subscription to pay.",
+                        parse_mode="Markdown")
+                except: pass
+            elif trial_end <= warn_threshold:
+                days_left = (trial_end - now).days
+                try:
+                    await ctx.bot.send_message(tg_id,
+                        f"⚠️ *Trial Ending Soon — {name}*\n\n"
+                        f"Your free trial ends in *{days_left} days* "
+                        f"({trial_end.strftime('%d %b %Y')}).\n\n"
+                        f"Subscribe for *MVR {fee}/month* to keep your listings active.\n"
+                        f"Tap /start → 💳 My Subscription to pay now.",
+                        parse_mode="Markdown")
+                except: pass
+
+        elif sub["status"] == "active":
+            paid_until = sub["paid_until"]
+            if not paid_until: continue
+            if now >= paid_until:
+                # Subscription expired
+                pool2 = await get_pool()
+                async with pool2.acquire() as conn2:
+                    await conn2.execute(
+                        "UPDATE subscriptions SET status='expired' WHERE id=$1", sub["id"])
+                    await conn2.execute(
+                        "UPDATE operators SET subscription_status='expired' WHERE id=$1", sub["op_id"])
+                try:
+                    await ctx.bot.send_message(tg_id,
+                        f"❌ *Subscription Expired — {name}*\n\n"
+                        f"Your schedules are now hidden from customers.\n\n"
+                        f"Renew for *MVR {fee}/month* to reactivate.\n"
+                        f"Tap /start → 💳 My Subscription to pay.",
+                        parse_mode="Markdown")
+                except: pass
+            elif paid_until <= warn_threshold:
+                days_left = (paid_until - now).days
+                try:
+                    await ctx.bot.send_message(tg_id,
+                        f"⚠️ *Subscription Expiring — {name}*\n\n"
+                        f"Your subscription expires in *{days_left} days* "
+                        f"({paid_until.strftime('%d %b %Y')}).\n\n"
+                        f"Renew now to avoid interruption! *MVR {fee}/month*\n"
+                        f"Tap /start → 💳 My Subscription.",
+                        parse_mode="Markdown")
+                except: pass
+
 async def job_departure_reminders(ctx: ContextTypes.DEFAULT_TYPE):
     """Run every 5 minutes — send 45-min reminders to confirmed customers"""
     from datetime import timedelta
@@ -3418,6 +3937,8 @@ async def main():
     jq.run_daily(job_morning_ping, time=dt_time(15, 0, 0), name="morning_ping")  # 8:00 PM MVT
     # Departure reminders: every 5 minutes
     jq.run_repeating(job_departure_reminders, interval=300, first=30, name="departure_reminders")
+    # Subscription expiry check: daily 9AM MVT = 04:00 UTC
+    jq.run_daily(job_subscription_check, time=dt_time(4, 0, 0), name="subscription_check")
     logger.info("✅ Scheduled jobs registered")
 
     await app.initialize()
