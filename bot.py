@@ -2376,6 +2376,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"🔍 *{rf} → {rt}*\n\n📅 Select your *travel date* or type manually:\n_(DD-MM-YYYY or DD/MM/YYYY)_",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(date_buttons))
+            return   # ← don't fall through to else block!
         else:
             sd2 = await get_user_state(user.id)
             role = sd2.get("role","customer")
@@ -4289,14 +4290,29 @@ async def job_morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
             ])
             buttons = [[InlineKeyboardButton("📅 View & Manage Today", callback_data="op_today")]]
             try:
+                from datetime import timezone, timedelta as _tdtz
+                mvt_hour = (datetime.now(timezone.utc) + _tdtz(hours=5)).hour
+                if 5 <= mvt_hour < 12:
+                    greeting = "🌅 Good morning"
+                    note = "Have a great day on the water! 🌊"
+                elif 12 <= mvt_hour < 17:
+                    greeting = "☀️ Good afternoon"
+                    note = "Hope the afternoon trips are going smoothly! 🚤"
+                elif 17 <= mvt_hour < 21:
+                    greeting = "🌇 Good evening"
+                    note = "Here's a summary of today's schedule. 🌊"
+                else:
+                    greeting = "🌙 Good night"
+                    note = "Here's your schedule summary for tomorrow. 🌊"
                 await ctx.bot.send_message(op["telegram_id"],
-                    f"🌅 *Good morning, {op['business_name']}!*\n\n"
+                    f"{greeting}, *{op['business_name']}!*\n\n"
                     f"Today's schedules:\n{sched_lines}\n\n"
-                    f"⚠️ Any changes? Tap below to swap boats, update times, or cancel a departure.",
+                    f"⚠️ Any changes? Tap below to manage tomorrow's departures.\n\n"
+                    f"_{note}_",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(buttons))
             except Exception as e:
-                logger.error(f"Morning ping failed for {op['telegram_id']}: {e}")
+                logger.error(f"Daily ping failed for {op['telegram_id']}: {e}")
 
 async def job_subscription_check(ctx: ContextTypes.DEFAULT_TYPE):
     """
