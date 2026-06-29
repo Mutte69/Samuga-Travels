@@ -4323,10 +4323,34 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         booking_id = int(data.split("_")[-1])
         pool = await get_pool()
         async with pool.acquire() as conn:
-            bk = await conn.fetchrow("SELECT * FROM bookings WHERE id=$1", booking_id)
+            bk = await conn.fetchrow("""
+                SELECT b.*, o.telegram_username AS operator_username,
+                       o.telegram_id AS operator_telegram_id,
+                       o.owner_contact AS operator_contact,
+                       o.business_name AS operator_business_name
+                FROM bookings b
+                JOIN operators o ON b.operator_id=o.id
+                WHERE b.id=$1
+            """, booking_id)
         if not bk:
             await query.answer("Booking not found.", show_alert=True)
             return
+
+        # Contact button: prefer operator username, fallback to Telegram user ID deep-link.
+        # This keeps the message clean and lets the customer contact the operator directly.
+        contact_buttons = []
+        op_username = (bk.get("operator_username") or "").strip()
+        if op_username:
+            contact_buttons.append([InlineKeyboardButton(
+                "📩 Contact Operator",
+                url=f"https://t.me/{op_username.lstrip('@')}"
+            )])
+        elif bk.get("operator_telegram_id"):
+            contact_buttons.append([InlineKeyboardButton(
+                "📩 Contact Operator",
+                url=f"tg://user?id={bk['operator_telegram_id']}"
+            )])
+
         try:
             await ctx.bot.send_message(bk["customer_telegram_id"],
                 f"⚠️ *Payment Not Confirmed*\n\n"
@@ -4336,7 +4360,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"• Amount was incorrect\n"
                 f"• Screenshot was unclear\n\n"
                 f"Please double-check and resend your slip, or contact the operator. 🙏",
-                parse_mode="Markdown")
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(contact_buttons) if contact_buttons else None)
         except Exception as e:
             logger.error(f"Not received notify: {e}")
         await safe_edit(query,
