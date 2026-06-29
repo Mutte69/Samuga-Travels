@@ -85,6 +85,8 @@ OP_AWAIT_REFUND_SLIP="op_await_refund_slip"
 # AI chat state
 CX_AI_CHAT="cx_ai_chat"
 OP_AI_CHAT="op_ai_chat"
+# Live tracking
+OP_TRACKING_ACTIVE="op_tracking_active"
 # Rate limit: max 10 AI questions per user per day (Gemini free tier)
 _ai_usage: dict = {}  # {user_id: {"count": int, "date": str}}
 ADMIN_AWAIT_LOGO="admin_await_logo"
@@ -393,6 +395,22 @@ async def init_db():
         await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_slip_url TEXT")
         await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_status TEXT DEFAULT 'none'")
         await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_at TIMESTAMP")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_alert_stage INTEGER DEFAULT 0")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_alert_last_at TIMESTAMP")
+        # Live boat location tracking
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS boat_locations (
+                id SERIAL PRIMARY KEY,
+                booking_ref TEXT NOT NULL,
+                operator_id INTEGER REFERENCES operators(id),
+                schedule_id INTEGER REFERENCES schedules(id),
+                travel_date DATE NOT NULL,
+                latitude DECIMAL(10,7) NOT NULL,
+                longitude DECIMAL(10,7) NOT NULL,
+                is_active BOOLEAN DEFAULT TRUE,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
         # AI usage tracking table (persistent — survives Railway restarts)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS ai_usage (
@@ -814,6 +832,263 @@ async def get_operator(telegram_id: int):
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT * FROM operators WHERE telegram_id=$1", telegram_id)
     return dict(row) if row else None
+
+# ── LIVE TRACKING ─────────────────────────────────────────────────────────────
+async def handle_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Handle live location updates from captain"""
+    user = update.effective_user
+    location = update.message.location
+    if not location: return
+    op = await get_operator(user.id)
+    if not op or op.get("status") != "approved": return
+    sd = await get_user_state(user.id)
+    temp = sd.get("temp_data", {}) or {}
+    tracking_sched = temp.get("tracking_schedule_id")
+    if not tracking_sched: return
+    today = datetime.now().date()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            UPDATE boat_locations SET latitude=$1, longitude=$2, updated_at=NOW()
+            WHERE operator_id=$3 AND travel_date=$4 AND is_active=TRUE
+        """, float(location.latitude), float(location.longitude), op["id"], today)
+        rows_updated = await conn.fetchval("""
+            SELECT COUNT(*) FROM boat_locations
+            WHERE operator_id=$1 AND travel_date=$2 AND is_active=TRUE
+        """, op["id"], today)
+        if not rows_updated:
+            await conn.execute("""
+                INSERT INTO boat_locations
+                    (booking_ref, operator_id, schedule_id, travel_date, latitude, longitude, is_active)
+                VALUES ($1,$2,$3,$4,$5,$6,TRUE)
+            """, f"TRACK-{tracking_sched}-{today}", op["id"], tracking_sched, today,
+                float(location.latitude), float(location.longitude))
+        customers = await conn.fetch("""
+            SELECT DISTINCT customer_telegram_id, booking_ref FROM bookings
+            WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
+        """, tracking_sched, today)
+    # Notify customers max once per 2 minutes
+    last_sent = temp.get("loc_last_sent", 0)
+    now_ts = datetime.now().timestamp()
+    if now_ts - last_sent > 120:
+        maps_url = f"https://maps.google.com/?q={location.latitude},{location.longitude}"
+        for cx in customers:
+            try:
+                await ctx.bot.send_message(cx["customer_telegram_id"],
+                    f"📍 *Live Location — {op['business_name']}*\n\n"
+                    f"Your boat is on the way! Tap to track:\n"
+                    f"[View on Google Maps]({maps_url})\n\n"
+                    f"_Updates every 2 minutes._",
+                    parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Location notify failed: {e}")
+        await update_temp_key(user.id, "loc_last_sent", now_ts)
+
+# ── REPORT PDF GENERATOR ─────────────────────────────────────────────────────
+async def generate_report_pdf(title: str, rows: list, summary: dict, operator_name: str = "") -> bytes:
+    from reportlab.platypus import HRFlowable
+    from reportlab.lib.colors import HexColor
+    buf = io.BytesIO()
+    ST_NAVY  = HexColor("#0D2137"); ST_BLUE  = HexColor("#1B6CA8")
+    ST_ACCENT= HexColor("#00B4D8"); ST_LIGHT = HexColor("#E8F4FD")
+    ST_WHITE = HexColor("#FFFFFF"); ST_MUTED = HexColor("#6B8A9E")
+    ST_TEXT  = HexColor("#1A2733")
+    doc = SimpleDocTemplate(buf, pagesize=A4,
+                            rightMargin=15*mm, leftMargin=15*mm,
+                            topMargin=15*mm, bottomMargin=15*mm)
+    story = []
+    lbl = ParagraphStyle("lbl", fontName="Helvetica-Bold", fontSize=8, textColor=ST_MUTED)
+    val = ParagraphStyle("val", fontName="Helvetica-Bold", fontSize=11, textColor=ST_TEXT, alignment=TA_CENTER)
+    cell_s = ParagraphStyle("cell", fontName="Helvetica", fontSize=8, textColor=ST_TEXT)
+
+    # Title band
+    title_t = Table([[f"  {title}  "]], colWidths=[175*mm])
+    title_t.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), ST_NAVY), ("TEXTCOLOR", (0,0), (-1,-1), ST_WHITE),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica-Bold"), ("FONTSIZE", (0,0), (-1,-1), 13),
+        ("ALIGN", (0,0), (-1,-1), "CENTER"), ("PADDING", (0,0), (-1,-1), 10),
+    ]))
+    story.append(title_t)
+    story.append(Spacer(1, 3*mm))
+    if operator_name:
+        story.append(Paragraph(f"<b>Operator:</b> {operator_name}  |  "
+                               f"Generated: {datetime.now().strftime('%d %b %Y %H:%M')} MVT",
+            ParagraphStyle("meta", fontName="Helvetica", fontSize=9, textColor=ST_MUTED, spaceAfter=4)))
+    story.append(HRFlowable(width="100%", thickness=2, color=ST_ACCENT, spaceAfter=4*mm))
+
+    # Summary grid
+    if summary:
+        items = list(summary.items())
+        # Rows of 4
+        for chunk_start in range(0, len(items), 4):
+            chunk = items[chunk_start:chunk_start+4]
+            row_data = [Paragraph(
+                f'<b>{v}</b><br/><font color="#6B8A9E" size="8">{k}</font>', val)
+                for k, v in chunk]
+            while len(row_data) < 4: row_data.append(Paragraph("", val))
+            sum_t = Table([row_data], colWidths=[44*mm]*4)
+            sum_t.setStyle(TableStyle([
+                ("BACKGROUND", (0,0), (-1,-1), ST_LIGHT),
+                ("BOX", (0,0), (-1,-1), 1, ST_ACCENT),
+                ("INNERGRID", (0,0), (-1,-1), 0.5, HexColor("#D0E8F5")),
+                ("PADDING", (0,0), (-1,-1), 10), ("ALIGN", (0,0), (-1,-1), "CENTER"),
+                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ]))
+            story.append(sum_t)
+            story.append(Spacer(1, 2*mm))
+        story.append(Spacer(1, 2*mm))
+
+    # Bookings table
+    if rows:
+        story.append(Paragraph("Booking Details",
+            ParagraphStyle("bh", fontName="Helvetica-Bold", fontSize=10,
+                           textColor=ST_NAVY, spaceBefore=4, spaceAfter=4)))
+        hdr = [Paragraph(x, lbl) for x in ["Ref", "Customer", "Route", "Date", "Pax", "Amount", "Status"]]
+        tdata = [hdr]
+        sc_map = {"confirmed":"#0ca30c","cancelled":"#dc2626",
+                  "pending_confirmation":"#f59e0b","pending_payment":"#6b7280"}
+        for r in rows[:60]:
+            st = r.get("status","")
+            sc = sc_map.get(st, "#6b7280")
+            tdata.append([
+                Paragraph(str(r.get("booking_ref",""))[-12:], cell_s),
+                Paragraph(str(r.get("customer_name",""))[:18], cell_s),
+                Paragraph(f"{r.get('route_from','')} → {r.get('route_to','')}", cell_s),
+                Paragraph(str(r.get("travel_date",""))[:10], cell_s),
+                Paragraph(str(r.get("passenger_count","")), cell_s),
+                Paragraph(f"MVR {r.get('total_amount','0')}", cell_s),
+                Paragraph(f'<font color="{sc}">{st.replace("_"," ").upper()[:10]}</font>', cell_s),
+            ])
+        bk_t = Table(tdata, colWidths=[24*mm,30*mm,38*mm,20*mm,10*mm,22*mm,28*mm])
+        bk_t.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), ST_NAVY), ("TEXTCOLOR", (0,0), (-1,0), ST_WHITE),
+            ("ROWBACKGROUNDS", (0,1), (-1,-1), [ST_WHITE, ST_LIGHT]),
+            ("BOX", (0,0), (-1,-1), 0.5, ST_BLUE),
+            ("INNERGRID", (0,0), (-1,-1), 0.3, HexColor("#D0E8F5")),
+            ("PADDING", (0,0), (-1,-1), 5), ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ]))
+        story.append(bk_t)
+
+    story.append(Spacer(1, 6*mm))
+    story.append(HRFlowable(width="100%", thickness=1, color=ST_ACCENT))
+    story.append(Paragraph(
+        '<font color="#1B6CA8"><b>Samuga Travels</b></font> · Official Travel Partner · Maldives · Confidential',
+        ParagraphStyle("foot", fontName="Helvetica", fontSize=7, textColor=ST_MUTED,
+                       alignment=TA_CENTER, spaceBefore=4)))
+    doc.build(story)
+    return buf.getvalue()
+
+async def job_daily_report(ctx: ContextTypes.DEFAULT_TYPE):
+    """Send daily sales PDF to each operator at 11PM MVT (18:00 UTC)"""
+    today = datetime.now().date()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        operators = await conn.fetch("SELECT * FROM operators WHERE status='approved'")
+    for op in operators:
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT b.*, s.route_from, s.route_to FROM bookings b
+                    JOIN schedules s ON b.schedule_id=s.id
+                    WHERE b.operator_id=$1 AND b.travel_date=$2 ORDER BY b.created_at
+                """, op["id"], today)
+                stats = await conn.fetchrow("""
+                    SELECT
+                        COUNT(*) FILTER (WHERE status='confirmed') as confirmed,
+                        COUNT(*) FILTER (WHERE status='cancelled') as cancelled,
+                        COUNT(*) FILTER (WHERE status IN ('pending_payment','pending_confirmation')) as pending,
+                        COALESCE(SUM(passenger_count) FILTER (WHERE status='confirmed'),0) as seats,
+                        COALESCE(SUM(total_amount) FILTER (WHERE status='confirmed'),0) as revenue
+                    FROM bookings WHERE operator_id=$1 AND travel_date=$2
+                """, op["id"], today)
+            if not rows: continue
+            summary = {
+                "Confirmed": str(stats["confirmed"]), "Cancelled": str(stats["cancelled"]),
+                "Seats Sold": str(stats["seats"]), "Revenue": f"MVR {float(stats['revenue']):,.0f}",
+            }
+            pdf_bytes = await generate_report_pdf(
+                title=f"Daily Sales Report — {today.strftime('%d %b %Y')}",
+                rows=[dict(r) for r in rows], summary=summary,
+                operator_name=op["business_name"])
+            pdf_buf = io.BytesIO(pdf_bytes)
+            pdf_buf.name = f"samuga_daily_{today.strftime('%Y%m%d')}.pdf"
+            await ctx.bot.send_document(op["telegram_id"], document=pdf_buf,
+                caption=(f"📊 *Daily Report — {today.strftime('%d %b %Y')}*\n\n"
+                         f"🚤 {op['business_name']}\n"
+                         f"✅ {stats['confirmed']} confirmed | ❌ {stats['cancelled']} cancelled\n"
+                         f"💺 {stats['seats']} seats | 💰 MVR {float(stats['revenue']):,.0f}\n\n"
+                         f"_Full breakdown attached._"),
+                parse_mode="Markdown")
+            logger.info(f"✅ Daily report sent to {op['business_name']}")
+        except Exception as e:
+            logger.error(f"Daily report error for {op['business_name']}: {e}")
+
+async def job_monthly_report(ctx: ContextTypes.DEFAULT_TYPE):
+    """Send monthly PDF on 1st of each month at 8AM MVT (03:00 UTC)"""
+    if datetime.now().day != 1: return
+    from datetime import timedelta as _tdm
+    yesterday = (datetime.now() - _tdm(days=1)).date()
+    year, month = yesterday.year, yesterday.month
+    month_name = datetime(year, month, 1).strftime("%B %Y")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        operators = await conn.fetch("SELECT * FROM operators WHERE status='approved'")
+    for op in operators:
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT b.*, s.route_from, s.route_to FROM bookings b
+                    JOIN schedules s ON b.schedule_id=s.id
+                    WHERE b.operator_id=$1
+                      AND EXTRACT(YEAR FROM b.travel_date)=$2
+                      AND EXTRACT(MONTH FROM b.travel_date)=$3
+                    ORDER BY b.travel_date
+                """, op["id"], year, month)
+                stats = await conn.fetchrow("""
+                    SELECT
+                        COUNT(*) as total,
+                        COUNT(*) FILTER (WHERE status='confirmed') as confirmed,
+                        COUNT(*) FILTER (WHERE status='cancelled') as cancelled,
+                        COALESCE(SUM(passenger_count) FILTER (WHERE status='confirmed'),0) as seats,
+                        COALESCE(SUM(total_amount) FILTER (WHERE status='confirmed'),0) as revenue,
+                        COALESCE(SUM(total_amount) FILTER (WHERE status='cancelled'),0) as cancelled_val
+                    FROM bookings WHERE operator_id=$1
+                      AND EXTRACT(YEAR FROM travel_date)=$2
+                      AND EXTRACT(MONTH FROM travel_date)=$3
+                """, op["id"], year, month)
+                top_route = await conn.fetchrow("""
+                    SELECT s.route_from, s.route_to, COUNT(*) as trips
+                    FROM bookings b JOIN schedules s ON b.schedule_id=s.id
+                    WHERE b.operator_id=$1 AND b.status='confirmed'
+                      AND EXTRACT(YEAR FROM b.travel_date)=$2
+                      AND EXTRACT(MONTH FROM b.travel_date)=$3
+                    GROUP BY s.route_from, s.route_to ORDER BY trips DESC LIMIT 1
+                """, op["id"], year, month)
+            if not rows: continue
+            conf_rate = round(stats["confirmed"] / max(stats["total"],1) * 100)
+            top_str = f"{top_route['route_from']} → {top_route['route_to']}" if top_route else "N/A"
+            summary = {
+                "Total": str(stats["total"]), "Confirmed": str(stats["confirmed"]),
+                "Cancelled": str(stats["cancelled"]), "Seats": str(stats["seats"]),
+                "Revenue": f"MVR {float(stats['revenue']):,.0f}",
+                "Cancelled": f"MVR {float(stats['cancelled_val']):,.0f}",
+                "Confirm Rate": f"{conf_rate}%", "Top Route": top_str,
+            }
+            pdf_bytes = await generate_report_pdf(
+                title=f"Monthly Report — {month_name}",
+                rows=[dict(r) for r in rows], summary=summary,
+                operator_name=op["business_name"])
+            pdf_buf = io.BytesIO(pdf_bytes)
+            pdf_buf.name = f"samuga_monthly_{year}{month:02d}.pdf"
+            await ctx.bot.send_document(op["telegram_id"], document=pdf_buf,
+                caption=(f"📅 *Monthly Report — {month_name}*\n\n"
+                         f"🚤 {op['business_name']}\n"
+                         f"✅ {stats['confirmed']} confirmed | 💰 MVR {float(stats['revenue']):,.0f}\n"
+                         f"📈 Confirm rate: {conf_rate}%\n\n_Full breakdown attached._"),
+                parse_mode="Markdown")
+            logger.info(f"✅ Monthly report sent to {op['business_name']}")
+        except Exception as e:
+            logger.error(f"Monthly report error for {op['business_name']}: {e}")
 
 def gen_ref():
     ts = datetime.now().strftime("%y%m%d")
@@ -1371,6 +1646,89 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"\n_{note}_\n\n"
         f"{'Type /urgent if you need urgent review.' if op['status'] == 'pending' else ''}",
         parse_mode="Markdown")
+
+async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Operator starts live tracking"""
+    user = update.effective_user
+    op = await get_operator(user.id)
+    if not op or op.get("status") != "approved":
+        await update.message.reply_text("⚠️ Operator account required.")
+        return
+    today = datetime.now().date()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        scheds = await conn.fetch("""
+            SELECT DISTINCT s.id, s.departure_time, s.route_from, s.route_to,
+                   COUNT(b.id) as bookings
+            FROM schedules s JOIN bookings b ON b.schedule_id=s.id
+            WHERE s.operator_id=$1 AND b.travel_date=$2 AND b.status='confirmed'
+            GROUP BY s.id, s.departure_time, s.route_from, s.route_to
+            ORDER BY s.departure_time
+        """, op["id"], today)
+    if not scheds:
+        await update.message.reply_text(
+            "📍 No confirmed bookings today to track.\n\n"
+            "Start tracking once passengers have confirmed bookings.", parse_mode="Markdown")
+        return
+    btns = [[InlineKeyboardButton(
+        f"🚤 {s['departure_time']} — {s['route_from']} → {s['route_to']} ({s['bookings']} pax)",
+        callback_data=f"start_tracking_{s['id']}")] for s in scheds]
+    await update.message.reply_text(
+        "📍 *Start Live Tracking*\n\nSelect today's trip:\n\n"
+        "_Customers see your position on Google Maps every 2 minutes._",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
+
+async def cmd_stoptrack(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Operator stops live tracking"""
+    user = update.effective_user
+    op = await get_operator(user.id)
+    if not op: return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE boat_locations SET is_active=FALSE WHERE operator_id=$1 AND travel_date=$2",
+            op["id"], datetime.now().date())
+    await set_user_state(user.id, OP_IDLE, {})
+    await update.message.reply_text(
+        "📍 *Tracking stopped.* Customers notified.\n\nGreat trip! 🌊",
+        parse_mode="Markdown", reply_markup=main_kb("operator"))
+
+async def cmd_locate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Customer checks live location of their boat"""
+    user = update.effective_user
+    today = datetime.now().date()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT b.booking_ref, o.business_name,
+                   bl.latitude, bl.longitude, bl.updated_at,
+                   s.route_from, s.route_to, s.departure_time
+            FROM bookings b
+            JOIN operators o ON b.operator_id=o.id
+            JOIN schedules s ON b.schedule_id=s.id
+            LEFT JOIN boat_locations bl ON bl.schedule_id=b.schedule_id
+                AND bl.travel_date=$1 AND bl.is_active=TRUE
+            WHERE b.customer_telegram_id=$2 AND b.travel_date=$1 AND b.status='confirmed'
+            ORDER BY bl.updated_at DESC NULLS LAST LIMIT 1
+        """, today, user.id)
+    if not row:
+        await update.message.reply_text("📍 No active booking today. Tracking is available on travel day.")
+        return
+    if not row["latitude"]:
+        await update.message.reply_text(
+            f"📍 *{row['business_name']}*\n🚤 {row['route_from']} → {row['route_to']} @ {row['departure_time']}\n\n"
+            f"Captain hasn't started live tracking yet. You'll get notified when they do!",
+            parse_mode="Markdown")
+        return
+    lat, lng = float(row["latitude"]), float(row["longitude"])
+    maps_url = f"https://maps.google.com/?q={lat},{lng}"
+    await update.message.reply_text(
+        f"📍 *{row['business_name']} — Live Location*\n\n"
+        f"🚤 {row['route_from']} → {row['route_to']}\n"
+        f"🕐 Updated: {str(row['updated_at'])[:16]} MVT\n\n"
+        f"[Open in Google Maps]({maps_url})",
+        parse_mode="Markdown")
+    await ctx.bot.send_location(user.id, latitude=lat, longitude=lng)
 
 async def cmd_findcustomer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Find customer by booking ref or telegram ID"""
@@ -2419,7 +2777,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"💳 *Payment Details:*\n\n"
                 f"{pay_str}"
                 f"💰 Amount: *MVR {total_amt:.2f}*\n\n"
-                f"⚠️ *Important:* Double-check the *account number* and *account name* before transferring. If money is sent to the wrong bank/account, Samuga Travels and the operator cannot reverse it — you must contact your bank.\n\n"
+                f"⚠️ *Cancellation / Refund Policy*\n\n"
+                f"Please double-check your *route, date, time, passenger details, account number,* and *account name* before transfer.\n\n"
+                f"If you send money to the wrong bank/account, this is not refundable by Samuga Travels or the operator. You must contact your bank.\n\n"
+                f"Refunds/cancellations for valid payments depend on the operator's policy and trip timing.\n\n"
                 f"👉 If everything is correct, transfer and *upload your payment screenshot here.*\n\n"
                 f"Need to fix something? Use the edit buttons below before paying."
             )
@@ -3261,8 +3622,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"*{row['business_name']}* is now live on Samuga Travels!\n\n"
                 f"🎁 *Free Trial: 2 Months*\n"
                 f"Your free trial runs until *{trial_end}* — no payment needed now.\n\n"
-                f"After that, a small monthly fee of *MVR 500* keeps you listed.\n"
-                f"We'll remind you before your trial ends. 🙏\n\n"
+                f"✅ *Welcome to Samuga Travels Operator Panel*\n\n"
+                f"1. Add your schedules\n"
+                f"2. Check pending bookings\n"
+                f"3. Confirm payment only after checking your bank/account\n"
+                f"4. Use Today's Schedule for passengers\n"
+                f"5. Scan ticket QR or mark boarded\n"
+                f"6. Check Monthly Report for earnings\n\n"
+                f"After the free trial, a small monthly fee of *MVR 500* keeps you listed.\n"
+                f"Need help? Contact @SamugaTravels\n\n"
                 f"Use /start to add your schedules and start receiving bookings! 🌊",
                 parse_mode="Markdown")
             await query.edit_message_text(
@@ -3950,6 +4318,27 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("🔙 Admin Panel", callback_data="adm_back")]
             ]))
 
+    elif data.startswith("start_tracking_"):
+        sched_id = int(data.split("_")[-1])
+        op = await get_operator(user.id)
+        if not op: return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
+            pax = await conn.fetchval(
+                "SELECT COUNT(*) FROM bookings WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'",
+                sched_id, datetime.now().date())
+        await set_user_state(user.id, OP_TRACKING_ACTIVE,
+                             {"tracking_schedule_id": sched_id})
+        await query.edit_message_text(
+            f"📍 *Live Tracking Started!*\n\n"
+            f"🚤 {sched['route_from']} → {sched['route_to']} @ {sched['departure_time']}\n"
+            f"👥 {pax} passengers will see your location\n\n"
+            f"*Now share your live location:*\n"
+            f"📎 Attachment → Location → *Share Live Location* → 8 hours\n\n"
+            f"Type /stoptrack when trip ends.",
+            parse_mode="Markdown")
+
     elif data == "adm_back":
         if not await admin_check(query, ctx): return
         await query.message.reply_text("Back to admin — type /admin", parse_mode="Markdown")
@@ -4360,6 +4749,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"• Transfer sent to wrong account\n"
                 f"• Amount was incorrect\n"
                 f"• Screenshot was unclear\n\n"
+                f"⚠️ If money was sent to the wrong bank/account, Samuga Travels and the operator cannot refund it. You must contact your bank.\n\n"
                 f"Please double-check and resend your slip, or contact the operator. 🙏",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(contact_buttons) if contact_buttons else None)
@@ -4541,6 +4931,7 @@ async def notify_operator_payment(ctx, booking_id, sel, temp, ref, customer, sli
         f"📅 {temp.get('travel_date')} @ {dep_time}\n"
         f"👥 {temp.get('passenger_count')} passengers:\n{pax_lines}\n"
         f"💰 MVR {temp.get('total_amount')}\n\n"
+        f"Please confirm or mark not received as soon as possible. The bot will remind you if this waits too long.\n\n"
         f"Review the slip and confirm below 👇"
     )
     try:
@@ -4693,6 +5084,126 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             pass
 
 # ── SCHEDULED JOBS ───────────────────────────────────────────────────────────
+
+async def job_payment_confirmation_watchdog(ctx: ContextTypes.DEFAULT_TYPE):
+    """Remind operator/admin when a paid booking is waiting too long for confirmation."""
+    pool = await get_pool()
+
+    async def _send_admin_alert(text: str, reply_markup=None):
+        try:
+            await ctx.bot.send_message(
+                ADMIN_GROUP_ID, text, parse_mode="Markdown",
+                message_thread_id=ADMIN_THREAD_ID, reply_markup=reply_markup
+            )
+        except Exception as e:
+            logger.error(f"Payment watchdog admin thread send failed: {e}")
+            try:
+                await ctx.bot.send_message(ADMIN_GROUP_ID, text, parse_mode="Markdown", reply_markup=reply_markup)
+            except Exception as e2:
+                logger.error(f"Payment watchdog admin fallback failed: {e2}")
+
+    async with pool.acquire() as conn:
+        first_alerts = await conn.fetch("""
+            UPDATE bookings b
+            SET payment_alert_stage=1, payment_alert_last_at=NOW()
+            FROM operators o, schedules s
+            WHERE b.operator_id=o.id AND b.schedule_id=s.id
+              AND b.status='pending_confirmation'
+              AND COALESCE(b.payment_alert_stage,0)=0
+              AND b.created_at <= NOW() - INTERVAL '15 minutes'
+            RETURNING b.id, b.booking_ref, b.customer_telegram_id, b.customer_name,
+                      b.travel_date, b.passenger_count, b.total_amount,
+                      o.telegram_id AS operator_telegram_id, o.business_name AS operator_name,
+                      o.owner_contact AS operator_contact,
+                      s.route_from, s.route_to, s.departure_time
+        """)
+        second_alerts = await conn.fetch("""
+            UPDATE bookings b
+            SET payment_alert_stage=2, payment_alert_last_at=NOW()
+            FROM operators o, schedules s
+            WHERE b.operator_id=o.id AND b.schedule_id=s.id
+              AND b.status='pending_confirmation'
+              AND COALESCE(b.payment_alert_stage,0)=1
+              AND b.created_at <= NOW() - INTERVAL '20 minutes'
+            RETURNING b.id, b.booking_ref, b.customer_telegram_id, b.customer_name,
+                      b.travel_date, b.passenger_count, b.total_amount,
+                      o.telegram_id AS operator_telegram_id, o.business_name AS operator_name,
+                      o.owner_contact AS operator_contact,
+                      s.route_from, s.route_to, s.departure_time
+        """)
+
+    for b in first_alerts:
+        op_buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📩 Contact Customer", url=f"tg://user?id={b['customer_telegram_id']}")],
+            [InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{b['id']}")],
+            [InlineKeyboardButton("❌ Not Received / Wrong Transfer", callback_data=f"not_received_{b['id']}")]
+        ])
+        try:
+            await ctx.bot.send_message(
+                b["operator_telegram_id"],
+                f"⏳ *Payment confirmation pending*\n\n"
+                f"Booking `{b['booking_ref']}` has been waiting about *15 minutes*.\n\n"
+                f"👤 Customer: {b['customer_name'] or 'N/A'}\n"
+                f"📍 {b['route_from']} → {b['route_to']}\n"
+                f"📅 {b['travel_date']} @ {b['departure_time']}\n"
+                f"👥 {b['passenger_count']} pax | 💰 MVR {b['total_amount']}\n\n"
+                f"Please check your bank and confirm, or mark not received.",
+                parse_mode="Markdown", reply_markup=op_buttons
+            )
+        except Exception as e:
+            logger.error(f"Payment watchdog first operator ping failed: {e}")
+
+        await _send_admin_alert(
+            f"⚠️ *Payment waiting too long*\n\n"
+            f"Booking: `{b['booking_ref']}`\n"
+            f"Operator: *{b['operator_name']}* ({b['operator_contact'] or 'no contact'})\n"
+            f"Customer: {b['customer_name'] or 'N/A'} (`{b['customer_telegram_id']}`)\n"
+            f"Trip: {b['route_from']} → {b['route_to']}\n"
+            f"Date: {b['travel_date']} @ {b['departure_time']}\n"
+            f"Pax: {b['passenger_count']} | Amount: MVR {b['total_amount']}\n\n"
+            f"Bot pinged the operator. If not approved in another 5 minutes, it will ping again.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📩 Contact Operator", url=f"tg://user?id={b['operator_telegram_id']}"),
+                InlineKeyboardButton("📩 Contact Customer", url=f"tg://user?id={b['customer_telegram_id']}")
+            ]])
+        )
+
+    for b in second_alerts:
+        op_buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📩 Contact Customer", url=f"tg://user?id={b['customer_telegram_id']}")],
+            [InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{b['id']}")],
+            [InlineKeyboardButton("❌ Not Received / Wrong Transfer", callback_data=f"not_received_{b['id']}")]
+        ])
+        try:
+            await ctx.bot.send_message(
+                b["operator_telegram_id"],
+                f"🚨 *Second reminder — customer is waiting*\n\n"
+                f"Booking `{b['booking_ref']}` is still not approved.\n\n"
+                f"👤 Customer: {b['customer_name'] or 'N/A'}\n"
+                f"📍 {b['route_from']} → {b['route_to']}\n"
+                f"📅 {b['travel_date']} @ {b['departure_time']}\n"
+                f"👥 {b['passenger_count']} pax | 💰 MVR {b['total_amount']}\n\n"
+                f"Please confirm now or mark not received. Samuga Travels may contact you directly.",
+                parse_mode="Markdown", reply_markup=op_buttons
+            )
+        except Exception as e:
+            logger.error(f"Payment watchdog second operator ping failed: {e}")
+
+        await _send_admin_alert(
+            f"🚨 *Second ping — operator still has not approved*\n\n"
+            f"Booking: `{b['booking_ref']}`\n"
+            f"Operator: *{b['operator_name']}* ({b['operator_contact'] or 'no contact'})\n"
+            f"Customer: {b['customer_name'] or 'N/A'} (`{b['customer_telegram_id']}`)\n"
+            f"Trip: {b['route_from']} → {b['route_to']}\n"
+            f"Date: {b['travel_date']} @ {b['departure_time']}\n"
+            f"Pax: {b['passenger_count']} | Amount: MVR {b['total_amount']}\n\n"
+            f"Please reach out to the operator directly.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📩 Contact Operator", url=f"tg://user?id={b['operator_telegram_id']}"),
+                InlineKeyboardButton("📩 Contact Customer", url=f"tg://user?id={b['customer_telegram_id']}")
+            ]])
+        )
+
 async def job_morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
     """20:00 MVT — ping all operators to prepare tomorrow's schedules"""
     from datetime import timedelta as _td
@@ -4907,6 +5418,9 @@ async def main():
     app.add_handler(CommandHandler("ops",       cmd_ops))
     app.add_handler(CommandHandler("urgent",       cmd_urgent))
     app.add_handler(CommandHandler("deletemydata", cmd_delete_my_data))
+    app.add_handler(CommandHandler("track",        cmd_track))
+    app.add_handler(CommandHandler("stoptrack",    cmd_stoptrack))
+    app.add_handler(CommandHandler("locate",       cmd_locate))
     app.add_handler(CommandHandler("status",       cmd_status))
     app.add_handler(CommandHandler("findcustomer", cmd_findcustomer))
 
@@ -5007,6 +5521,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location))
     app.add_error_handler(error_handler)
 
     # ── Scheduled jobs ──
@@ -5016,8 +5531,12 @@ async def main():
     jq.run_daily(job_morning_ping, time=dt_time(15, 0, 0), name="evening_schedule_ping")
     # Departure reminders: every 5 minutes
     jq.run_repeating(job_departure_reminders, interval=300, first=30, name="departure_reminders")
+    # Payment confirmation watchdog: first ping after 15 min, second ping 5 min later
+    jq.run_repeating(job_payment_confirmation_watchdog, interval=300, first=120, name="payment_confirmation_watchdog")
     # Subscription expiry check: daily 9AM MVT = 04:00 UTC
     jq.run_daily(job_subscription_check, time=dt_time(4, 0, 0), name="subscription_check")
+    jq.run_daily(job_daily_report,        time=dt_time(18, 0, 0), name="daily_report")
+    jq.run_daily(job_monthly_report,      time=dt_time(3,  0, 0), name="monthly_report")
     logger.info("✅ Scheduled jobs registered")
 
     await app.initialize()
