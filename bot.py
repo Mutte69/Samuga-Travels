@@ -2477,9 +2477,9 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 """, ref, user.id, customer_name, operator_id, schedule_id,
                     travel_date_val, pax_count, passengers_json, total_amount, url)
             booking_id = row["id"]
-            logger.info(f"\u2705 Booking {ref} saved with id={booking_id}")
+            logger.info(f"✅ Booking {ref} saved with id={booking_id}")
         except Exception as e:
-            logger.error(f"\u274c Payment slip booking save error: {e}", exc_info=True)
+            logger.error(f"❌ Payment slip booking save error: {e}", exc_info=True)
             try:
                 op_id_fb = int(t2.get("sel_operator_id") or 0) or None
                 if op_id_fb:
@@ -2512,8 +2512,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         # STEP 2: Confirm to customer
         await set_user_state(user.id, CX_BOOKING_COMPLETE, {"booking_ref": ref, "booking_id": booking_id})
         await update.message.reply_text(
-            f"\u2705 *Payment slip received!*\n\n"
-            f"\ud83d\udccb Booking Ref: `{ref}`\n\n"
+            f"✅ *Payment slip received!*\n\n"
+            f"📋 Booking Ref: `{ref}`\n\n"
             f"Your booking is being reviewed by the operator. "
             f"You will receive your confirmed ticket within *5-10 minutes*. "
             f"Please do not resend your slip - we have received it!",
@@ -2521,15 +2521,18 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         # STEP 3: Notify operator (best-effort)
         try:
+            op_tg_raw = t2.get("sel_op_tg", 0)
+            op_id_raw = t2.get("sel_operator_id")
+            logger.info(f"STEP3 notify: booking_id={booking_id} sel_op_tg={op_tg_raw} sel_operator_id={op_id_raw}")
             sel = {
-                "operator_id": int(t2.get("sel_operator_id") or 0) or None,
+                "operator_id": int(op_id_raw or 0) or None,
                 "id": int(t2.get("sel_schedule_id") or 0) or None,
                 "departure_time": t2.get("sel_time",""),
-                "op_telegram_id": t2.get("sel_op_tg", 0),
+                "op_telegram_id": int(op_tg_raw) if op_tg_raw else None,
             }
             await notify_operator_payment(ctx, booking_id, sel, t2, ref, user, photo.file_id)
         except Exception as e:
-            logger.error(f"\u274c Operator notify error (booking still saved): {e}", exc_info=True)
+            logger.error(f"❌ Operator notify error (booking still saved): {e}", exc_info=True)
 
 
 
@@ -4177,17 +4180,42 @@ async def notify_admin_new_op(ctx, user, temp: dict, op_id: int = 0):
         logger.error(f"❌ Admin photo send FAILED: {e}")
 
 async def notify_operator_payment(ctx, booking_id, sel, temp, ref, customer, slip_file_id):
-    # Get operator telegram ID from sel dict or flat temp keys or DB
-    op_tg_id = sel.get("op_telegram_id") or temp.get("sel_op_tg")
+    # Get operator telegram ID — try all possible sources
+    op_tg_id = (sel.get("op_telegram_id") or temp.get("sel_op_tg") or
+                temp.get("op_tg_id") or temp.get("op_telegram_id"))
+
+    # Convert 0 to None (0 is falsy but stored as int)
+    if op_tg_id == 0 or op_tg_id == "0":
+        op_tg_id = None
+
+    logger.info(f"notify_operator: booking={booking_id} op_tg_id={op_tg_id} "
+                f"sel_op_tg={temp.get('sel_op_tg')} sel_operator_id={temp.get('sel_operator_id')}")
+
     if not op_tg_id:
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            op_id = sel.get("operator_id") or temp.get("sel_operator_id")
-            row = await conn.fetchrow("SELECT telegram_id FROM operators WHERE id=$1", op_id)
-        if not row:
-            logger.error(f"Could not find operator for booking {booking_id}")
-            return
-        op_tg_id = row["telegram_id"]
+        # Fallback: look up from DB using operator_id
+        op_id = (sel.get("operator_id") or sel.get("id") or
+                 temp.get("sel_operator_id") or temp.get("operator_id"))
+        if not op_id:
+            # Last resort: look up from the booking itself
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                bk_row = await conn.fetchrow(
+                    "SELECT operator_id FROM bookings WHERE id=$1", booking_id)
+            op_id = bk_row["operator_id"] if bk_row else None
+
+        if op_id:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT telegram_id FROM operators WHERE id=$1", int(op_id))
+            if row:
+                op_tg_id = row["telegram_id"]
+                logger.info(f"notify_operator: resolved op_tg_id={op_tg_id} from DB")
+
+    if not op_tg_id:
+        logger.error(f"❌ Cannot notify operator for booking {booking_id} — no telegram_id found. "
+                     f"sel={sel} temp_keys={list(temp.keys())}")
+        return
 
     pax = temp.get("passengers_collected",[])
     pax_lines = "\n".join([f"  {i+1}. {p.get('name','N/A')} ({p.get('id_number','N/A')})" for i,p in enumerate(pax)]) or "  (details on file)"
@@ -4314,7 +4342,7 @@ async def do_confirm_booking(ctx, booking_id: int, query):
             ]))
         ticket_sent = True
     except Exception as e:
-        logger.error(f"\u274c Ticket PDF/send error for {booking['booking_ref']}: {e}", exc_info=True)
+        logger.error(f"❌ Ticket PDF/send error for {booking['booking_ref']}: {e}", exc_info=True)
         try:
             await ctx.bot.send_message(
                 booking["customer_telegram_id"],
