@@ -35,6 +35,9 @@ CLOUDINARY_CLOUD = os.environ.get("CLOUDINARY_CLOUD", "dfhj3clbh")
 CLOUDINARY_KEY   = os.environ.get("CLOUDINARY_KEY",   "")
 CLOUDINARY_SECRET= os.environ.get("CLOUDINARY_SECRET","")
 
+# SamugaAI — Gemini free tier for customer/operator chat
+GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
+
 cloudinary.config(cloud_name=CLOUDINARY_CLOUD, api_key=CLOUDINARY_KEY, api_secret=CLOUDINARY_SECRET)
 
 # ── STATES ────────────────────────────────────────────────────────────────────
@@ -66,6 +69,11 @@ OP_BULK_SATHU_DEPS="op_bulk_sathu_deps"
 OP_BULK_FRI_DEPS="op_bulk_fri_deps"
 # Admin states
 ADMIN_AWAIT_BROADCAST="admin_await_broadcast"
+# AI chat state
+CX_AI_CHAT="cx_ai_chat"
+OP_AI_CHAT="op_ai_chat"
+# Rate limit: max 10 AI questions per user per day (Gemini free tier)
+_ai_usage: dict = {}  # {user_id: {"count": int, "date": str}}
 ADMIN_AWAIT_LOGO="admin_await_logo"
 ADMIN_AWAIT_REVIEW_TEXT="admin_await_review_text"
 # Subscription states
@@ -134,6 +142,33 @@ def parse_price(text: str) -> float | None:
                 pass
     return None
 
+def parse_time_24hr(text: str) -> str | None:
+    """
+    Parse and normalise departure time to 24hr HH:MM format.
+    Accepts: 16:00, 04:00PM, 4:00pm, 16.00, 4pm, 16h00
+    Rejects AM/PM and converts to 24hr.
+    Returns None if unparseable.
+    """
+    import re as _re
+    text = text.strip().upper().replace("H", ":").replace(".", ":")
+    # Try HH:MM AM/PM
+    m = _re.match(r"(\d{1,2}):(\d{2})\s*(AM|PM)?$", text)
+    if m:
+        h, mn, period = int(m.group(1)), int(m.group(2)), m.group(3)
+        if period == "PM" and h != 12: h += 12
+        if period == "AM" and h == 12: h = 0
+        if 0 <= h <= 23 and 0 <= mn <= 59:
+            return f"{h:02d}:{mn:02d}"
+    # Try HH AM/PM (no minutes)
+    m2 = _re.match(r"(\d{1,2})\s*(AM|PM)$", text)
+    if m2:
+        h, period = int(m2.group(1)), m2.group(2)
+        if period == "PM" and h != 12: h += 12
+        if period == "AM" and h == 12: h = 0
+        if 0 <= h <= 23:
+            return f"{h:02d}:00"
+    return None
+
 def parse_date_flexible(text: str):
     """Parse date from many formats"""
     from datetime import datetime as _dt
@@ -175,7 +210,8 @@ def parse_bulk_departures(text: str):
         m = time_pat.match(line)
         if not m:
             continue
-        time_str = m.group(1).strip().upper().replace(".", ":")
+        raw_time = m.group(1).strip()
+        time_str = parse_time_24hr(raw_time) or raw_time.upper().replace(".", ":")
         rest = line[m.end():].strip()
         parts = [p.strip().title() for p in to_pat.split(rest) if p.strip()]
         if len(parts) >= 2:
@@ -490,6 +526,107 @@ async def operator_is_active(operator_id: int) -> bool:
     status = await get_sub_status(operator_id)
     return status["status"] in ["trial", "active", "grace"]
 
+# ── SAMUGA AI ─────────────────────────────────────────────────────────────────
+def _ai_check_limit(user_id: int) -> tuple[bool, int]:
+    """Returns (allowed, remaining). 10 messages/day free."""
+    from datetime import date
+    today = str(date.today())
+    if user_id not in _ai_usage or _ai_usage[user_id]["date"] != today:
+        _ai_usage[user_id] = {"count": 0, "date": today}
+    remaining = 10 - _ai_usage[user_id]["count"]
+    return remaining > 0, max(0, remaining)
+
+def _ai_increment(user_id: int):
+    from datetime import date
+    today = str(date.today())
+    if user_id not in _ai_usage or _ai_usage[user_id]["date"] != today:
+        _ai_usage[user_id] = {"count": 0, "date": today}
+    _ai_usage[user_id]["count"] += 1
+
+async def ask_samuga_ai(question: str, role: str, context: dict = None) -> str:
+    """
+    Ask Gemini a question with Samuga Travels context.
+    role: "customer" or "operator"
+    context: optional dict with operator name, route info etc.
+    """
+    if not GEMINI_API_KEY:
+        return (
+            "🤖 SamugaAI is not configured yet.\n\n"
+            "Contact @SamugaTravels for help! 🙏"
+        )
+
+    if role == "operator":
+        system_prompt = """You are SamugaAI, the helpful assistant for Samuga Travels operators in the Maldives.
+You help speedboat and ferry operators with:
+- How to add and manage schedules
+- How to confirm bookings and send tickets
+- How to manage their fleet
+- Subscription and billing questions
+- How to use bot commands
+- General Maldives maritime travel questions
+
+Key facts about Samuga Travels:
+- Operators use /profile to see their dashboard
+- Bulk schedule setup: tap Add Schedule → Bulk Setup → enter routes and times in 24hr format
+- Subscription: MVR 500/month after 2-month free trial
+- Booking confirmation: tap ✅ Confirm & Send Ticket when you receive payment slip
+- All times must be in 24hr format (16:00 not 4:00PM)
+
+Keep answers SHORT (max 3-4 sentences). Use simple English. Be friendly and helpful.
+If you don't know something, say "Contact @SamugaTravels for this."
+Never make up prices, policies, or features that aren't mentioned."""
+    else:
+        system_prompt = """You are SamugaAI, the helpful travel assistant for Samuga Travels customers in the Maldives.
+You help passengers with:
+- How to search and book speedboats
+- What to bring on a boat trip
+- Island information (Thoddoo, Maafushi, Dhigurah, etc.)
+- What to expect during the journey
+- Payment and ticket questions
+- Travel tips for the Maldives
+
+Key facts:
+- Search boats by typing your route e.g. "Male to Thoddoo"
+- Pay via BML or MIB bank transfer then upload screenshot
+- Ticket arrives within 5-10 minutes after operator confirms
+- 45-minute reminder is sent before departure
+- Bring your National ID card (Maldivians) or Passport (foreigners)
+- Use FollowMe app to track your boat
+
+Keep answers SHORT (max 3-4 sentences). Be warm and friendly.
+Never make up schedules, prices, or routes — say "Search in the bot to see current options."
+If asked about refunds or complaints, say "Contact @SamugaTravels directly."
+"""
+
+    ctx_str = ""
+    if context:
+        if context.get("operator_name"):
+            ctx_str = f"\n(Operator: {context['operator_name']})"
+        if context.get("customer_route"):
+            ctx_str = f"\n(Looking for: {context['customer_route']})"
+
+    try:
+        resp = requests.post(
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}",
+            json={
+                "contents": [{"parts": [{"text": f"{system_prompt}{ctx_str}\n\nUser: {question}"}]}],
+                "generationConfig": {"maxOutputTokens": 200, "temperature": 0.7}
+            },
+            timeout=15
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+            return f"🤖 *SamugaAI:*\n\n{text}"
+        elif resp.status_code == 429:
+            return "🤖 SamugaAI is a bit busy right now. Please try again in a minute! 🙏"
+        else:
+            logger.error(f"Gemini error: {resp.status_code} {resp.text[:200]}")
+            return "🤖 Couldn't get an answer right now. Try again or contact @SamugaTravels! 🙏"
+    except Exception as e:
+        logger.error(f"SamugaAI error: {e}")
+        return "🤖 Something went wrong. Please try again! 🙏"
+
 async def get_operator(telegram_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -536,62 +673,71 @@ async def generate_ticket_pdf(booking: dict, operator: dict, schedule: dict) -> 
     story = []
 
     # ── HEADER BAND ──────────────────────────────────────────────────────────
-    # Samuga logo top-left + operator logo top-right in a side-by-side table
-    header_left_content = []
-    try:
-        st_logo_resp = requests.get(
-            "https://res.cloudinary.com/dfhj3clbh/image/upload/samuga_travels/logos/logo_{}.png".format(
-                operator.get("telegram_id", "default")), timeout=4)
-        # Use operator logo as main, we'll add ST watermark text
-        op_img = RLImage(io.BytesIO(st_logo_resp.content), width=22*mm, height=22*mm)
-    except:
-        op_img = None
+    from reportlab.platypus import KeepInFrame
 
-    # Samuga Travels logo top-left (from settings)
+    # Samuga Travels logo top-left — fixed width, maintain aspect ratio, no squeeze
     st_logo_img = None
     if samuga_logo_url:
         try:
             resp = requests.get(samuga_logo_url, timeout=5)
-            st_logo_img = RLImage(io.BytesIO(resp.content), width=22*mm, height=22*mm)
+            img_data = io.BytesIO(resp.content)
+            # Get natural size to preserve aspect ratio
+            from PIL import Image as PILImage
+            pil_img = PILImage.open(io.BytesIO(resp.content))
+            nat_w, nat_h = pil_img.size
+            logo_w = 45*mm
+            logo_h = logo_w * nat_h / nat_w
+            if logo_h > 18*mm:  # cap height
+                logo_h = 18*mm
+                logo_w = logo_h * nat_w / nat_h
+            img_data.seek(0)
+            st_logo_img = RLImage(img_data, width=logo_w, height=logo_h)
+            st_logo_img.hAlign = 'LEFT'
         except: pass
 
     # Operator logo top-right
     op_logo_img = None
     if operator.get("logo_url"):
         try:
-            resp = requests.get(operator["logo_url"], timeout=5)
-            op_logo_img = RLImage(io.BytesIO(resp.content), width=28*mm, height=28*mm)
+            resp_op = requests.get(operator["logo_url"], timeout=5)
+            op_pil = __import__('PIL').Image.open(io.BytesIO(resp_op.content))
+            ow, oh = op_pil.size
+            ol_h = 24*mm
+            ol_w = ol_h * ow / oh
+            if ol_w > 30*mm:
+                ol_w = 30*mm
+                ol_h = ol_w * oh / ow
+            op_logo_img = RLImage(io.BytesIO(resp_op.content), width=ol_w, height=ol_h)
+            op_logo_img.hAlign = 'RIGHT'
         except: pass
 
-    # Header: Samuga logo left (just the logo, no text), operator right
+    # Build header cells properly — no nested lists to prevent squeezing
     from reportlab.platypus import KeepInFrame
-
-    # Left: Samuga logo only — fixed size, no squeezing
-    left_items = []
-    if st_logo_img:
-        st_logo_img.hAlign = 'LEFT'
-        left_items.append(st_logo_img)
-
-    # Right: operator logo + name + contact
-    right_items = []
+    left_cell_items  = ([st_logo_img] if st_logo_img else
+                        [Paragraph('<font color="#1B6CA8"><b>Samuga Travels</b></font>',
+                         ParagraphStyle('stfb', fontName='Helvetica-Bold', fontSize=11))])
+    right_cell_items = []
     if op_logo_img:
-        op_logo_img.hAlign = 'RIGHT'
-        right_items.append(op_logo_img)
-    right_items.append(Paragraph(
+        right_cell_items.append(op_logo_img)
+    right_cell_items.append(Paragraph(
         f'<font color="#0D2137"><b>{operator.get("business_name","")}</b></font>',
-        ParagraphStyle('opn', fontName='Helvetica-Bold', fontSize=11, alignment=2)))
-    right_items.append(Paragraph(
+        ParagraphStyle('opn2', fontName='Helvetica-Bold', fontSize=11, alignment=2)))
+    right_cell_items.append(Paragraph(
         f'<font color="#6B8A9E" size="8">{operator.get("owner_contact","")}</font>',
-        ParagraphStyle('opc', fontName='Helvetica', fontSize=8, alignment=2)))
+        ParagraphStyle('opc2', fontName='Helvetica', fontSize=8, alignment=2)))
 
-    header_table = Table([[left_items, right_items]], colWidths=[85*mm, 90*mm])
+    header_table = Table([
+        [KeepInFrame(85*mm, 25*mm, left_cell_items, hAlign='LEFT'),
+         KeepInFrame(85*mm, 25*mm, right_cell_items, hAlign='RIGHT')]
+    ], colWidths=[90*mm, 85*mm])
     header_table.setStyle(TableStyle([
-        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
-        ('ALIGN', (0,0), (0,0), 'LEFT'),
-        ('ALIGN', (1,0), (1,0), 'RIGHT'),
-        ('PADDING', (0,0), (-1,-1), 2),
-        ('LEFTPADDING', (0,0), (0,-1), 0),
-        ('RIGHTPADDING', (1,0), (1,-1), 0),
+        ('VALIGN',      (0,0), (-1,-1), 'MIDDLE'),
+        ('ALIGN',       (0,0), (0,0),   'LEFT'),
+        ('ALIGN',       (1,0), (1,0),   'RIGHT'),
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING',(0,0), (-1,-1), 0),
+        ('TOPPADDING',  (0,0), (-1,-1), 2),
+        ('BOTTOMPADDING',(0,0),(-1,-1), 2),
     ]))
     story.append(header_table)
     story.append(HRFlowable(width="100%", thickness=2, color=ST_ACCENT, spaceAfter=4*mm))
@@ -694,27 +840,80 @@ async def generate_ticket_pdf(booking: dict, operator: dict, schedule: dict) -> 
         story.append(pax_t)
         story.append(Spacer(1, 4*mm))
 
-    # ── CONTACT + FOOTER ─────────────────────────────────────────────────────
-    story.append(HRFlowable(width="100%", thickness=1, color=ST_ACCENT, spaceBefore=2, spaceAfter=3*mm))
+    # ── QR CODE ──────────────────────────────────────────────────────────────
+    try:
+        import qrcode as _qr
+        passengers_list = booking.get("passengers", [])
+        if isinstance(passengers_list, str):
+            try: passengers_list = json.loads(passengers_list)
+            except: passengers_list = []
+        pax_names = ", ".join([p.get("name","") for p in passengers_list])
+        qr_data = (
+            f"SAMUGA TRAVELS BOOKING\n"
+            f"Ref: {booking['booking_ref']}\n"
+            f"Route: {schedule.get('route_from','')} to {schedule.get('route_to','')}\n"
+            f"Date: {booking.get('travel_date','')}\n"
+            f"Departure: {schedule.get('departure_time','')}\n"
+            f"Passengers: {booking.get('passenger_count',0)}\n"
+            f"Names: {pax_names}\n"
+            f"Total: MVR {booking.get('total_amount',0)}\n"
+            f"Operator: {operator.get('business_name','')}\n"
+            f"Contact: {operator.get('owner_contact','')}\n"
+            f"Issued: {datetime.now().strftime('%d %b %Y %H:%M')} MVT"
+        )
+        qr_img = _qr.make(qr_data)
+        qr_buf = io.BytesIO()
+        qr_img.save(qr_buf, format="PNG")
+        qr_buf.seek(0)
+        qr_rl = RLImage(qr_buf, width=28*mm, height=28*mm)
 
-    contact_text = (
-        f"<b>Operator Contact:</b> {operator.get('owner_contact','N/A')} &nbsp;|&nbsp; "
-        f"<b>Business:</b> {operator.get('business_name','')} &nbsp;|&nbsp; "
-        f"<b>Questions?</b> Contact your operator or Samuga Travels"
-    )
-    story.append(Paragraph(contact_text,
-        ParagraphStyle('ct', fontName='Helvetica', fontSize=8,
-                       textColor=ST_MUTED, alignment=TA_CENTER, spaceAfter=2)))
-
-    story.append(Paragraph(
-        "✅ <b>Present this ticket when boarding.</b> This is an official Samuga Travels booking ticket.",
-        ParagraphStyle('f1', fontName='Helvetica', fontSize=8,
-                       textColor=ST_TEXT, alignment=TA_CENTER, spaceAfter=1)))
-
-    story.append(Paragraph(
-        f"<font color='#1B6CA8'><b>Samuga Travels</b></font> · Maldives · Issued {datetime.now().strftime('%d %b %Y %H:%M')} MVT",
-        ParagraphStyle('f2', fontName='Helvetica', fontSize=7,
-                       textColor=ST_MUTED, alignment=TA_CENTER)))
+        # QR + footer text side by side
+        qr_lbl = ParagraphStyle('qrl', fontName='Helvetica', fontSize=6.5, textColor=ST_MUTED, alignment=1)
+        contact_text = (
+            f"<b>Operator:</b> {operator.get('owner_contact','N/A')} &nbsp;|&nbsp; "
+            f"<b>Business:</b> {operator.get('business_name','')} &nbsp;|&nbsp; "
+            f"<b>Questions?</b> Contact your operator or Samuga Travels"
+        )
+        footer_left = [
+            Paragraph(contact_text,
+                ParagraphStyle('ctq', fontName='Helvetica', fontSize=7.5,
+                               textColor=ST_MUTED, spaceAfter=3)),
+            Paragraph(
+                "■ <b>Present this ticket when boarding.</b> This is an official Samuga Travels booking ticket.",
+                ParagraphStyle('f1q', fontName='Helvetica', fontSize=7.5,
+                               textColor=ST_TEXT, spaceAfter=2)),
+            Paragraph(
+                f"<font color='#1B6CA8'><b>Samuga Travels</b></font> · Maldives · "
+                f"Issued {datetime.now().strftime('%d %b %Y %H:%M')} MVT",
+                ParagraphStyle('f2q', fontName='Helvetica', fontSize=7,
+                               textColor=ST_MUTED)),
+        ]
+        footer_right = [
+            qr_rl,
+            Paragraph("Scan to verify", qr_lbl),
+        ]
+        story.append(HRFlowable(width="100%", thickness=1, color=ST_ACCENT, spaceBefore=2, spaceAfter=3*mm))
+        footer_table = Table([[footer_left, footer_right]], colWidths=[140*mm, 35*mm])
+        footer_table.setStyle(TableStyle([
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+            ('ALIGN',  (1,0), (1,0),   'CENTER'),
+            ('LEFTPADDING',  (0,0), (-1,-1), 0),
+            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ]))
+        story.append(footer_table)
+    except Exception as _qe:
+        logger.error(f"QR code generation: {_qe}")
+        # Fallback footer without QR
+        story.append(HRFlowable(width="100%", thickness=1, color=ST_ACCENT, spaceBefore=2, spaceAfter=3*mm))
+        story.append(Paragraph(
+            f"<b>Operator Contact:</b> {operator.get('owner_contact','N/A')} | "
+            f"<b>Business:</b> {operator.get('business_name','')}",
+            ParagraphStyle('ctf', fontName='Helvetica', fontSize=8,
+                           textColor=ST_MUTED, alignment=TA_CENTER)))
+        story.append(Paragraph(
+            "■ <b>Present this ticket when boarding.</b> This is an official Samuga Travels booking ticket.",
+            ParagraphStyle('f1f', fontName='Helvetica', fontSize=8,
+                           textColor=ST_TEXT, alignment=TA_CENTER)))
 
     doc.build(story)
     return buf.getvalue()
@@ -729,10 +928,12 @@ def main_kb(role="customer"):
              InlineKeyboardButton("📦 Pending Bookings", callback_data="op_bookings")],
             [InlineKeyboardButton("✏️ Edit Info",        callback_data="op_edit"),
              InlineKeyboardButton("📅 Today's Schedule", callback_data="op_today")],
+            [InlineKeyboardButton("🤖 Ask SamugaAI",    callback_data="op_ai_chat")],
         ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔍 Search Boats",           callback_data="cx_search"),
          InlineKeyboardButton("📋 My Bookings",            callback_data="cx_my_bookings")],
+        [InlineKeyboardButton("🤖 Ask SamugaAI",          callback_data="cx_ai_chat")],
         [InlineKeyboardButton("🤝 Register as Operator",   callback_data="register_operator")],
     ])
 
@@ -1096,6 +1297,41 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await set_user_state(user.id, CX_IDLE, {})
         return
 
+    # ── SAMUGAAI CHAT STATES ─────────────────────────────────────────────────
+    if state in [CX_AI_CHAT, OP_AI_CHAT]:
+        if is_cancel(text):
+            role = sd.get("role","customer")
+            op = await get_operator(user.id)
+            back_state = OP_IDLE if (op and op.get("status") == "approved") else CX_IDLE
+            await set_user_state(user.id, back_state, {})
+            await update.message.reply_text(
+                "👋 Left SamugaAI. Back to main menu!",
+                reply_markup=main_kb("operator" if (op and op.get("status") == "approved") else "customer"))
+            return
+        allowed, remaining = _ai_check_limit(user.id)
+        if not allowed:
+            await update.message.reply_text(
+                "🤖 You've used your 10 free SamugaAI questions for today.\n\n"
+                "Come back tomorrow for more! 🙏",
+                parse_mode="Markdown")
+            return
+        _ai_increment(user.id)
+        thinking = await update.message.reply_text("🤖 _SamugaAI is thinking..._", parse_mode="Markdown")
+        role = "operator" if state == OP_AI_CHAT else "customer"
+        op = await get_operator(user.id)
+        ctx_data = {"operator_name": op.get("business_name") if op else None}
+        answer = await ask_samuga_ai(text, role, ctx_data)
+        try:
+            await ctx.bot.delete_message(user.id, thinking.message_id)
+        except: pass
+        await update.message.reply_text(
+            answer + f"\n\n_({remaining-1} questions left today)_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ End Chat", callback_data="ai_end_chat")
+            ]]))
+        return
+
     # ── GLOBAL CANCEL CHECK ──────────────────────────────────────────────────
     if is_cancel(text) and state not in [CX_IDLE, OP_IDLE]:
         role = sd.get("role","customer")
@@ -1198,7 +1434,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pool = await get_pool()
 
         if change_type == "time":
-            new_time_val = text.strip()
+            new_time_val = parse_time_24hr(text.strip())
+            if not new_time_val:
+                await update.message.reply_text(
+                    "⚠️ Use 24-hour format e.g. `16:00` or `06:45`",
+                    parse_mode="Markdown")
+                return
             async with pool.acquire() as conn:
                 await conn.execute("""
                     INSERT INTO schedule_changes (schedule_id, change_date, new_time, note)
@@ -1477,11 +1718,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                              {**temp, "sched_from": sched_from, "sched_to": sched_to,
                               "sched_stops": stops, "route_display": route_display})
         await update.message.reply_text(
-            f"✅ Route saved!\n\n📍 *{route_display}*\n\nWhat is the *departure time*?\n\n_Example: 04:00 PM_",
+            f"✅ Route saved!\n\n📍 *{route_display}*\n\nWhat is the *departure time*? *(24hr format)*\n\n_Example: `16:00` or `06:45`_",
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_SCHEDULE_TIME:
-        await set_user_state(user.id, OP_AWAIT_SCHEDULE_PRICE, {**temp, "sched_time": text})
+        parsed_time = parse_time_24hr(text)
+        if not parsed_time:
+            await update.message.reply_text(
+                "⚠️ Please use *24-hour format*\n\n"
+                "_Examples:_\n`16:00` not `4:00PM`\n`06:45` not `6:45am`\n`10:15`",
+                parse_mode="Markdown")
+            return
+        await set_user_state(user.id, OP_AWAIT_SCHEDULE_PRICE, {**temp, "sched_time": parsed_time})
         await update.message.reply_text(
             "✅ Time saved!\n\nWhat is the *price per seat* (MVR)?",
             parse_mode="Markdown")
