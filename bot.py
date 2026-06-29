@@ -58,6 +58,85 @@ OP_AWAIT_SCHEDULE_LOCATION="op_await_schedule_location"
 OP_AWAIT_SCHEDULE_DAYS="op_await_schedule_days"
 OP_AWAIT_CHANGE_NOTE="op_await_change_note"
 
+# ── SMART INPUT HELPERS ──────────────────────────────────────────────────────
+def normalize_input(text: str) -> str:
+    """Clean up common input variations"""
+    return text.strip()
+
+def parse_name_id(text: str) -> tuple[str, str] | None:
+    """
+    Flexibly parse 'Name, ID' from user input.
+    Accepts: comma, dash, slash, pipe, space+ID as separators.
+    Also handles: 'Ahmed Ali A123456' (space before ID starting with A/A0-9)
+    """
+    import re
+    text = text.strip()
+    # Try comma first (preferred)
+    if "," in text:
+        parts = text.split(",", 1)
+        if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+            return parts[0].strip(), parts[1].strip()
+    # Try other separators: | / - (with spaces)
+    for sep in [" | ", " / ", " - ", "|", "/"]:
+        if sep in text:
+            parts = text.split(sep, 1)
+            if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+                return parts[0].strip(), parts[1].strip()
+    # Try: name followed by ID card pattern (A + digits or passport)
+    match = re.search(r'^(.+?)\s+([A-Za-z]\d{5,}|[A-Z]{2}\d{6,})$', text)
+    if match:
+        return match.group(1).strip(), match.group(2).strip()
+    return None
+
+def is_cancel(text: str) -> bool:
+    """Check if user wants to cancel"""
+    return text.strip().lower() in ["cancel", "stop", "quit", "exit", "/cancel", "back", "nope", "no"]
+
+def is_skip(text: str) -> bool:
+    """Check if user wants to skip optional step"""
+    return text.strip().lower() in ["skip", "no", "nope", "none", "-", "n/a", "na", "next"]
+
+def parse_number(text: str) -> int | None:
+    """Extract number from text like '2 seats', '2pax', '2 people'"""
+    import re
+    text = text.strip()
+    match = re.search(r'\d+', text)
+    if match:
+        return int(match.group())
+    return None
+
+def parse_price(text: str) -> float | None:
+    """Parse price from '250', '250MVR', 'MVR250', '250 mvr', '250.00'"""
+    import re
+    text = text.strip().upper().replace(",", "")
+    text = text.replace("MVR", "").replace("RF", "").replace("MRF", "").strip()
+    try:
+        return float(text)
+    except ValueError:
+        match = re.search(r'[\d.]+', text)
+        if match:
+            try:
+                return float(match.group())
+            except ValueError:
+                pass
+    return None
+
+def parse_date_flexible(text: str):
+    """Parse date from many formats"""
+    from datetime import datetime as _dt
+    text = text.strip()
+    formats = [
+        "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
+        "%Y-%m-%d",  # ISO format
+        "%d-%m-%y", "%d/%m/%y",  # short year
+    ]
+    for fmt in formats:
+        try:
+            return _dt.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
 # ── DB POOL ───────────────────────────────────────────────────────────────────
 _pool = None
 
@@ -565,6 +644,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     temp = sd.get("temp_data", {}) or {}
     text = (update.message.text or "").strip()
 
+    # ── GLOBAL CANCEL CHECK ──────────────────────────────────────────────────
+    if is_cancel(text) and state not in [CX_IDLE, OP_IDLE]:
+        role = sd.get("role","customer")
+        if role == "operator":
+            op = await get_operator(user.id)
+            role = "operator" if (op and op.get("status")=="approved") else "customer"
+        await set_user_state(user.id, CX_IDLE if role != "operator" else OP_IDLE, {})
+        await update.message.reply_text(
+            "❌ Cancelled. Back to main menu.",
+            reply_markup=main_kb(role))
+        return
+
     # ── OPERATOR REG FLOW ─────────────────────────────────────────────────────
     if state == OP_AWAIT_BUSINESS_NAME:
         await set_user_state(user.id, OP_AWAIT_BOAT_NAME, {**temp, "business_name": text})
@@ -579,14 +670,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_SEATS:
-        if not text.isdigit():
-            await update.message.reply_text("⚠️ Please enter a valid number.")
+        seat_num = parse_number(text)
+        if not seat_num or seat_num < 1:
+            await update.message.reply_text("⚠️ Please enter a valid number e.g. `20`", parse_mode="Markdown")
             return
-        await set_user_state(user.id, OP_AWAIT_TYPE, {**temp, "seat_count": int(text)})
+        await set_user_state(user.id, OP_AWAIT_TYPE, {**temp, "seat_count": seat_num})
         await update.message.reply_text(
             "✅ Got it!\n\n*Step 4 of 9:* What type of service?",
             parse_mode="Markdown", reply_markup=boat_type_kb())
-
     elif state == OP_AWAIT_ROUTES:
         stops = [s.strip() for s in text.split(",") if s.strip()]
         if len(stops) < 2:
@@ -628,7 +719,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_MIB_ACCOUNT:
-        if text.strip().lower() == "skip":
+        if is_skip(text):
             mib_entry = ""
         else:
             parts = text.strip().split(" ", 1)
@@ -654,10 +745,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_BOAT_ADD_CAPACITY:
-        if not text.strip().isdigit():
-            await update.message.reply_text("⚠️ Enter a valid number.")
+        capacity = parse_number(text)
+        if not capacity or capacity < 1:
+            await update.message.reply_text("⚠️ Enter a valid number e.g. `20`", parse_mode="Markdown")
             return
-        capacity = int(text.strip())
         op = await get_operator(user.id)
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -704,9 +795,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_SCHEDULE_PRICE:
-        try:
-            price = float(text.upper().replace("MVR","").replace(",","").strip())
-        except ValueError:
+        price = parse_price(text)
+        if price is None or price <= 0:
             await update.message.reply_text("⚠️ Enter a valid price e.g. `535` or `535MVR`", parse_mode="Markdown")
             return
         await set_user_state(user.id, OP_AWAIT_SCHEDULE_SEATS, {**temp, "sched_price": price})
@@ -714,10 +804,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                         parse_mode="Markdown")
 
     elif state == OP_AWAIT_SCHEDULE_SEATS:
-        if not text.isdigit():
-            await update.message.reply_text("⚠️ Enter a valid number.")
+        seats = parse_number(text)
+        if not seats or seats < 1:
+            await update.message.reply_text("⚠️ Enter a valid number e.g. `18`", parse_mode="Markdown")
             return
-        seats = int(text)
         sd2 = await get_user_state(user.id)
         t2  = sd2.get("temp_data", {}) or {}
         op  = await get_operator(user.id)
@@ -811,17 +901,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── CUSTOMER FLOW ─────────────────────────────────────────────────────────
     elif state == CX_AWAIT_DATE:
-        # Accept multiple formats: DD-MM-YYYY, DD/MM/YYYY
-        travel_date = None
-        for fmt in ("%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y"):
-            try:
-                travel_date = datetime.strptime(text.strip(), fmt).date()
-                break
-            except ValueError:
-                continue
+        travel_date = parse_date_flexible(text)
         if not travel_date:
             await update.message.reply_text(
-                "⚠️ Invalid date format.\n\nAccepted formats:\n`30-06-2026` or `30/06/2026`",
+                "⚠️ Couldn\'t read that date 😅\n\nTry formats like:\n`30-06-2026` or `30/06/2026`",
                 parse_mode="Markdown")
             return
         if travel_date < datetime.now().date():
@@ -908,41 +991,66 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
     elif state == CX_AWAIT_PASSENGER_COUNT:
-        if not text.isdigit() or int(text) < 1:
-            await update.message.reply_text("⚠️ Enter a valid number (1-10).")
+        count = parse_number(text)
+        if not count or count < 1:
+            await update.message.reply_text("⚠️ Enter a valid number e.g. `2`", parse_mode="Markdown")
             return
-        count = int(text)
         if count > 10:
             await update.message.reply_text("⚠️ Maximum 10 seats per booking.")
             return
         if count > int(temp.get("sel_seats", 0)):
             await update.message.reply_text(f"⚠️ Only *{temp.get('sel_seats')} seats* available.", parse_mode="Markdown")
             return
+        # Build example format based on count
+        example_lines = "\n".join([f"{i+1}. Full Name, ID Number" for i in range(count)])
+        example_filled = "\n".join([
+            "1. Ahmed Ali, A123456",
+            "2. Fatima Mohamed, A654321",
+            "3. Hassan Ali, A789012"
+        ][:count])
         await set_user_state(user.id, CX_COLLECTING_PASSENGERS,
                              {**temp, "passenger_count": count, "passengers_collected": [], "current_passenger": 1})
         await update.message.reply_text(
-            f"👤 *Passenger 1 of {count}*\n\nEnter *Full Name* and *ID / Passport Number*:\n\n_Format: Ahmed Ali, A123456_",
+            f"👥 *Enter all {count} passenger(s) at once:*\n\n"
+            f"_Format — one per line:_\n`Name, ID Number`\n\n"
+            f"_Example:_\n`{example_filled}`\n\n"
+            f"Send all {count} passengers in one message 👇",
             parse_mode="Markdown")
 
     elif state == CX_COLLECTING_PASSENGERS:
-        parts = text.split(",", 1)
-        if len(parts) != 2:
-            await update.message.reply_text("⚠️ Format: `Full Name, ID Number`\n\nExample: `Ahmed Ali, A123456`", parse_mode="Markdown")
-            return
         sd2 = await get_user_state(user.id)
         t2  = sd2.get("temp_data", {}) or {}
-        passengers = t2.get("passengers_collected", [])
-        current    = t2.get("current_passenger", 1)
-        total      = t2.get("passenger_count", 1)
-        passengers.append({"name": parts[0].strip(), "id_number": parts[1].strip()})
+        total = t2.get("passenger_count", 1)
 
-        if current < total:
-            await set_user_state(user.id, CX_COLLECTING_PASSENGERS,
-                                 {**t2, "passengers_collected": passengers, "current_passenger": current+1})
+        # Parse all passengers from one message — one per line
+        # Strip leading numbers like "1. Ahmed" or "1) Ahmed"
+        import re as _re
+        lines_raw = [_re.sub(r"^\d+[.)\-\s]+", "", l.strip()) for l in text.strip().split("\n") if l.strip()]
+        passengers = []
+        errors = []
+        for i, line in enumerate(lines_raw):
+            parsed = parse_name_id(line)
+            if parsed:
+                passengers.append({"name": parsed[0], "id_number": parsed[1]})
+            else:
+                errors.append(f"Line {i+1}: couldn\'t read `{line}`")
+
+        if errors or len(passengers) != total:
+            example = "\n".join([f"{i+1}. Ahmed Ali, A12345{i}" for i in range(total)])
+            err_msg = "\n".join(errors) if errors else ""
             await update.message.reply_text(
-                f"✅ Passenger {current} saved!\n\n"
-                f"👤 *Passenger {current+1} of {total}*\n\nEnter *Full Name* and *ID / Passport Number*:\n\n_Format: Ahmed Ali, A123456_",
+                f"⚠️ Need exactly *{total} passenger(s)*, one per line.\n\n"
+                f"{err_msg}\n\n"
+                f"_Example for {total} passenger(s):_\n`{example}`",
                 parse_mode="Markdown")
+            return
+
+        if True:  # always show summary now
+            t2["passengers_collected"] = passengers
+            # fall through to summary below
+            pass
+        if False:
+            pass
         else:
             sd3 = await get_user_state(user.id)
             t3  = sd3.get("temp_data", {}) or {}
@@ -1046,42 +1154,68 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif state == CX_AWAIT_PAYMENT_SLIP:
         await update.message.reply_text("⏳ Processing your payment slip...")
-        ref = gen_ref()
-        url = await upload_image(file_bytes, "payment_slips", f"slip_{ref}")
-        sd2 = await get_user_state(user.id)
-        t2  = sd2.get("temp_data", {}) or {}
+        try:
+            ref = gen_ref()
+            url = await upload_image(file_bytes, "payment_slips", f"slip_{ref}")
+            sd2 = await get_user_state(user.id)
+            t2  = sd2.get("temp_data", {}) or {}
 
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("""
-                INSERT INTO bookings (booking_ref, customer_telegram_id, customer_name, operator_id, schedule_id,
-                                      travel_date, passenger_count, passengers, total_amount,
-                                      payment_slip_url, status)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending_confirmation')
-                RETURNING id
-            """, ref, user.id, f"{t2.get('cx_name','')} | {t2.get('cx_phone','')}",
-                t2.get("sel_operator_id"), t2.get("sel_schedule_id"),
-                t2.get("travel_date"), t2.get("passenger_count"),
-                json.dumps(t2.get("passengers_collected",[])),
-                t2.get("total_amount"), url)
-        booking_id = row["id"]
+            # Safe type casting
+            from datetime import date as _date
+            travel_date_raw = t2.get("travel_date","")
+            try:
+                if isinstance(travel_date_raw, str) and travel_date_raw:
+                    travel_date_val = datetime.strptime(travel_date_raw, "%Y-%m-%d").date()
+                else:
+                    travel_date_val = _date.today()
+            except Exception:
+                travel_date_val = _date.today()
 
-        await set_user_state(user.id, CX_BOOKING_COMPLETE, {"booking_ref": ref, "booking_id": booking_id})
-        await update.message.reply_text(
-            f"✅ *Payment slip received!*\n\n"
-            f"📋 Booking Ref: `{ref}`\n\n"
-            f"Your booking is being reviewed by the operator. "
-            f"You\'ll receive your ticket here within 5 minutes. 🌊",
-            parse_mode="Markdown")
+            operator_id  = int(t2.get("sel_operator_id") or 0) or None
+            schedule_id  = int(t2.get("sel_schedule_id") or 0) or None
+            pax_count    = int(t2.get("passenger_count") or 1)
+            total_amount = float(t2.get("total_amount") or 0)
+            customer_name = f"{t2.get('cx_name','')} | {t2.get('cx_phone','')}"
+            passengers_json = json.dumps(t2.get("passengers_collected",[]))
 
-        # Build sel dict from flat keys for notify
-        sel = {
-            "operator_id": t2.get("sel_operator_id"),
-            "id": t2.get("sel_schedule_id"),
-            "departure_time": t2.get("sel_time"),
-            "op_telegram_id": t2.get("sel_op_tg"),
-        }
-        await notify_operator_payment(ctx, booking_id, sel, t2, ref, user, photo.file_id)
+            logger.info(f"Booking insert: ref={ref} op={operator_id} sched={schedule_id} date={travel_date_val} pax={pax_count} amt={total_amount}")
+
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow("""
+                    INSERT INTO bookings (booking_ref, customer_telegram_id, customer_name, operator_id, schedule_id,
+                                          travel_date, passenger_count, passengers, total_amount,
+                                          payment_slip_url, status)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending_confirmation')
+                    RETURNING id
+                """, ref, user.id, customer_name, operator_id, schedule_id,
+                    travel_date_val, pax_count, passengers_json, total_amount, url)
+            booking_id = row["id"]
+            logger.info(f"✅ Booking {ref} saved with id={booking_id}")
+
+            await set_user_state(user.id, CX_BOOKING_COMPLETE, {"booking_ref": ref, "booking_id": booking_id})
+            await update.message.reply_text(
+                f"✅ *Payment slip received!*\n\n"
+                f"📋 Booking Ref: `{ref}`\n\n"
+                f"Your booking is being reviewed by the operator. "
+                f"You\'ll receive your ticket here within 5 minutes. 🌊",
+                parse_mode="Markdown")
+
+            sel = {
+                "operator_id": operator_id,
+                "id": schedule_id,
+                "departure_time": t2.get("sel_time",""),
+                "op_telegram_id": t2.get("sel_op_tg", 0),
+            }
+            await notify_operator_payment(ctx, booking_id, sel, t2, ref, user, photo.file_id)
+
+        except Exception as e:
+            logger.error(f"❌ Payment slip error: {e}", exc_info=True)
+            await update.message.reply_text(
+                "⚠️ Sorry, something went wrong saving your booking.\n\n"
+                "Don\'t worry — please send your payment slip directly to the operator "
+                "and they will confirm manually. We apologise for the inconvenience! 🙏",
+                parse_mode="Markdown")
 
 
     else:
