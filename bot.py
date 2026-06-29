@@ -364,6 +364,19 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        # Prevent duplicate daily overrides for the same schedule/date.
+        # Clean old duplicates first so index creation will not fail on existing databases.
+        await conn.execute("""
+            DELETE FROM schedule_changes a
+            USING schedule_changes b
+            WHERE a.schedule_id=b.schedule_id
+              AND a.change_date=b.change_date
+              AND a.id > b.id
+        """)
+        await conn.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS unique_schedule_change_per_day
+            ON schedule_changes(schedule_id, change_date)
+        """)
         # Add columns to schedules if missing
         await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'Jetty No. 1, Male'")
         await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS run_days TEXT DEFAULT 'daily'")
@@ -408,6 +421,10 @@ async def init_db():
         """)
         await conn.execute("""
             INSERT INTO settings (key, value) VALUES ('subscription_accounts', '[]')
+            ON CONFLICT (key) DO NOTHING
+        """)
+        await conn.execute("""
+            INSERT INTO settings (key, value) VALUES ('commission_rate', '0')
             ON CONFLICT (key) DO NOTHING
         """)
         # Subscriptions table
@@ -484,6 +501,23 @@ async def set_setting(key: str, value: str):
             INSERT INTO settings (key, value, updated_at) VALUES ($1,$2,NOW())
             ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()
         """, key, value)
+
+async def safe_edit(query, text: str, parse_mode: str = "Markdown", reply_markup=None):
+    """Edit either a caption message or a text message; fallback to reply if editing fails."""
+    try:
+        await query.edit_message_caption(caption=text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(text=text, parse_mode=parse_mode, reply_markup=reply_markup)
+        return
+    except Exception:
+        pass
+    try:
+        await query.message.reply_text(text, parse_mode=parse_mode, reply_markup=reply_markup)
+    except Exception as e:
+        logger.error(f"safe_edit failed: {e}")
 
 async def get_subscription(operator_id: int) -> dict | None:
     pool = await get_pool()
@@ -724,17 +758,38 @@ async def get_operator_monthly_report(operator_id: int, year: int, month: int) -
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
             SELECT
-                COUNT(*) AS total_bookings,
-                COUNT(*) FILTER (WHERE status='confirmed')   AS confirmed_bookings,
-                COUNT(*) FILTER (WHERE status='cancelled')   AS cancelled_bookings,
-                COUNT(*) FILTER (WHERE status IN ('pending_payment','pending_confirmation')) AS pending_bookings,
-                COALESCE(SUM(passenger_count)  FILTER (WHERE status='confirmed'), 0) AS seats_sold,
-                COALESCE(SUM(total_amount)     FILTER (WHERE status='confirmed'), 0) AS gross_sales,
-                COALESCE(SUM(total_amount)     FILTER (WHERE status='cancelled'), 0) AS cancelled_value
+                COUNT(*) FILTER (
+                    WHERE EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
+                ) AS total_bookings,
+                COUNT(*) FILTER (
+                    WHERE status='confirmed' AND EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
+                ) AS confirmed_bookings,
+                COUNT(*) FILTER (
+                    WHERE status='cancelled' AND EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
+                ) AS cancelled_bookings,
+                COUNT(*) FILTER (
+                    WHERE status IN ('pending_payment','pending_confirmation') AND EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
+                ) AS pending_bookings,
+                COALESCE(SUM(passenger_count) FILTER (
+                    WHERE status='confirmed' AND EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
+                ), 0) AS seats_sold,
+                COALESCE(SUM(total_amount) FILTER (
+                    WHERE status='confirmed' AND EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
+                ), 0) AS gross_sales,
+                COALESCE(SUM(total_amount) FILTER (
+                    WHERE status='cancelled' AND EXTRACT(YEAR FROM travel_date)=$2 AND EXTRACT(MONTH FROM travel_date)=$3
+                ), 0) AS cancelled_value,
+                COUNT(*) FILTER (
+                    WHERE status='cancelled' AND cancelled_at IS NOT NULL AND EXTRACT(YEAR FROM cancelled_at)=$2 AND EXTRACT(MONTH FROM cancelled_at)=$3
+                ) AS cancelled_this_month,
+                COALESCE(SUM(total_amount) FILTER (
+                    WHERE refund_status='completed' AND refund_at IS NOT NULL AND EXTRACT(YEAR FROM refund_at)=$2 AND EXTRACT(MONTH FROM refund_at)=$3
+                ), 0) AS refunds_completed,
+                COALESCE(SUM(total_amount) FILTER (
+                    WHERE refund_status='requested'
+                ), 0) AS refunds_pending
             FROM bookings
             WHERE operator_id=$1
-              AND EXTRACT(YEAR  FROM travel_date)=$2
-              AND EXTRACT(MONTH FROM travel_date)=$3
         """, operator_id, year, month)
 
         top_route = await conn.fetchrow("""
@@ -1136,9 +1191,11 @@ async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         op = await get_operator(user.id)
         kb = None
         if user.id in SUPER_ADMINS or (op and op.get("id") == bk["operator_id"]):
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🛳️ Mark as Boarded", callback_data=f"mark_boarded_{bk['id']}")
-            ]])
+            date_token = bk["travel_date"].strftime("%Y%m%d") if hasattr(bk["travel_date"], "strftime") else str(bk["travel_date"]).replace("-", "")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🛳️ Mark as Boarded", callback_data=f"mark_boarded_{bk['id']}")],
+                [InlineKeyboardButton("👥 Open Boarding Manifest", callback_data=f"op_manifest_{bk['schedule_id']}_{date_token}")]
+            ])
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
     else:
         msg += f"\n⚠️ Status is *{bk['status']}* — not yet confirmed."
@@ -1416,7 +1473,7 @@ async def start_op_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await set_user_state(user.id, OP_AWAIT_BUSINESS_NAME, {}, role="operator_pending")
     await msg.reply_text(
         "🚤 *Operator Registration — Samuga Travels*\n\n"
-        "*Step 1 of 9:* What is your *business/company name*?\n\n_Example: Thoddoo Express Travels_",
+        "*Step 1:* What is your *business/company name*?\n\n_Example: Thoddoo Express Travels_",
         parse_mode="Markdown")
 
 # ── MESSAGE HANDLER ───────────────────────────────────────────────────────────
@@ -1624,13 +1681,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if state == OP_AWAIT_BUSINESS_NAME:
         await set_user_state(user.id, OP_AWAIT_BOAT_NAME, {**temp, "business_name": text})
         await update.message.reply_text(
-            "✅ Got it!\n\n*Step 2 of 9:* What is your *boat name*?\n\n_Example: Ocean Star_",
+            "✅ Got it!\n\n*Step 2:* What is your *boat name*?\n\n_Example: Ocean Star_",
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_BOAT_NAME:
         await set_user_state(user.id, OP_AWAIT_SEATS, {**temp, "boat_name": text})
         await update.message.reply_text(
-            "✅ Got it!\n\n*Step 3 of 9:* How many *seats* does your boat have?\n\n_Enter a number, e.g. 20_",
+            "✅ Got it!\n\n*Step 3:* How many *seats* does your boat have?\n\n_Enter a number, e.g. 20_",
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_SEATS:
@@ -1640,7 +1697,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await set_user_state(user.id, OP_AWAIT_TYPE, {**temp, "seat_count": seat_num})
         await update.message.reply_text(
-            "✅ Got it!\n\n*Step 4 of 9:* What type of service?",
+            "✅ Got it!\n\n*Step 4:* What type of service?",
             parse_mode="Markdown", reply_markup=boat_type_kb())
     elif state == OP_AWAIT_ROUTES:
         stops = [s.strip() for s in text.split(",") if s.strip()]
@@ -1653,21 +1710,21 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         route_display = " → ".join(stops)
         await set_user_state(user.id, OP_AWAIT_OWNER_NAME, {**temp, "routes": stops, "route_display": route_display})
         await update.message.reply_text(
-            f"✅ Route saved!\n\n📍 *{route_display}*\n\n*Step 6 of 9:* What is the *owner's full name*?",
+            f"✅ Route saved!\n\n📍 *{route_display}*\n\n*Step 6:* What is the *owner's full name*?",
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_OWNER_NAME:
         await set_user_state(user.id, OP_AWAIT_OWNER_CONTACT, {**temp, "owner_name": text})
         await update.message.reply_text(
-            "✅ Got it!\n\n*Step 7 of 9:* Owner's *contact number*?\n\n_Example: 7771234_",
+            "✅ Got it!\n\n*Step 7:* Owner's *contact number*?\n\n_Example: 7771234_",
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_OWNER_CONTACT:
         await set_user_state(user.id, OP_AWAIT_OWNER_ID_PHOTO, {**temp, "owner_contact": text})
         await update.message.reply_text(
-            "✅ Got it!\n\n*Step 8 of 9:* Please upload a *photo of the owner's ID card or passport*.\n\n"
+            "✅ Got it!\n\n*Step 8:* Please upload a *photo of the owner's ID card or passport*.\n\n"
             "🔒 *Privacy Notice:* Your ID is used only for operator verification by Samuga Travels admin. "
-            "It is stored in a private, encrypted folder and will never be shared publicly or with other operators.\n\n"
+            "It will not be shown publicly or shared with other operators. Only Samuga Travels admin can use it for verification.\n\n"
             "_This is required by Samuga Travels to ensure all operators are legitimate._",
             parse_mode="Markdown")
 
@@ -2420,7 +2477,7 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         url = await upload_image(file_bytes, "logos", f"logo_{user.id}")
         await set_user_state(user.id, OP_AWAIT_ROUTES, {**temp, "logo_url": url})
         await update.message.reply_text(
-            "✅ Logo uploaded!\n\n*Step 5 of 9:* Enter your *route with all stops in order*\n\n"
+            "✅ Logo uploaded!\n\n*Step 5:* Enter your *route with all stops in order*\n\n"
             "_For a ferry with multiple stops:_\n"
             "`Male, Dhigurah, Thoddoo, Dhagethi`\n\n"
             "_For a direct route:_\n"
@@ -2429,11 +2486,11 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
     elif state == OP_AWAIT_OWNER_ID_PHOTO:
-        await update.message.reply_text("⏳ Uploading ID securely to private storage...")
+        await update.message.reply_text("⏳ Uploading ID securely to Samuga Travels storage...")
         url = await upload_image(file_bytes, "private/id_photos", f"id_{user.id}")
         await set_user_state(user.id, OP_AWAIT_BML_ACCOUNT, {**temp, "owner_id_photo_url": url})
         await update.message.reply_text(
-            "✅ ID uploaded!\n\n*Step 9 of 10:* Your *BML bank account number and account name*?\n\n"
+            "✅ ID uploaded!\n\n*Final step:* Your *BML bank account number and account name*?\n\n"
             "_Format: AccountNumber AccountName_\n_Example: 7770000234231 Samuga Art_",
             parse_mode="Markdown")
 
@@ -3077,7 +3134,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await set_user_state(user.id, OP_AWAIT_LOGO, {**temp, "boat_type": boat_type})
         await query.message.reply_text(
             f"✅ *{'Ferry' if boat_type=='ferry' else 'Private Hire'}* selected!\n\n"
-            f"*Step 5 of 9:* Please upload your *boat/company logo*.",
+            f"*Step 5:* Please upload your *boat/company logo*.",
             parse_mode="Markdown")
 
     elif data.startswith("approve_op_"):
@@ -3251,6 +3308,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         bk_map_tmr   = {b["schedule_id"]: b for b in bookings_tmr}
 
         msg = f"📅 *Today — {today.strftime('%A, %d %b')}*\n\n"
+        buttons = []
         if not scheds_today:
             msg += "_No schedules today._\n"
         for s in scheds_today:
@@ -3263,9 +3321,12 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"🚤 {s['active_boat'] or 'Default'} | 📌 {s.get('location','Jetty No. 1, Male')}\n"
                 f"🎫 {cnt} bookings | 👥 {pax} pax{chng}\n\n"
             )
+            if cnt:
+                buttons.append([InlineKeyboardButton(
+                    f"👥 Manifest {s['active_time']} — {s['route_from']} → {s['route_to']}",
+                    callback_data=f"op_manifest_{s['id']}_{today.strftime('%Y%m%d')}")])
 
         msg += f"\n📅 *Tomorrow — {tomorrow.strftime('%A, %d %b')}* _(tap to manage)_\n\n"
-        buttons = []
         if not scheds_tmr:
             msg += "_No schedules tomorrow._\n"
         for s in scheds_tmr:
@@ -3285,6 +3346,73 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(msg, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
 
+    elif data.startswith("op_manifest_"):
+        op = await get_operator(user.id)
+        if not op:
+            await query.answer("Operator account required.", show_alert=True)
+            return
+        parts = data.split("_")
+        sched_id = int(parts[2])
+        date_token = parts[3] if len(parts) > 3 else datetime.now().strftime("%Y%m%d")
+        manifest_date = datetime.strptime(date_token, "%Y%m%d").date()
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT b.id, b.booking_ref, b.passengers, b.passenger_count,
+                       b.boarded_at, b.status, b.customer_name,
+                       s.route_from, s.route_to, s.departure_time, s.location
+                FROM bookings b
+                JOIN schedules s ON b.schedule_id=s.id
+                WHERE b.schedule_id=$1
+                  AND b.operator_id=$2
+                  AND b.travel_date=$3
+                  AND b.status='confirmed'
+                ORDER BY b.boarded_at NULLS FIRST, b.created_at
+            """, sched_id, op["id"], manifest_date)
+        if not rows:
+            await query.message.reply_text(
+                f"👥 *Boarding Manifest*\n\nNo confirmed passengers for {manifest_date}.",
+                parse_mode="Markdown")
+            return
+        first = rows[0]
+        total_pax = sum(int(r["passenger_count"] or 0) for r in rows)
+        boarded_pax = sum(int(r["passenger_count"] or 0) for r in rows if r["boarded_at"])
+        msg = (
+            f"👥 *Boarding Manifest*\n\n"
+            f"📍 {first['route_from']} → {first['route_to']}\n"
+            f"📅 {manifest_date} @ {first['departure_time']}\n"
+            f"📌 {first.get('location') or 'Jetty No. 1, Male'}\n\n"
+            f"🛳️ Boarded: *{boarded_pax}/{total_pax}*\n\n"
+        )
+        buttons = []
+        for r in rows:
+            icon = "✅" if r["boarded_at"] else "⬜"
+            passengers = r["passengers"] or "[]"
+            if isinstance(passengers, str):
+                try:
+                    passengers = json.loads(passengers)
+                except Exception:
+                    passengers = []
+            pax_lines = []
+            for psg in passengers:
+                pax_lines.append(f"{psg.get('name','N/A')} — {psg.get('id_number','N/A')}")
+            if not pax_lines:
+                pax_lines = [r["customer_name"] or "Passenger details on file"]
+            msg += f"{icon} `{r['booking_ref']}`\n"
+            for line in pax_lines:
+                msg += f"   {line}\n"
+            if r["boarded_at"]:
+                msg += f"   Boarded: {str(r['boarded_at'])[:16]}\n\n"
+            else:
+                msg += "\n"
+                buttons.append([InlineKeyboardButton(
+                    f"✅ Mark boarded — {r['booking_ref']}",
+                    callback_data=f"mark_boarded_{r['id']}")])
+        await query.message.reply_text(
+            msg[:3900],
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+
     elif data.startswith("change_sched_"):
         sched_id = int(data.split("_")[-1])
         op = await get_operator(user.id)
@@ -3302,7 +3430,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 callback_data=f"swap_boat_{sched_id}_{b['boat_name']}")])
         buttons.append([InlineKeyboardButton("⏰ Change Time", callback_data=f"swap_time_{sched_id}")])
         buttons.append([InlineKeyboardButton("🗺️ Change Route", callback_data=f"swap_route_{sched_id}")])
-        buttons.append([InlineKeyboardButton("❌ Cancel Today's Departure", callback_data=f"cancel_today_{sched_id}")])
+        buttons.append([InlineKeyboardButton("❌ Cancel Tomorrow's Departure", callback_data=f"cancel_today_{sched_id}")])
         await query.message.reply_text(
             f"✏️ *Manage Tomorrow's Schedule*\n\n"
             f"⏰ {sched['departure_time']} — {sched['route_from']} → {sched['route_to']}\n"
@@ -3314,14 +3442,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sched_id = int(data.split("_")[-1])
         await set_user_state(user.id, OP_AWAIT_CHANGE_NOTE, {"change_type": "time", "change_sched_id": sched_id})
         await query.message.reply_text(
-            "⏰ *Change Today's Departure Time*\n\nEnter the new time:\n_Example: 05:00 PM_",
+            "⏰ *Change Tomorrow's Departure Time*\n\nEnter the new time:\n_Example: 05:00 PM_",
             parse_mode="Markdown")
 
     elif data.startswith("swap_route_"):
         sched_id = int(data.split("_")[-1])
         await set_user_state(user.id, OP_AWAIT_CHANGE_NOTE, {"change_type": "route", "change_sched_id": sched_id})
         await query.message.reply_text(
-            "🗺️ *Change Today's Route*\n\nEnter new stops comma-separated:\n_Example: Male, Gulhi, Maafushi_",
+            "🗺️ *Change Tomorrow's Route*\n\nEnter new stops comma-separated:\n_Example: Male, Gulhi, Maafushi_",
             parse_mode="Markdown")
 
     elif data.startswith("swap_boat_"):
@@ -3871,6 +3999,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         seats     = int(stats.get("seats_sold", 0) or 0)
         gross     = float(stats.get("gross_sales", 0) or 0)
         canc_val  = float(stats.get("cancelled_value", 0) or 0)
+        cancelled_actions = int(stats.get("cancelled_this_month", 0) or 0)
+        refunds_completed = float(stats.get("refunds_completed", 0) or 0)
+        refunds_pending   = float(stats.get("refunds_pending", 0) or 0)
+        try:
+            commission_rate = float(await get_setting("commission_rate", "0") or 0)
+        except Exception:
+            commission_rate = 0.0
+        commission = gross * commission_rate / 100
+        net_earning = max(0, gross - refunds_completed - commission)
         rating    = float(op_meta.get("average_rating", 0) or 0)
         reviews   = int(op_meta.get("total_reviews", 0) or 0)
 
@@ -3895,9 +4032,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"  ✅ Confirmed: *{confirmed}*\n"
             f"  ❌ Cancelled: *{cancelled}*\n"
             f"  ⏳ Pending: *{pending}*\n\n"
-            f"💺 Seats sold: *{seats}*\n"
-            f"💰 Gross sales: *MVR {gross:,.2f}*\n"
-            f"📉 Cancelled value: *MVR {canc_val:,.2f}*\n\n"
+            f"💺 Seats sold: *{seats}*\n\n"
+            f"💰 *Money:*\n"
+            f"  Gross confirmed sales: *MVR {gross:,.2f}*\n"
+            f"  Refunds completed: *MVR {refunds_completed:,.2f}*\n"
+            f"  Refunds pending: *MVR {refunds_pending:,.2f}*\n"
+            f"  Samuga commission ({commission_rate:g}%): *MVR {commission:,.2f}*\n"
+            f"  💵 Estimated net earning: *MVR {net_earning:,.2f}*\n\n"
+            f"📉 Cancelled trip value: *MVR {canc_val:,.2f}*\n"
+            f"🗓 Cancelled this month: *{cancelled_actions}*\n\n"
             f"⭐ Rating: *{rating:.1f}* ({reviews} reviews){route_line}\n\n"
             f"_{perf}_"
         )
@@ -4055,9 +4198,17 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await conn.execute("""
                 UPDATE bookings SET boarded_at=NOW(), boarded_by=$1 WHERE id=$2
             """, user.id, booking_id)
-        await query.edit_message_text(
+        passengers = bk.get("passengers") or "[]"
+        if isinstance(passengers, str):
+            try:
+                passengers = json.loads(passengers)
+            except Exception:
+                passengers = []
+        pax_names = ", ".join([psg.get("name", "") for psg in passengers if psg.get("name")]) or (bk.get("customer_name") or "Passenger")
+        await safe_edit(query,
             f"🛳️ *Passenger boarded!*\n\n"
             f"Ref: `{bk['booking_ref']}`\n"
+            f"Passenger: *{pax_names}*\n"
             f"Marked at: {datetime.now().strftime('%d %b %Y %H:%M')} MVT\n\n"
             f"✅ Ticket used — cannot be reused.",
             parse_mode="Markdown")
@@ -4082,8 +4233,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
         except Exception as e:
             logger.error(f"Not received notify: {e}")
-        await query.edit_message_caption(
-            caption=f"❌ Customer notified — payment not confirmed for `{bk['booking_ref']}`.",
+        await safe_edit(query,
+            f"❌ Customer notified — payment not confirmed for `{bk['booking_ref']}`.",
             parse_mode="Markdown")
 
     elif data.startswith("confirm_booking_"):
@@ -4261,8 +4412,8 @@ async def do_confirm_booking(ctx, booking_id: int, query):
                 # Already confirmed, cancelled, or doesn't exist
                 try:
                     await query.answer("⚠️ This booking is already confirmed or no longer pending.", show_alert=True)
-                    await query.edit_message_caption(
-                        caption="⚠️ Already processed — no action needed.",
+                    await safe_edit(query,
+                        "⚠️ Already processed — no action needed.",
                         parse_mode="Markdown")
                 except: pass
                 return
@@ -4278,8 +4429,8 @@ async def do_confirm_booking(ctx, booking_id: int, query):
             if not seat_update:
                 try:
                     await query.answer("❌ Not enough seats available to confirm!", show_alert=True)
-                    await query.edit_message_caption(
-                        caption=f"❌ Cannot confirm — not enough seats available for `{booking['booking_ref']}`.",
+                    await safe_edit(query,
+                        f"❌ Cannot confirm — not enough seats available for `{booking['booking_ref']}`.",
                         parse_mode="Markdown")
                 except: pass
                 return
@@ -4360,11 +4511,11 @@ async def do_confirm_booking(ctx, booking_id: int, query):
             logger.error(f"❌ Text confirmation also failed: {e2}")
     try:
         if ticket_sent:
-            await query.edit_message_caption(
-                caption=f"✅ Booking `{booking['booking_ref']}` confirmed! Ticket sent.", parse_mode="Markdown")
+            await safe_edit(query,
+                f"✅ Booking `{booking['booking_ref']}` confirmed! Ticket sent.", parse_mode="Markdown")
         else:
-            await query.edit_message_caption(
-                caption=f"✅ Booking `{booking['booking_ref']}` confirmed! ⚠️ Could not auto-send ticket — contact the customer.", parse_mode="Markdown")
+            await safe_edit(query,
+                f"✅ Booking `{booking['booking_ref']}` confirmed! ⚠️ Could not auto-send ticket — contact the customer.", parse_mode="Markdown")
     except Exception:
         pass
 
@@ -4381,11 +4532,12 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 # ── SCHEDULED JOBS ───────────────────────────────────────────────────────────
 async def job_morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
-    """6:00 AM MVT — ping all operators about today's schedules"""
-    today = datetime.now().date()
+    """20:00 MVT — ping all operators to prepare tomorrow's schedules"""
+    from datetime import timedelta as _td
+    tomorrow = datetime.now().date() + _td(days=1)
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Get all approved operators with schedules today
+        # Get all approved operators with active schedules
         operators = await conn.fetch("""
             SELECT DISTINCT o.telegram_id, o.business_name, o.id as op_id
             FROM operators o
@@ -4403,7 +4555,7 @@ async def job_morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
                 f"  ⏰ {s['departure_time']} — {s['route_from']} → {s['route_to']} | 📌 {s.get('location','Jetty No. 1, Male')}"
                 for s in scheds
             ])
-            buttons = [[InlineKeyboardButton("📅 View & Manage Today", callback_data="op_today")]]
+            buttons = [[InlineKeyboardButton("📅 View & Manage Schedule", callback_data="op_today")]]
             try:
                 from datetime import timezone, timedelta as _tdtz
                 mvt_hour = (datetime.now(timezone.utc) + _tdtz(hours=5)).hour
@@ -4415,14 +4567,14 @@ async def job_morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
                     note = "Hope the afternoon trips are going smoothly! 🚤"
                 elif 17 <= mvt_hour < 21:
                     greeting = "🌇 Good evening"
-                    note = "Here's a summary of today's schedule. 🌊"
+                    note = "Please review tomorrow's trips before the day starts. 🌊"
                 else:
                     greeting = "🌙 Good night"
-                    note = "Here's your schedule summary for tomorrow. 🌊"
+                    note = "Please review tomorrow's trips before the day starts. 🌊"
                 await ctx.bot.send_message(op["telegram_id"],
                     f"{greeting}, *{op['business_name']}!*\n\n"
-                    f"Today's schedules:\n{sched_lines}\n\n"
-                    f"⚠️ Any changes? Tap below to manage tomorrow's departures.\n\n"
+                    f"Tomorrow's schedule check — *{tomorrow}*:\n{sched_lines}\n\n"
+                    f"⚠️ Any changes? Tap below to manage departures before customers arrive.\n\n"
                     f"_{note}_",
                     parse_mode="Markdown",
                     reply_markup=InlineKeyboardMarkup(buttons))
@@ -4596,14 +4748,33 @@ async def main():
     app.add_handler(CommandHandler("status",       cmd_status))
     app.add_handler(CommandHandler("findcustomer", cmd_findcustomer))
 
-    # ── Flexible operator shortcuts ──
+    # ── Flexible operator/customer shortcuts ──
+    class FakeCallbackQuery:
+        def __init__(self, update, data):
+            self.message = update.message
+            self.from_user = update.effective_user
+            self.data = data
+        async def answer(self, *args, **kwargs):
+            return None
+        async def edit_message_text(self, text=None, parse_mode=None, reply_markup=None, **kwargs):
+            await self.message.reply_text(text or "", parse_mode=parse_mode, reply_markup=reply_markup)
+        async def edit_message_caption(self, caption=None, parse_mode=None, reply_markup=None, **kwargs):
+            await self.message.reply_text(caption or "", parse_mode=parse_mode, reply_markup=reply_markup)
+
+    class FakeCallbackUpdate:
+        def __init__(self, update, data):
+            self.callback_query = FakeCallbackQuery(update, data)
+            self.effective_user = update.effective_user
+            self.effective_chat = update.effective_chat
+            self.effective_message = update.message
+
+    async def run_callback_shortcut(update, context, data: str):
+        await handle_callback(FakeCallbackUpdate(update, data), context)
+
     async def cmd_profile(u, c):
         sd = await get_user_state(u.effective_user.id)
         if sd.get("role") == "operator":
-            # fake callback
-            class FQ: message=u.message; from_user=u.effective_user; data="op_profile"
-            class FU: callback_query=FQ(); effective_user=u.effective_user
-            await handle_callback(FU(), c)
+            await run_callback_shortcut(u, c, "op_profile")
         else:
             await cmd_start(u, c)
     async def cmd_schedules_shortcut(u, c):
@@ -4614,23 +4785,15 @@ async def main():
         else:
             await u.message.reply_text("⚠️ Operator account required.")
     async def cmd_bookings_shortcut(u, c):
-        class FQ: message=u.message; from_user=u.effective_user; data="op_bookings"
-        class FU: callback_query=FQ(); effective_user=u.effective_user
-        await handle_callback(FU(), c)
+        await run_callback_shortcut(u, c, "op_bookings")
     async def cmd_fleet_shortcut(u, c):
-        class FQ: message=u.message; from_user=u.effective_user; data="op_fleet"
-        class FU: callback_query=FQ(); effective_user=u.effective_user
-        await handle_callback(FU(), c)
+        await run_callback_shortcut(u, c, "op_fleet")
     async def cmd_today_shortcut(u, c):
-        class FQ: message=u.message; from_user=u.effective_user; data="op_today"
-        class FU: callback_query=FQ(); effective_user=u.effective_user
-        await handle_callback(FU(), c)
+        await run_callback_shortcut(u, c, "op_today")
     async def cmd_search_shortcut(u, c):
         await u.message.reply_text("🔍 Type your route to search:\n_Example: Male to Thoddoo_", parse_mode="Markdown")
     async def cmd_mybookings_shortcut(u, c):
-        class FQ: message=u.message; from_user=u.effective_user; data="cx_my_bookings"
-        class FU: callback_query=FQ(); effective_user=u.effective_user
-        await handle_callback(FU(), c)
+        await run_callback_shortcut(u, c, "cx_my_bookings")
     async def cmd_help_full(u, c):
         sd = await get_user_state(u.effective_user.id)
         role = sd.get("role","customer")
@@ -4673,6 +4836,8 @@ async def main():
         app.add_handler(CommandHandler(cmd, cmd_fleet_shortcut))
     for cmd in ["today", "todayschedule"]:
         app.add_handler(CommandHandler(cmd, cmd_today_shortcut))
+    for cmd in ["report", "monthly", "earnings"]:
+        app.add_handler(CommandHandler(cmd, lambda u, c: run_callback_shortcut(u, c, "op_monthly_report")))
     for cmd in ["search", "searchboats", "book"]:
         app.add_handler(CommandHandler(cmd, cmd_search_shortcut))
     for cmd in ["help", "commands"]:
@@ -4685,8 +4850,8 @@ async def main():
     # ── Scheduled jobs ──
     from datetime import time as dt_time
     jq = app.job_queue
-    # Morning ping: 6:00 AM MVT = 01:00 UTC
-    jq.run_daily(job_morning_ping, time=dt_time(15, 0, 0), name="morning_ping")  # 8:00 PM MVT
+    # Evening schedule-prep ping: 20:00 MVT = 15:00 UTC
+    jq.run_daily(job_morning_ping, time=dt_time(15, 0, 0), name="evening_schedule_ping")
     # Departure reminders: every 5 minutes
     jq.run_repeating(job_departure_reminders, interval=300, first=30, name="departure_reminders")
     # Subscription expiry check: daily 9AM MVT = 04:00 UTC
