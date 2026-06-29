@@ -1150,6 +1150,70 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg += f"⚠️ Status is *{bk['status']}* — ticket not yet confirmed."
         await update.message.reply_text(msg, parse_mode="Markdown")
 
+async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Verify a booking — /verify ST-XXXXXX or via QR deep-link /start verify_ST-XXXXXX"""
+    user = update.effective_user
+    args = ctx.args or []
+    ref = None
+    if args and args[0].startswith("verify_"):
+        ref = args[0].replace("verify_", "").strip().upper()
+    elif args:
+        ref = args[0].strip().upper()
+    if not ref:
+        await update.message.reply_text(
+            "🔍 *Ticket Verification*\n\nUsage: `/verify ST-260629-1234`\n\nOr scan the QR code on the ticket.",
+            parse_mode="Markdown")
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        bk = await conn.fetchrow("""
+            SELECT b.*, o.business_name, o.owner_contact,
+                   s.route_from, s.route_to, s.departure_time
+            FROM bookings b
+            JOIN operators o ON b.operator_id=o.id
+            JOIN schedules s ON b.schedule_id=s.id
+            WHERE b.booking_ref=$1
+        """, ref)
+    if not bk:
+        await update.message.reply_text(
+            f"❌ *Booking Not Found*\n\n`{ref}` does not exist.\n\nCheck the reference and try again.",
+            parse_mode="Markdown")
+        return
+    passengers = bk["passengers"] or "[]"
+    if isinstance(passengers, str):
+        try: passengers = __import__("json").loads(passengers)
+        except: passengers = []
+    status_icons = {"confirmed":"✅","pending_confirmation":"⏳","pending_payment":"💳","cancelled":"❌"}
+    icon = status_icons.get(bk["status"],"❓")
+    boarded = bk.get("boarded_at")
+    pax_list = "\n".join([f"  {i+1}. {p.get('name','')} ({p.get('id_number','')})"
+                           for i,p in enumerate(passengers)])
+    msg = (
+        f"{icon} *Ticket Verification*\n\n"
+        f"📋 Ref: `{bk['booking_ref']}`\n"
+        f"📊 Status: *{bk['status'].upper().replace('_',' ')}*\n"
+        f"🚤 {bk['business_name']}\n"
+        f"📍 {bk['route_from']} → {bk['route_to']}\n"
+        f"📅 {bk['travel_date']} @ {bk['departure_time']}\n"
+        f"👥 Passengers:\n{pax_list}\n"
+        f"💰 MVR {bk['total_amount']}\n"
+    )
+    if boarded:
+        msg += f"\n🛳️ *Already boarded at {str(boarded)[:16]}* — ticket used."
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    elif bk["status"] == "confirmed":
+        msg += "\n✅ *Valid — not yet boarded.*"
+        op = await get_operator(user.id)
+        kb = None
+        if user.id in SUPER_ADMINS or (op and op.get("id") == bk["operator_id"]):
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🛳️ Mark as Boarded", callback_data=f"mark_boarded_{bk['id']}")
+            ]])
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    else:
+        msg += f"\n⚠️ Status is *{bk['status']}* — not yet confirmed."
+        await update.message.reply_text(msg, parse_mode="Markdown")
+
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     sd = await get_user_state(user.id)
