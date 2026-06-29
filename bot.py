@@ -2302,8 +2302,14 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await set_user_state(user.id, CX_AWAIT_PASSENGER_COUNT, {**temp, "cx_name": cx_name, "cx_phone": cx_phone})
         await update.message.reply_text(
             f"✅ *{cx_name}* saved!\n\n"
+            f"If this contact is wrong, tap *Edit contact*.\n"
+            f"If it is correct, just type the number of seats and continue.\n\n"
             f"💺 How many seats would you like to book?\n_(Max 10, available: {temp.get('sel_seats',0)})_",
-            parse_mode="Markdown")
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Edit contact", callback_data="cx_edit_contact")],
+                [InlineKeyboardButton("📅 Change date / boat", callback_data="cx_edit_trip")]
+            ]))
 
     elif state == CX_AWAIT_PASSENGER_COUNT:
         count = parse_number(text)
@@ -2328,12 +2334,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await set_user_state(user.id, CX_COLLECTING_PASSENGERS,
                              {**temp, "passenger_count": count, "passengers_collected": [], "current_passenger": 1})
         await update.message.reply_text(
-            f"👥 *Enter all {count} passenger(s) at once:*\n\n"
+            f"👥 *Passenger count: {count}*\n\n"
+            f"If this number is wrong, tap *Edit passenger count*.\n"
+            f"If it is correct, just send the passenger details and continue.\n\n"
+            f"*Enter all {count} passenger(s) at once:*\n\n"
             f"_One per line — Name, ID or Passport Number_\n\n"
             f"_Example:_\n`{example_str}`\n\n"
             f"📌 ID card for Maldivians, Passport number for foreigners\n\n"
             f"Send all {count} in one message 👇",
-            parse_mode="Markdown")
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✏️ Edit passenger count", callback_data="cx_edit_pax_count")
+            ]]))
 
     elif state == CX_COLLECTING_PASSENGERS:
         sd2 = await get_user_state(user.id)
@@ -2359,8 +2371,12 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"⚠️ Need exactly *{total} passenger(s)*, one per line.\n\n"
                 f"{err_msg}\n\n"
-                f"_Example for {total} passenger(s):_\n`{example}`",
-                parse_mode="Markdown")
+                f"_Example for {total} passenger(s):_\n`{example}`\n\n"
+                f"If the passenger count was a mistake, tap *Edit passenger count*. Otherwise send the correct list again.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✏️ Edit passenger count", callback_data="cx_edit_pax_count")
+                ]]))
             return
 
         if True:  # always show summary now
@@ -2403,11 +2419,20 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"💳 *Payment Details:*\n\n"
                 f"{pay_str}"
                 f"💰 Amount: *MVR {total_amt:.2f}*\n\n"
-                f"👉 After transferring, *upload your payment screenshot here.*"
+                f"👉 If everything is correct, transfer and *upload your payment screenshot here.*\n\n"
+                f"Need to fix something? Use the edit buttons below before paying."
             )
             await set_user_state(user.id, CX_AWAIT_PAYMENT_SLIP,
                                  {**t3, "total_amount": str(total_amt), "passengers_collected": passengers})
-            await update.message.reply_text(summary, parse_mode="Markdown")
+            await update.message.reply_text(
+                summary,
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✏️ Edit contact", callback_data="cx_edit_contact"),
+                     InlineKeyboardButton("✏️ Edit passengers", callback_data="cx_edit_pax_details")],
+                    [InlineKeyboardButton("✏️ Edit passenger count", callback_data="cx_edit_pax_count")],
+                    [InlineKeyboardButton("📅 Change date / boat", callback_data="cx_edit_trip")]
+                ]))
 
     else:
         # Default — route search from text
@@ -2734,6 +2759,82 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if bk:
             ctx.args = [f"verify_{bk['booking_ref']}"]
             await cmd_verify(update, ctx)
+
+    elif data == "cx_edit_contact":
+        # Let customer correct booker name/phone without restarting.
+        if sd.get("state") not in [CX_AWAIT_PASSENGER_COUNT, CX_COLLECTING_PASSENGERS, CX_AWAIT_PAYMENT_SLIP, CX_AWAIT_CONTACT]:
+            await query.answer("This booking step is no longer active.", show_alert=True)
+            return
+        await set_user_state(user.id, CX_AWAIT_CONTACT, temp)
+        await query.message.reply_text(
+            "✏️ *Edit contact details*\n\n"
+            "Enter *Full Name* and *Phone Number* again:\n\n"
+            "_Format: Ahmed Ali, 7771234_",
+            parse_mode="Markdown")
+
+    elif data == "cx_edit_trip":
+        # Let customer change date/boat while keeping the route search.
+        if sd.get("state") not in [CX_AWAIT_CONTACT, CX_AWAIT_PASSENGER_COUNT, CX_COLLECTING_PASSENGERS, CX_AWAIT_PAYMENT_SLIP, CX_AWAIT_DATE]:
+            await query.answer("This booking step is no longer active.", show_alert=True)
+            return
+        route_from = temp.get("route_from", "")
+        route_to = temp.get("route_to", "")
+        if not route_from or not route_to:
+            await query.message.reply_text(
+                "🔍 Please type your route again, for example:\n`Male to Thoddoo`",
+                parse_mode="Markdown")
+            await set_user_state(user.id, CX_IDLE, {})
+            return
+        from datetime import timedelta
+        today = datetime.now().date()
+        dates = [today + timedelta(days=i) for i in range(4)]
+        date_buttons = [[InlineKeyboardButton(
+            f"{'Today' if i==0 else 'Tomorrow' if i==1 else d.strftime('%a %d %b')}",
+            callback_data=f"date_select_{d.strftime('%d-%m-%Y')}"
+        )] for i, d in enumerate(dates)]
+        await set_user_state(user.id, CX_AWAIT_DATE, temp)
+        await query.message.reply_text(
+            f"📅 *Change date / boat*\n\n"
+            f"Route: *{route_from} → {route_to}*\n\n"
+            f"Select a new travel date, or type manually:\n_(DD-MM-YYYY or DD/MM/YYYY)_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(date_buttons))
+
+    elif data == "cx_edit_pax_details":
+        # Let customer resend passenger names/IDs without changing count.
+        if sd.get("state") not in [CX_COLLECTING_PASSENGERS, CX_AWAIT_PAYMENT_SLIP]:
+            await query.answer("This booking step is no longer active.", show_alert=True)
+            return
+        total = int(temp.get("passenger_count", 1) or 1)
+        cx_name = temp.get("cx_name", "You")
+        example_lines = [f"1. {cx_name}, (your ID/passport number)"]
+        for i in range(1, total):
+            example_lines.append(f"{i+1}. Full Name, ID/Passport Number")
+        example_str = "\n".join(example_lines)
+        await set_user_state(user.id, CX_COLLECTING_PASSENGERS, {**temp, "passengers_collected": []})
+        await query.message.reply_text(
+            f"✏️ *Edit passenger details*\n\n"
+            f"Passenger count: *{total}*\n\n"
+            f"Send all {total} passenger(s) again, one per line:\n\n"
+            f"_Example:_\n`{example_str}`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✏️ Edit passenger count", callback_data="cx_edit_pax_count")
+            ]]))
+
+    elif data == "cx_edit_pax_count":
+        # Customer may have typed the wrong number of seats/passengers.
+        # Let them correct it without restarting the whole booking flow.
+        if sd.get("state") not in [CX_COLLECTING_PASSENGERS, CX_AWAIT_PASSENGER_COUNT]:
+            await query.answer("This step is no longer active.", show_alert=True)
+            return
+        await set_user_state(user.id, CX_AWAIT_PASSENGER_COUNT, {**temp, "passengers_collected": []})
+        await query.message.reply_text(
+            f"✏️ *Edit passenger count*\n\n"
+            f"How many seats/passengers do you want to book?\n"
+            f"_Max 10, available: {temp.get('sel_seats', 0)}_\n\n"
+            f"Example: `1`",
+            parse_mode="Markdown")
 
     elif data.startswith("cx_cancel_booking_"):
         bk_id = int(data.split("_")[-1])
@@ -3126,8 +3227,13 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ *{sel['business_name']}* selected!\n\n"
             f"📍 {temp.get('route_from')} → {temp.get('route_to')}\n"
             f"⏰ {sel['departure_time']} | 💺 {sel['available_seats']} seats\n\n"
+            f"If this trip/boat is wrong, tap *Change date / boat*.\n"
+            f"If it is correct, enter your contact details and continue.\n\n"
             f"👤 *Your contact details:*\nEnter *Full Name* and *Phone Number*:\n\n_Format: Ahmed Ali, 7771234_",
-            parse_mode="Markdown")
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📅 Change date / boat", callback_data="cx_edit_trip")
+            ]]))
 
     elif data.startswith("type_"):
         boat_type = data.split("_")[1]
