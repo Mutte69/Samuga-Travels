@@ -2419,6 +2419,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"💳 *Payment Details:*\n\n"
                 f"{pay_str}"
                 f"💰 Amount: *MVR {total_amt:.2f}*\n\n"
+                f"⚠️ *Important:* Double-check the *account number* and *account name* before transferring. If money is sent to the wrong bank/account, Samuga Travels and the operator cannot reverse it — you must contact your bank.\n\n"
                 f"👉 If everything is correct, transfer and *upload your payment screenshot here.*\n\n"
                 f"Need to fix something? Use the edit buttons below before paying."
             )
@@ -4336,8 +4337,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await query.answer("Booking not found.", show_alert=True)
             return
 
-        # Contact button: prefer operator username, fallback to Telegram user ID deep-link.
-        # This keeps the message clean and lets the customer contact the operator directly.
+        # Customer contact button: prefer operator username, fallback to Telegram user ID deep-link.
+        # This lets the customer and operator talk directly, then operator can confirm or reject from the same admin message.
         contact_buttons = []
         op_username = (bk.get("operator_username") or "").strip()
         if op_username:
@@ -4364,8 +4365,38 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(contact_buttons) if contact_buttons else None)
         except Exception as e:
             logger.error(f"Not received notify: {e}")
+
+        customer_contact = bk.get("customer_name") or "Customer"
+        operator_buttons = [
+            [InlineKeyboardButton("📩 Contact Customer", url=f"tg://user?id={bk['customer_telegram_id']}")],
+            [InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{booking_id}")],
+            [InlineKeyboardButton("❌ Keep Not Confirmed", callback_data=f"reject_booking_{booking_id}")],
+        ]
         await safe_edit(query,
-            f"❌ Customer notified — payment not confirmed for `{bk['booking_ref']}`.",
+            f"❌ *Payment Not Confirmed*\n\n"
+            f"Customer has been notified for booking `{bk['booking_ref']}`.\n\n"
+            f"📩 We forwarded your contact button to the customer.\n"
+            f"👤 *Customer contact:* {customer_contact}\n\n"
+            f"After you talk and solve the issue, you can confirm the booking below. "
+            f"If the payment is still wrong, keep it not confirmed.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(operator_buttons))
+
+    elif data.startswith("reject_booking_"):
+        booking_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            bk = await conn.fetchrow("SELECT booking_ref, status FROM bookings WHERE id=$1", booking_id)
+        if not bk:
+            await query.answer("Booking not found.", show_alert=True)
+            return
+        if bk["status"] == "confirmed":
+            await query.answer("Already confirmed — cannot reject here.", show_alert=True)
+            return
+        await safe_edit(query,
+            f"❌ *Payment Still Not Confirmed*\n\n"
+            f"Booking `{bk['booking_ref']}` is left pending/not confirmed.\n\n"
+            f"Customer can resend a clearer slip or contact the operator again.",
             parse_mode="Markdown")
 
     elif data.startswith("confirm_booking_"):
