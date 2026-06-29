@@ -150,33 +150,39 @@ def parse_date_flexible(text: str):
 def parse_bulk_departures(text: str):
     """
     Parse multiple departure lines like:
-      10:15 Male to Thoddoo
-      06:45 Thoddoo to Male
-      10:15AM Male to Airport to Thoddoo
-    Returns list of {"time": "10:15", "from": "Male", "to": "Thoddoo"}
+      10:15 Male to Airport to Thoddoo
+      06:45 Thoddoo to Airport to Male
+    Returns list of {
+      "time": "10:15",
+      "from": "Male",
+      "to": "Thoddoo",
+      "stops": ["Male", "Airport", "Thoddoo"],
+      "full_route": "Male → Airport → Thoddoo"
+    }
     or None if nothing parseable found.
     """
     import re
     results = []
     lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
-    time_pat = re.compile(r'^(\d{1,2}[:.:]\d{2}\s*(?:AM|PM)?)', re.IGNORECASE)
-    to_pat   = re.compile(r'\bto\b', re.IGNORECASE)
+    time_pat = re.compile(r"^(\d{1,2}[:.]\d{2}\s*(?:AM|PM)?)", re.IGNORECASE)
+    to_pat   = re.compile(r"\bto\b", re.IGNORECASE)
 
     for line in lines:
-        # Strip leading numbers like "1." or "1)"
-        line = re.sub(r'^\d+[.)\-\s]+', '', line).strip()
+        line = re.sub(r"^\d+[.)\-\s]+", "", line).strip()
         m = time_pat.match(line)
         if not m:
             continue
-        time_str = m.group(1).strip().replace(".", ":").replace(" ", "")
+        time_str = m.group(1).strip().upper().replace(".", ":")
         rest = line[m.end():].strip()
-        # Split by "to" — first part = from, last part = to (ignoring middle stops for display)
-        parts = to_pat.split(rest)
+        parts = [p.strip().title() for p in to_pat.split(rest) if p.strip()]
         if len(parts) >= 2:
-            frm = parts[0].strip().title()
-            to  = parts[-1].strip().title()
-            if frm and to:
-                results.append({"time": time_str, "from": frm, "to": to})
+            results.append({
+                "time": time_str,
+                "from": parts[0],
+                "to":   parts[-1],
+                "stops": parts,
+                "full_route": " → ".join(parts)
+            })
     return results if results else None
 
 # ── DB POOL ───────────────────────────────────────────────────────────────────
@@ -1110,17 +1116,31 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── BULK SCHEDULE SETUP FLOW ─────────────────────────────────────────────────
     elif state == OP_BULK_LOCATION:
-        stops = [s.strip().title() for s in text.split(",") if s.strip()]
-        if len(stops) < 2:
+        import re as _re2
+        # Accept "Male to Airport to Thoddoo" format — one or multiple routes per line
+        lines_raw = [l.strip() for l in text.strip().split("\n") if l.strip()]
+        # Parse each line as a route with stops separated by "to"
+        all_route_lines = []
+        for line in lines_raw:
+            stops_in_line = [s.strip().title() for s in _re2.split(r"\bto\b", line, flags=_re2.IGNORECASE) if s.strip()]
+            if len(stops_in_line) >= 2:
+                all_route_lines.append(stops_in_line)
+        if not all_route_lines:
             await update.message.reply_text(
-                "⚠️ Enter at least 2 stops e.g. `Male, Airport, Thoddoo`",
+                "⚠️ Couldn\'t read routes. Try:\n\n"
+                "`Male to Airport to Thoddoo`\n"
+                "`Thoddoo to Airport to Male`",
                 parse_mode="Markdown")
             return
-        route_display = " → ".join(stops)
+        # Use all unique stops from first route as the stop list
+        all_stops = all_route_lines[0]
+        route_display = "\n".join([" → ".join(r) for r in all_route_lines])
         await set_user_state(user.id, OP_BULK_SATHU_DEPS,
-                             {**temp, "bulk_stops": stops, "bulk_route": route_display})
+                             {**temp, "bulk_stops": all_stops,
+                              "bulk_routes": all_route_lines,
+                              "bulk_route": route_display})
         await update.message.reply_text(
-            f"✅ Route: *{route_display}*\n\n"
+            f"✅ Routes saved!\n📍 {route_display}\n\n"
             f"*Step 2:* What is your *departure location/jetty*?\n\n"
             f"_Example: Jetty No. 1, Male_",
             parse_mode="Markdown")
@@ -1134,18 +1154,23 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                                  {**temp, "bulk_location": location})
             stops = temp.get("bulk_stops", [])
             route_display = temp.get("bulk_route", "")
-            example = (
-                f"10:15 {stops[0]} to {stops[-1]}\n"
-                f"16:00 {stops[0]} to {stops[-1]}\n"
-                f"06:45 {stops[-1]} to {stops[0]}\n"
-                f"13:00 {stops[-1]} to {stops[0]}"
-            )
+            stops = temp.get("bulk_stops", [])
+            bulk_routes = temp.get("bulk_routes", [[stops[0], stops[-1]], [stops[-1], stops[0]]])
+            # Build example using full route strings
+            def route_str(r): return " to ".join(r)
+            example_lines = []
+            example_lines.append(f"10:15 {route_str(bulk_routes[0])}")
+            example_lines.append(f"16:00 {route_str(bulk_routes[0])}")
+            if len(bulk_routes) > 1:
+                example_lines.append(f"06:45 {route_str(bulk_routes[1])}")
+                example_lines.append(f"13:00 {route_str(bulk_routes[1])}")
+            example = "\n".join(example_lines)
             await update.message.reply_text(
                 f"✅ Location: *{location}*\n\n"
                 f"*Step 3:* Enter your *Saturday–Thursday departures*\n"
-                f"_(one per line: TIME FROM to TO)_\n\n"
+                f"_One per line: TIME then full route_\n\n"
                 f"_Example:_\n`{example}`\n\n"
-                f"_Use 24hr or 12hr time. Direction matters!_",
+                f"_24hr or 12hr time both work!_",
                 parse_mode="Markdown")
             return
         # This is the Sat-Thu departures
@@ -1227,30 +1252,32 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS run_days TEXT DEFAULT 'daily'")
             await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS boat_name TEXT")
             for dep in sathu_deps:
+                dep_stops = dep.get("stops", [dep["from"], dep["to"]])
                 await conn.execute("""
                     INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
                                            price_per_seat, total_seats, available_seats,
                                            sched_stops, location, run_days)
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'sat-thu')
                 """, op["id"], dep["from"], dep["to"], dep["time"],
-                    price, seats, seats, _j.dumps(stops), location)
+                    price, seats, seats, _j.dumps(dep_stops), location)
                 created += 1
             for dep in fri_deps:
+                dep_stops = dep.get("stops", [dep["from"], dep["to"]])
                 await conn.execute("""
                     INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
                                            price_per_seat, total_seats, available_seats,
                                            sched_stops, location, run_days)
                     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'fri')
                 """, op["id"], dep["from"], dep["to"], dep["time"],
-                    price, seats, seats, _j.dumps(stops), location)
+                    price, seats, seats, _j.dumps(dep_stops), location)
                 created += 1
 
         await set_user_state(user.id, OP_IDLE, {})
 
-        # Build summary
+        # Build summary with full route per line
         route_display = temp.get("bulk_route","")
-        sathu_lines = "\n".join([f"  ⏰ {d['time']} — {d['from']} → {d['to']}" for d in sathu_deps])
-        fri_lines   = "\n".join([f"  ⏰ {d['time']} — {d['from']} → {d['to']}" for d in fri_deps]) if fri_deps else "  _No Friday service_"
+        sathu_lines = "\n".join([f"  ⏰ {d['time']} — {d.get('full_route', d['from']+' → '+d['to'])}" for d in sathu_deps])
+        fri_lines   = "\n".join([f"  ⏰ {d['time']} — {d.get('full_route', d['from']+' → '+d['to'])}" for d in fri_deps]) if fri_deps else "  _No Friday service_"
 
         await update.message.reply_text(
             f"🎉 *{created} Schedules Created!*\n\n"
