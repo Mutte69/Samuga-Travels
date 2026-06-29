@@ -2949,7 +2949,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"• Type `/today` to view today\'s schedule\n"
             f"• Type `/help` for all commands\n\n"
             f"_Commands are flexible — just type naturally!_",
-            parse_mode="Markdown", reply_markup=main_kb("operator"))
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 Bulk Schedule Setup", callback_data="op_bulk_setup"),
+                 InlineKeyboardButton("➕ Add Single Schedule", callback_data="op_single_schedule")],
+                [InlineKeyboardButton("🚤 My Fleet",            callback_data="op_fleet"),
+                 InlineKeyboardButton("📦 Pending Bookings",    callback_data="op_bookings")],
+                [InlineKeyboardButton("📅 Today & Tomorrow",    callback_data="op_today"),
+                 InlineKeyboardButton("✏️ Edit Info",           callback_data="op_edit")],
+            ]))
 
     elif data == "op_bookings":
         op = await get_operator(user.id)
