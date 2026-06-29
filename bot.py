@@ -35,6 +35,18 @@ CLOUDINARY_CLOUD = os.environ.get("CLOUDINARY_CLOUD", "dfhj3clbh")
 CLOUDINARY_KEY   = os.environ.get("CLOUDINARY_KEY",   "")
 CLOUDINARY_SECRET= os.environ.get("CLOUDINARY_SECRET","")
 
+# Configure Cloudinary immediately so uploads don't silently fail
+if CLOUDINARY_KEY and CLOUDINARY_SECRET:
+    cloudinary.config(
+        cloud_name=CLOUDINARY_CLOUD,
+        api_key=CLOUDINARY_KEY,
+        api_secret=CLOUDINARY_SECRET,
+        secure=True
+    )
+else:
+    import warnings
+    warnings.warn("⚠️ CLOUDINARY_KEY / CLOUDINARY_SECRET not set — image uploads will fail!")
+
 # SamugaAI — Gemini free tier for customer/operator chat
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
 
@@ -2565,15 +2577,16 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             contact_line = ""
             kb_btns = []
             if op_contact_fb:
-                contact_line = (f"\n\n\ud83d\udcde *Contact the operator directly:*\n"
-                                f"\ud83d\udea4 {op_name_fb}\n\ud83d\udcf1 {op_contact_fb}")
+                contact_line = (
+                    f"\n\n📞 *Contact the operator directly:*\n"
+                    f"🚤 {op_name_fb}\n📱 {op_contact_fb}")
                 tgh = op_contact_fb.replace('+','').replace(' ','')
-                kb_btns.append([InlineKeyboardButton("\ud83d\udcde Contact Operator", url=f"https://t.me/{tgh}")])
-            kb_btns.append([InlineKeyboardButton("\ud83d\udce9 Contact Samuga Travels", url="https://t.me/SamugaTravels")])
+                kb_btns.append([InlineKeyboardButton("📞 Contact Operator", url=f"https://t.me/{tgh}")])
+            kb_btns.append([InlineKeyboardButton("📩 Contact Samuga Travels", url="https://t.me/SamugaTravels")])
             await update.message.reply_text(
-                f"\u26a0\ufe0f *Booking Save Issue*\n\n"
-                f"Your payment went through but we had trouble saving the booking automatically.{contact_line}\n\n"
-                f"Please send your payment slip directly to the operator and they will confirm manually. \ud83d\ude4f",
+                f"⚠️ *Booking Save Issue*\n\n"
+                f"Your payment went through but we had trouble saving automatically.{contact_line}\n\n"
+                f"Please send your slip directly to the operator and they will confirm manually. 🙏",
                 parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup(kb_btns))
             return
@@ -4368,18 +4381,18 @@ async def do_confirm_booking(ctx, booking_id: int, query):
         await ctx.bot.send_document(
             booking["customer_telegram_id"], document=pdf_file,
             caption=(
-                f"\u2705 *Booking Confirmed!*\n\n"
-                f"\ud83c\udfab Your ticket is attached.\n"
-                f"\ud83d\udd16 Ref: `{booking['booking_ref']}`\n"
-                f"\ud83d\udea4 {booking['business_name']}\n"
-                f"\ud83d\udccd {booking['route_from']} \u2192 {booking['route_to']}\n"
-                f"\ud83d\udcc5 {booking['travel_date']} @ {booking['departure_time']}\n\n"
-                f"Present this ticket when boarding. Safe travels! \ud83c\udf0a"
+                f"✅ *Booking Confirmed!*\n\n"
+                f"🎫 Your ticket is attached.\n"
+                f"🔖 Ref: `{booking['booking_ref']}`\n"
+                f"🚤 {booking['business_name']}\n"
+                f"📍 {booking['route_from']} → {booking['route_to']}\n"
+                f"📅 {booking['travel_date']} @ {booking['departure_time']}\n\n"
+                f"Present this ticket when boarding. Safe travels! 🌊"
             ),
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("\ud83d\udea2 Book Your Next Trip", callback_data="cx_search")],
-                [InlineKeyboardButton("\ud83d\udccb My Bookings", callback_data="cx_my_bookings")]
+                [InlineKeyboardButton("🚢 Book Your Next Trip", callback_data="cx_search")],
+                [InlineKeyboardButton("📋 My Bookings", callback_data="cx_my_bookings")]
             ]))
         ticket_sent = True
     except Exception as e:
@@ -4387,25 +4400,25 @@ async def do_confirm_booking(ctx, booking_id: int, query):
         try:
             await ctx.bot.send_message(
                 booking["customer_telegram_id"],
-                f"\u2705 *Booking Confirmed!*\n\n"
-                f"\ud83d\udd16 Ref: `{booking['booking_ref']}`\n"
-                f"\ud83d\udea4 {booking['business_name']}\n"
-                f"\ud83d\udccd {booking['route_from']} \u2192 {booking['route_to']}\n"
-                f"\ud83d\udcc5 {booking['travel_date']} @ {booking['departure_time']}\n"
-                f"\ud83d\udc65 {booking['passenger_count']} passengers | \ud83d\udcb0 MVR {booking['total_amount']}\n\n"
-                f"\ud83d\udcde Operator: {op_dict.get('owner_contact','')}\n\n"
-                f"Show this confirmation when boarding. Safe travels! \ud83c\udf0a",
+                f"✅ *Booking Confirmed!*\n\n"
+                f"🔖 Ref: `{booking['booking_ref']}`\n"
+                f"🚤 {booking['business_name']}\n"
+                f"📍 {booking['route_from']} → {booking['route_to']}\n"
+                f"📅 {booking['travel_date']} @ {booking['departure_time']}\n"
+                f"👥 {booking['passenger_count']} passengers | 💰 MVR {booking['total_amount']}\n\n"
+                f"📞 Operator: {op_dict.get('owner_contact','')}\n\n"
+                f"Show this confirmation when boarding. Safe travels! 🌊",
                 parse_mode="Markdown")
             ticket_sent = True
         except Exception as e2:
-            logger.error(f"\u274c Text confirmation also failed: {e2}")
+            logger.error(f"❌ Text confirmation also failed: {e2}")
     try:
         if ticket_sent:
             await query.edit_message_caption(
-                caption=f"\u2705 Booking `{booking['booking_ref']}` confirmed! Ticket sent.", parse_mode="Markdown")
+                caption=f"✅ Booking `{booking['booking_ref']}` confirmed! Ticket sent.", parse_mode="Markdown")
         else:
             await query.edit_message_caption(
-                caption=f"\u2705 Booking `{booking['booking_ref']}` confirmed! \u26a0\ufe0f Couldn't auto-send ticket \u2014 contact the customer.", parse_mode="Markdown")
+                caption=f"✅ Booking `{booking['booking_ref']}` confirmed! ⚠️ Could not auto-send ticket — contact the customer.", parse_mode="Markdown")
     except Exception:
         pass
 
