@@ -2205,7 +2205,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT s.*, s.sched_stops, o.id as operator_id, o.business_name, o.boat_name, o.logo_url,
-                       o.is_recommended, o.average_rating, o.total_reviews,
+                       o.is_recommended, o.average_rating, o.total_reviews, o.owner_contact,
                        o.review_text, o.bml_account, o.payment_accounts, o.telegram_id as op_telegram_id
                 FROM schedules s
                 JOIN operators o ON s.operator_id = o.id
@@ -2387,7 +2387,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             t3  = sd3.get("temp_data", {}) or {}
             t3["passengers_collected"] = passengers
             total_amt = float(t3.get("sel_price", 0)) * total
-            pax_lines = "\n".join([f"  {i+1}. {p['name']} ({p['id_number']})" for i,p in enumerate(passengers)])
+            pax_lines = "\n".join([f"  {i+1}. {p.get('name','N/A')} ({p.get('id_number','N/A')})" for i,p in enumerate(passengers)])
             import json as _json
             pay_str = ""
             try:
@@ -2509,13 +2509,17 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif state == CX_AWAIT_PAYMENT_SLIP:
         await update.message.reply_text("⏳ Processing your payment slip...")
+        sd2 = await get_user_state(user.id)
+        t2  = sd2.get("temp_data", {}) or {}
+        op_contact_fb = t2.get("sel_op_contact","") or ""
+        op_name_fb    = t2.get("sel_business","") or "the operator"
+        booking_id = None
+        ref = None
+
+        # STEP 1: Save booking (critical)
         try:
             ref = gen_ref()
             url = await upload_image(file_bytes, "private/payment_slips", f"slip_{ref}")
-            sd2 = await get_user_state(user.id)
-            t2  = sd2.get("temp_data", {}) or {}
-
-            # Safe type casting
             from datetime import date as _date
             travel_date_raw = t2.get("travel_date","")
             try:
@@ -2525,16 +2529,13 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     travel_date_val = _date.today()
             except Exception:
                 travel_date_val = _date.today()
-
             operator_id  = int(t2.get("sel_operator_id") or 0) or None
             schedule_id  = int(t2.get("sel_schedule_id") or 0) or None
             pax_count    = int(t2.get("passenger_count") or 1)
             total_amount = float(t2.get("total_amount") or 0)
             customer_name = f"{t2.get('cx_name','')} | {t2.get('cx_phone','')}"
             passengers_json = json.dumps(t2.get("passengers_collected",[]))
-
             logger.info(f"Booking insert: ref={ref} op={operator_id} sched={schedule_id} date={travel_date_val} pax={pax_count} amt={total_amount}")
-
             pool = await get_pool()
             async with pool.acquire() as conn:
                 row = await conn.fetchrow("""
@@ -2546,32 +2547,59 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 """, ref, user.id, customer_name, operator_id, schedule_id,
                     travel_date_val, pax_count, passengers_json, total_amount, url)
             booking_id = row["id"]
-            logger.info(f"✅ Booking {ref} saved with id={booking_id}")
-
-            await set_user_state(user.id, CX_BOOKING_COMPLETE, {"booking_ref": ref, "booking_id": booking_id})
+            logger.info(f"\u2705 Booking {ref} saved with id={booking_id}")
+        except Exception as e:
+            logger.error(f"\u274c Payment slip booking save error: {e}", exc_info=True)
+            try:
+                op_id_fb = int(t2.get("sel_operator_id") or 0) or None
+                if op_id_fb:
+                    pool2 = await get_pool()
+                    async with pool2.acquire() as conn2:
+                        opr = await conn2.fetchrow(
+                            "SELECT business_name, owner_contact FROM operators WHERE id=$1", op_id_fb)
+                    if opr:
+                        op_name_fb = opr["business_name"]
+                        op_contact_fb = opr["owner_contact"]
+            except Exception:
+                pass
+            contact_line = ""
+            kb_btns = []
+            if op_contact_fb:
+                contact_line = (f"\n\n\ud83d\udcde *Contact the operator directly:*\n"
+                                f"\ud83d\udea4 {op_name_fb}\n\ud83d\udcf1 {op_contact_fb}")
+                tgh = op_contact_fb.replace('+','').replace(' ','')
+                kb_btns.append([InlineKeyboardButton("\ud83d\udcde Contact Operator", url=f"https://t.me/{tgh}")])
+            kb_btns.append([InlineKeyboardButton("\ud83d\udce9 Contact Samuga Travels", url="https://t.me/SamugaTravels")])
             await update.message.reply_text(
-                f"✅ *Payment slip received!*\n\n"
-                f"📋 Booking Ref: `{ref}`\n\n"
-                f"Your booking is being reviewed by the operator. "
-                f"You will receive your confirmed ticket within *5-10 minutes*. "
-                f"Please do not resend your slip - we have received it!",
-                parse_mode="Markdown")
+                f"\u26a0\ufe0f *Booking Save Issue*\n\n"
+                f"Your payment went through but we had trouble saving the booking automatically.{contact_line}\n\n"
+                f"Please send your payment slip directly to the operator and they will confirm manually. \ud83d\ude4f",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(kb_btns))
+            return
 
+        # STEP 2: Confirm to customer
+        await set_user_state(user.id, CX_BOOKING_COMPLETE, {"booking_ref": ref, "booking_id": booking_id})
+        await update.message.reply_text(
+            f"\u2705 *Payment slip received!*\n\n"
+            f"\ud83d\udccb Booking Ref: `{ref}`\n\n"
+            f"Your booking is being reviewed by the operator. "
+            f"You will receive your confirmed ticket within *5-10 minutes*. "
+            f"Please do not resend your slip - we have received it!",
+            parse_mode="Markdown")
+
+        # STEP 3: Notify operator (best-effort)
+        try:
             sel = {
-                "operator_id": operator_id,
-                "id": schedule_id,
+                "operator_id": int(t2.get("sel_operator_id") or 0) or None,
+                "id": int(t2.get("sel_schedule_id") or 0) or None,
                 "departure_time": t2.get("sel_time",""),
                 "op_telegram_id": t2.get("sel_op_tg", 0),
             }
             await notify_operator_payment(ctx, booking_id, sel, t2, ref, user, photo.file_id)
-
         except Exception as e:
-            logger.error(f"❌ Payment slip error: {e}", exc_info=True)
-            await update.message.reply_text(
-                "⚠️ Sorry, something went wrong saving your booking.\n\n"
-                "Don\'t worry — please send your payment slip directly to the operator "
-                "and they will confirm manually. We apologise for the inconvenience! 🙏",
-                parse_mode="Markdown")
+            logger.error(f"\u274c Operator notify error (booking still saved): {e}", exc_info=True)
+
 
 
     elif state == OP_AWAIT_SUB_SLIP:
@@ -2984,7 +3012,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
                 SELECT s.*, s.sched_stops, o.id as operator_id, o.business_name, o.boat_name, o.logo_url,
-                       o.is_recommended, o.average_rating, o.total_reviews,
+                       o.is_recommended, o.average_rating, o.total_reviews, o.owner_contact,
                        o.review_text, o.bml_account, o.payment_accounts, o.telegram_id as op_telegram_id
                 FROM schedules s
                 JOIN operators o ON s.operator_id = o.id
@@ -3098,6 +3126,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "sel_bml": sel.get("bml_account", ""),
             "sel_payment_accounts": sel.get("payment_accounts", "[]"),
             "sel_op_tg": sel.get("op_telegram_id", 0),
+            "sel_op_contact": sel.get("owner_contact", ""),
             "route_from": temp.get("route_from", ""),
             "route_to": temp.get("route_to", ""),
             "travel_date": temp.get("travel_date", ""),
@@ -4230,7 +4259,7 @@ async def notify_operator_payment(ctx, booking_id, sel, temp, ref, customer, sli
         op_tg_id = row["telegram_id"]
 
     pax = temp.get("passengers_collected",[])
-    pax_lines = "\n".join([f"  {i+1}. {p['name']} ({p['id_number']})" for i,p in enumerate(pax)])
+    pax_lines = "\n".join([f"  {i+1}. {p.get('name','N/A')} ({p.get('id_number','N/A')})" for i,p in enumerate(pax)]) or "  (details on file)"
     dep_time = sel.get("departure_time") or temp.get("sel_time","")
     msg = (
         f"💳 *New Payment Received!*\n\n"
@@ -4330,28 +4359,56 @@ async def do_confirm_booking(ctx, booking_id: int, query):
         "location": sched_full["location"] if sched_full and "location" in sched_full.keys() else "Jetty No. 1, Male",
     }
 
-    pdf_bytes = await generate_ticket_pdf(booking_dict, op_dict, sched_dict)
-    pdf_file  = io.BytesIO(pdf_bytes)
-    pdf_file.name = f"ticket_{booking['booking_ref']}.pdf"
+    # Generate + send ticket (booking already confirmed — best-effort)
+    ticket_sent = False
+    try:
+        pdf_bytes = await generate_ticket_pdf(booking_dict, op_dict, sched_dict)
+        pdf_file  = io.BytesIO(pdf_bytes)
+        pdf_file.name = f"ticket_{booking['booking_ref']}.pdf"
+        await ctx.bot.send_document(
+            booking["customer_telegram_id"], document=pdf_file,
+            caption=(
+                f"\u2705 *Booking Confirmed!*\n\n"
+                f"\ud83c\udfab Your ticket is attached.\n"
+                f"\ud83d\udd16 Ref: `{booking['booking_ref']}`\n"
+                f"\ud83d\udea4 {booking['business_name']}\n"
+                f"\ud83d\udccd {booking['route_from']} \u2192 {booking['route_to']}\n"
+                f"\ud83d\udcc5 {booking['travel_date']} @ {booking['departure_time']}\n\n"
+                f"Present this ticket when boarding. Safe travels! \ud83c\udf0a"
+            ),
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("\ud83d\udea2 Book Your Next Trip", callback_data="cx_search")],
+                [InlineKeyboardButton("\ud83d\udccb My Bookings", callback_data="cx_my_bookings")]
+            ]))
+        ticket_sent = True
+    except Exception as e:
+        logger.error(f"\u274c Ticket PDF/send error for {booking['booking_ref']}: {e}", exc_info=True)
+        try:
+            await ctx.bot.send_message(
+                booking["customer_telegram_id"],
+                f"\u2705 *Booking Confirmed!*\n\n"
+                f"\ud83d\udd16 Ref: `{booking['booking_ref']}`\n"
+                f"\ud83d\udea4 {booking['business_name']}\n"
+                f"\ud83d\udccd {booking['route_from']} \u2192 {booking['route_to']}\n"
+                f"\ud83d\udcc5 {booking['travel_date']} @ {booking['departure_time']}\n"
+                f"\ud83d\udc65 {booking['passenger_count']} passengers | \ud83d\udcb0 MVR {booking['total_amount']}\n\n"
+                f"\ud83d\udcde Operator: {op_dict.get('owner_contact','')}\n\n"
+                f"Show this confirmation when boarding. Safe travels! \ud83c\udf0a",
+                parse_mode="Markdown")
+            ticket_sent = True
+        except Exception as e2:
+            logger.error(f"\u274c Text confirmation also failed: {e2}")
+    try:
+        if ticket_sent:
+            await query.edit_message_caption(
+                caption=f"\u2705 Booking `{booking['booking_ref']}` confirmed! Ticket sent.", parse_mode="Markdown")
+        else:
+            await query.edit_message_caption(
+                caption=f"\u2705 Booking `{booking['booking_ref']}` confirmed! \u26a0\ufe0f Couldn't auto-send ticket \u2014 contact the customer.", parse_mode="Markdown")
+    except Exception:
+        pass
 
-    await ctx.bot.send_document(
-        booking["customer_telegram_id"], document=pdf_file,
-        caption=(
-            f"✅ *Booking Confirmed!*\n\n"
-            f"🎫 Your ticket is attached.\n"
-            f"🔖 Ref: `{booking['booking_ref']}`\n"
-            f"🚤 {booking['business_name']}\n"
-            f"📍 {booking['route_from']} → {booking['route_to']}\n"
-            f"📅 {booking['travel_date']} @ {booking['departure_time']}\n\n"
-            f"Present this ticket when boarding. Safe travels! 🌊"
-        ),
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚢 Book Your Next Trip", callback_data="cx_search")],
-            [InlineKeyboardButton("📋 My Bookings", callback_data="cx_my_bookings")]
-        ]))
-    await query.edit_message_caption(
-        caption=f"✅ Booking `{booking['booking_ref']}` confirmed! Ticket sent.", parse_mode="Markdown")
 
 # ── ERROR HANDLER ─────────────────────────────────────────────────────────────
 async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
