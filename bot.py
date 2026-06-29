@@ -331,82 +331,203 @@ async def upload_image(file_bytes: bytes, folder: str, filename: str) -> str:
     return result["secure_url"]
 
 # ── PDF TICKET ────────────────────────────────────────────────────────────────
+SAMUGA_LOGO_URL = "https://res.cloudinary.com/dfhj3clbh/image/upload/samuga_travels/logos/logo_{user_id}"
+
 def generate_ticket_pdf(booking: dict, operator: dict, schedule: dict) -> bytes:
+    from reportlab.platypus import HRFlowable, KeepTogether
+    from reportlab.lib.colors import HexColor
+    from reportlab.pdfgen import canvas as rl_canvas
+
     buf = io.BytesIO()
+
+    # Color palette — Samuga Travels ocean theme
+    ST_NAVY   = HexColor('#0D2137')   # deep navy
+    ST_BLUE   = HexColor('#1B6CA8')   # samuga blue
+    ST_LIGHT  = HexColor('#E8F4FD')   # very light blue bg
+    ST_ACCENT = HexColor('#00B4D8')   # bright accent
+    ST_WHITE  = HexColor('#FFFFFF')
+    ST_GRAY   = HexColor('#F5F8FA')
+    ST_TEXT   = HexColor('#1A2733')
+    ST_MUTED  = HexColor('#6B8A9E')
+
     doc = SimpleDocTemplate(buf, pagesize=A4,
-                            rightMargin=20*mm, leftMargin=20*mm,
-                            topMargin=20*mm, bottomMargin=20*mm)
+                            rightMargin=15*mm, leftMargin=15*mm,
+                            topMargin=15*mm, bottomMargin=15*mm)
     styles = getSampleStyleSheet()
     story = []
 
-    title_s = ParagraphStyle('t', parent=styles['Title'], fontSize=20,
-                              textColor=colors.HexColor('#1a3a5c'), alignment=TA_CENTER, spaceAfter=4)
-    sub_s   = ParagraphStyle('s', parent=styles['Normal'], fontSize=9,
-                              textColor=colors.HexColor('#666'), alignment=TA_CENTER, spaceAfter=6)
+    # ── HEADER BAND ──────────────────────────────────────────────────────────
+    # Samuga logo top-left + operator logo top-right in a side-by-side table
+    header_left_content = []
+    try:
+        st_logo_resp = requests.get(
+            "https://res.cloudinary.com/dfhj3clbh/image/upload/samuga_travels/logos/logo_{}.png".format(
+                operator.get("telegram_id", "default")), timeout=4)
+        # Use operator logo as main, we'll add ST watermark text
+        op_img = RLImage(io.BytesIO(st_logo_resp.content), width=22*mm, height=22*mm)
+    except:
+        op_img = None
 
+    # Try operator logo
+    op_logo_img = None
     if operator.get("logo_url"):
         try:
             resp = requests.get(operator["logo_url"], timeout=5)
-            img = RLImage(io.BytesIO(resp.content), width=45*mm, height=45*mm)
-            img.hAlign = 'CENTER'
-            story.append(img)
-            story.append(Spacer(1, 3*mm))
+            op_logo_img = RLImage(io.BytesIO(resp.content), width=28*mm, height=28*mm)
         except: pass
 
-    story.append(Paragraph(operator.get("business_name","Speedboat Service"), title_s))
-    story.append(Paragraph("Powered by Samuga Travels 🌊", sub_s))
-    story.append(Spacer(1, 5*mm))
+    # Header row: ST branding left, operator logo right
+    st_brand = Paragraph(
+        '<font color="#00B4D8"><b>SAMUGA</b></font><font color="#1B6CA8"><b>TRAVELS</b></font>',
+        ParagraphStyle('stb', fontName='Helvetica-Bold', fontSize=13, alignment=0))
+    st_sub = Paragraph(
+        '<font color="#6B8A9E" size="7">Official Travel Partner · Maldives</font>',
+        ParagraphStyle('sts', fontName='Helvetica', fontSize=7, alignment=0))
 
-    data = [
-        ["🎫 BOOKING REF",  booking["booking_ref"]],
-        ["🚤 BOAT",         operator.get("boat_name","N/A")],
-        ["📍 ROUTE",        f"{schedule['route_from']} → {schedule['route_to']}"],
-        ["📅 DATE",         str(booking["travel_date"])],
-        ["⏰ DEPARTURE",    schedule["departure_time"]],
-        ["👥 PASSENGERS",   str(booking["passenger_count"])],
-        ["💰 TOTAL PAID",   f"MVR {booking['total_amount']}"],
-    ]
-    t = Table(data, colWidths=[70*mm, 90*mm])
-    t.setStyle(TableStyle([
-        ('BACKGROUND',(0,0),(-1,0), colors.HexColor('#1a3a5c')),
-        ('TEXTCOLOR',(0,0),(-1,0), colors.white),
-        ('FONTNAME',(0,0),(-1,-1),'Helvetica'),
-        ('FONTSIZE',(0,0),(-1,-1),10),
-        ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.HexColor('#f0f4f8'),colors.white]),
-        ('GRID',(0,0),(-1,-1),0.5,colors.HexColor('#cde')),
-        ('PADDING',(0,0),(-1,-1),8),
+    op_name_p = Paragraph(
+        f'<font color="#0D2137"><b>{operator.get("business_name","")}</b></font>',
+        ParagraphStyle('opn', fontName='Helvetica-Bold', fontSize=11, alignment=2))
+    op_contact_p = Paragraph(
+        f'<font color="#6B8A9E" size="8">{operator.get("owner_contact","")}</font>',
+        ParagraphStyle('opc', fontName='Helvetica', fontSize=8, alignment=2))
+
+    left_cell = [[st_brand], [st_sub]]
+    right_cell_content = []
+    if op_logo_img:
+        right_cell_content.append(op_logo_img)
+    right_cell_content.append(op_name_p)
+    right_cell_content.append(op_contact_p)
+
+    header_table = Table([[left_cell, right_cell_content]], colWidths=[90*mm, 85*mm])
+    header_table.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('ALIGN', (0,0), (0,0), 'LEFT'),
+        ('ALIGN', (1,0), (1,0), 'RIGHT'),
+        ('PADDING', (0,0), (-1,-1), 4),
     ]))
-    story.append(t)
-    story.append(Spacer(1,5*mm))
+    story.append(header_table)
+    story.append(HRFlowable(width="100%", thickness=2, color=ST_ACCENT, spaceAfter=4*mm))
 
-    passengers = booking.get("passengers",[])
+    # ── TICKET TITLE BAND ────────────────────────────────────────────────────
+    title_data = [["  BOARDING TICKET  ·  " + booking["booking_ref"]]]
+    title_t = Table(title_data, colWidths=[175*mm])
+    title_t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), ST_NAVY),
+        ('TEXTCOLOR', (0,0), (-1,-1), ST_WHITE),
+        ('FONTNAME', (0,0), (-1,-1), 'Helvetica-Bold'),
+        ('FONTSIZE', (0,0), (-1,-1), 13),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('PADDING', (0,0), (-1,-1), 8),
+        ('TOPPADDING', (0,0), (-1,-1), 6),
+    ]))
+    story.append(title_t)
+    story.append(Spacer(1, 4*mm))
+
+    # ── JOURNEY DETAILS ──────────────────────────────────────────────────────
+    route_str = f"{schedule.get('route_from','')} → {schedule.get('route_to','')}"
+    travel_date = str(booking.get("travel_date",""))
+    dep_time = schedule.get("departure_time","")
+    location = schedule.get("location","Jetty No. 1, Male")
+    boat_name = operator.get("boat_name","N/A")
+
+    # Two-column journey card
+    lbl = ParagraphStyle('lbl', fontName='Helvetica-Bold', fontSize=8, textColor=ST_MUTED)
+    val = ParagraphStyle('val', fontName='Helvetica-Bold', fontSize=11, textColor=ST_TEXT)
+    val_sm = ParagraphStyle('vsm', fontName='Helvetica', fontSize=10, textColor=ST_TEXT)
+
+    journey_data = [
+        [Paragraph("ROUTE", lbl), Paragraph("DATE", lbl),
+         Paragraph("DEPARTURE", lbl), Paragraph("LOCATION", lbl)],
+        [Paragraph(route_str, val), Paragraph(travel_date, val),
+         Paragraph(dep_time, val), Paragraph(location, val_sm)],
+    ]
+    journey_t = Table(journey_data, colWidths=[52*mm, 38*mm, 35*mm, 50*mm])
+    journey_t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,-1), ST_LIGHT),
+        ('ROWBACKGROUNDS', (0,0), (-1,-1), [ST_GRAY, ST_WHITE]),
+        ('BOX', (0,0), (-1,-1), 1, ST_ACCENT),
+        ('LINEABOVE', (0,1), (-1,1), 1, ST_ACCENT),
+        ('PADDING', (0,0), (-1,-1), 8),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+    ]))
+    story.append(journey_t)
+    story.append(Spacer(1, 3*mm))
+
+    # ── BOAT + PAYMENT ROW ───────────────────────────────────────────────────
+    boat_payment_data = [
+        [Paragraph("VESSEL", lbl), Paragraph("PASSENGERS", lbl), Paragraph("TOTAL PAID", lbl)],
+        [Paragraph(f"🚤 {boat_name}", val_sm),
+         Paragraph(str(booking.get("passenger_count",0)), val),
+         Paragraph(f"MVR {booking.get('total_amount','0')}", val)],
+    ]
+    bp_t = Table(boat_payment_data, colWidths=[65*mm, 50*mm, 60*mm])
+    bp_t.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), ST_BLUE),
+        ('TEXTCOLOR', (0,0), (-1,0), ST_WHITE),
+        ('BACKGROUND', (0,1), (-1,1), ST_WHITE),
+        ('BOX', (0,0), (-1,-1), 1, ST_BLUE),
+        ('PADDING', (0,0), (-1,-1), 8),
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+    ]))
+    story.append(bp_t)
+    story.append(Spacer(1, 4*mm))
+
+    # ── PASSENGER TABLE ──────────────────────────────────────────────────────
+    passengers = booking.get("passengers", [])
     if isinstance(passengers, str):
-        passengers = json.loads(passengers)
-    if passengers:
-        story.append(Paragraph("Passenger Details", ParagraphStyle('ph',parent=styles['Heading2'],
-                                fontSize=12,textColor=colors.HexColor('#1a3a5c'))))
-        pd = [["#","Full Name","ID / Passport"]]
-        for i,p in enumerate(passengers,1):
-            pd.append([str(i), p.get("name",""), p.get("id_number","")])
-        pt = Table(pd, colWidths=[10*mm,80*mm,70*mm])
-        pt.setStyle(TableStyle([
-            ('BACKGROUND',(0,0),(-1,0),colors.HexColor('#2e86ab')),
-            ('TEXTCOLOR',(0,0),(-1,0),colors.white),
-            ('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),
-            ('FONTSIZE',(0,0),(-1,-1),9),
-            ('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.HexColor('#f7fbff'),colors.white]),
-            ('GRID',(0,0),(-1,-1),0.5,colors.HexColor('#c0d8f0')),
-            ('PADDING',(0,0),(-1,-1),6),
-        ]))
-        story.append(pt)
-        story.append(Spacer(1,5*mm))
+        try: passengers = json.loads(passengers)
+        except: passengers = []
 
-    story.append(Paragraph("✅ Present this ticket when boarding.",
-        ParagraphStyle('f1',parent=styles['Normal'],fontSize=9,
-                       textColor=colors.HexColor('#444'),alignment=TA_CENTER)))
-    story.append(Paragraph("Samuga Travels — Safe travels! 🌊",
-        ParagraphStyle('f2',parent=styles['Normal'],fontSize=8,
-                       textColor=colors.HexColor('#888'),alignment=TA_CENTER)))
+    if passengers:
+        story.append(Paragraph("PASSENGER MANIFEST",
+            ParagraphStyle('pmt', fontName='Helvetica-Bold', fontSize=9,
+                           textColor=ST_NAVY, spaceBefore=2, spaceAfter=3)))
+        pax_data = [[
+            Paragraph("#", ParagraphStyle('ph', fontName='Helvetica-Bold', fontSize=8, textColor=ST_WHITE)),
+            Paragraph("FULL NAME", ParagraphStyle('ph', fontName='Helvetica-Bold', fontSize=8, textColor=ST_WHITE)),
+            Paragraph("ID / PASSPORT", ParagraphStyle('ph', fontName='Helvetica-Bold', fontSize=8, textColor=ST_WHITE)),
+        ]]
+        for i, p in enumerate(passengers, 1):
+            row_bg = ST_LIGHT if i % 2 == 0 else ST_WHITE
+            pax_data.append([
+                Paragraph(str(i), ParagraphStyle('pv', fontName='Helvetica-Bold', fontSize=9, textColor=ST_BLUE)),
+                Paragraph(p.get("name",""), ParagraphStyle('pv2', fontName='Helvetica', fontSize=9, textColor=ST_TEXT)),
+                Paragraph(p.get("id_number",""), ParagraphStyle('pv3', fontName='Helvetica', fontSize=9, textColor=ST_TEXT)),
+            ])
+        pax_t = Table(pax_data, colWidths=[12*mm, 95*mm, 68*mm])
+        pax_t.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), ST_NAVY),
+            ('ROWBACKGROUNDS', (0,1), (-1,-1), [ST_WHITE, ST_LIGHT]),
+            ('BOX', (0,0), (-1,-1), 0.5, ST_BLUE),
+            ('INNERGRID', (0,0), (-1,-1), 0.3, HexColor('#D0E8F5')),
+            ('PADDING', (0,0), (-1,-1), 7),
+            ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ]))
+        story.append(pax_t)
+        story.append(Spacer(1, 4*mm))
+
+    # ── CONTACT + FOOTER ─────────────────────────────────────────────────────
+    story.append(HRFlowable(width="100%", thickness=1, color=ST_ACCENT, spaceBefore=2, spaceAfter=3*mm))
+
+    contact_text = (
+        f"<b>Operator Contact:</b> {operator.get('owner_contact','N/A')} &nbsp;|&nbsp; "
+        f"<b>Business:</b> {operator.get('business_name','')} &nbsp;|&nbsp; "
+        f"<b>Questions?</b> Contact your operator or Samuga Travels"
+    )
+    story.append(Paragraph(contact_text,
+        ParagraphStyle('ct', fontName='Helvetica', fontSize=8,
+                       textColor=ST_MUTED, alignment=TA_CENTER, spaceAfter=2)))
+
+    story.append(Paragraph(
+        "✅ <b>Present this ticket when boarding.</b> This is an official Samuga Travels booking ticket.",
+        ParagraphStyle('f1', fontName='Helvetica', fontSize=8,
+                       textColor=ST_TEXT, alignment=TA_CENTER, spaceAfter=1)))
+
+    story.append(Paragraph(
+        f"<font color='#1B6CA8'><b>Samuga Travels</b></font> · Maldives · Issued {datetime.now().strftime('%d %b %Y %H:%M')} MVT",
+        ParagraphStyle('f2', fontName='Helvetica', fontSize=7,
+                       textColor=ST_MUTED, alignment=TA_CENTER)))
+
     doc.build(story)
     return buf.getvalue()
 
@@ -1198,7 +1319,8 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"✅ *Payment slip received!*\n\n"
                 f"📋 Booking Ref: `{ref}`\n\n"
                 f"Your booking is being reviewed by the operator. "
-                f"You\'ll receive your ticket here within 5 minutes. 🌊",
+                f"You will receive your confirmed ticket within *5-10 minutes*. "
+                f"Please do not resend your slip - we have received it!",
                 parse_mode="Markdown")
 
             sel = {
@@ -1932,6 +2054,31 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if row:
             await query.edit_message_text(f"⭐ Recommended badge removed from *{row['business_name']}*.", parse_mode="Markdown")
 
+    elif data.startswith("not_received_"):
+        booking_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            bk = await conn.fetchrow("SELECT * FROM bookings WHERE id=$1", booking_id)
+        if not bk:
+            await query.answer("Booking not found.", show_alert=True)
+            return
+        # Notify customer
+        try:
+            await ctx.bot.send_message(bk["customer_telegram_id"],
+                f"⚠️ *Payment Not Confirmed*\n\n"
+                f"Hi there! The operator could not verify your payment for booking `{bk['booking_ref']}`.\n\n"
+                f"This could be because:\n"
+                f"• The transfer was sent to the wrong account\n"
+                f"• The amount was incorrect\n"
+                f"• The screenshot was unclear\n\n"
+                f"Please double-check and resend your payment slip, or contact the operator directly. 🙏",
+                parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Not received notify error: {e}")
+        await query.edit_message_caption(
+            caption=f"❌ Customer notified — payment not confirmed for `{bk['booking_ref']}`.",
+            parse_mode="Markdown")
+
     elif data.startswith("confirm_booking_"):
         booking_id = int(data.split("_")[-1])
         await do_confirm_booking(ctx, booking_id, query)
@@ -2106,9 +2253,10 @@ async def notify_operator_payment(ctx, booking_id, sel, temp, ref, customer, sli
     )
     try:
         await ctx.bot.send_photo(op_tg_id, photo=slip_file_id, caption=msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{booking_id}")
-            ]]))
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{booking_id}")],
+                [InlineKeyboardButton("❌ Not Received / Wrong Transfer", callback_data=f"not_received_{booking_id}")]
+            ]))
         logger.info(f"✅ Operator {op_tg_id} notified for booking {booking_id}")
     except Exception as e:
         logger.error(f"Operator notify error: {e}")
@@ -2136,11 +2284,29 @@ async def do_confirm_booking(ctx, booking_id: int, query):
     booking_dict = dict(booking)
     passengers = booking_dict.get("passengers", "[]")
     if isinstance(passengers, str):
-        booking_dict["passengers"] = json.loads(passengers)
+        try: booking_dict["passengers"] = json.loads(passengers)
+        except: booking_dict["passengers"] = []
 
-    op_dict    = {"business_name": booking["business_name"], "boat_name": booking["boat_name"], "logo_url": booking["logo_url"]}
-    sched_dict = {"route_from": booking["route_from"], "route_to": booking["route_to"],
-                  "departure_time": booking["departure_time"], "price_per_seat": booking["price_per_seat"]}
+    # Fetch full operator info including contact
+    pool2 = await get_pool()
+    async with pool2.acquire() as conn2:
+        full_op = await conn2.fetchrow("SELECT * FROM operators WHERE id=$1", booking["operator_id"])
+        sched_full = await conn2.fetchrow("SELECT * FROM schedules WHERE id=$1", booking["schedule_id"])
+
+    op_dict = {
+        "business_name": booking["business_name"],
+        "boat_name": booking["boat_name"],
+        "logo_url": booking["logo_url"],
+        "owner_contact": full_op["owner_contact"] if full_op else "",
+        "telegram_id": full_op["telegram_id"] if full_op else 0,
+    }
+    sched_dict = {
+        "route_from": booking["route_from"],
+        "route_to": booking["route_to"],
+        "departure_time": booking["departure_time"],
+        "price_per_seat": booking["price_per_seat"],
+        "location": sched_full["location"] if sched_full and "location" in sched_full.keys() else "Jetty No. 1, Male",
+    }
 
     pdf_bytes = generate_ticket_pdf(booking_dict, op_dict, sched_dict)
     pdf_file  = io.BytesIO(pdf_bytes)
