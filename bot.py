@@ -2188,8 +2188,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         sort_labels = {"recommended":"⭐ Rec","earliest":"⏰ Early","cheapest":"💰 Cheap","seats":"💺 Seats"}
         sort_row = [
-            InlineKeyboardButton(f"{'→ ' if sort_key==k else ''}{v}",
-                callback_data=f"sort_{k}_{travel_date}_{route_from}_{route_to}")
+            InlineKeyboardButton(f"{'✓ ' if sort_key==k else ''}{v}",
+                callback_data=f"srt_{k}")   # short callback — max 64 chars safe
             for k, v in sort_labels.items()
         ]
 
@@ -2372,16 +2372,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"{'Today' if i==0 else 'Tomorrow' if i==1 else d.strftime('%a %d %b')}",
                 callback_data=f"date_select_{d.strftime('%d-%m-%Y')}"
             )] for i, d in enumerate(dates)]
-            # Add time-of-day filter row
-            filter_row = [
-                InlineKeyboardButton("🌅 Morning",   callback_data=f"filter_morning_{rf}_{rt}"),
-                InlineKeyboardButton("☀️ Afternoon",  callback_data=f"filter_afternoon_{rf}_{rt}"),
-                InlineKeyboardButton("🌙 Evening",   callback_data=f"filter_evening_{rf}_{rt}"),
-            ]
             await update.message.reply_text(
                 f"🔍 *{rf} → {rt}*\n\n📅 Select your *travel date* or type manually:\n_(DD-MM-YYYY or DD/MM/YYYY)_",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup(date_buttons + [filter_row]))
+                reply_markup=InlineKeyboardMarkup(date_buttons))
         else:
             sd2 = await get_user_state(user.id)
             role = sd2.get("role","customer")
@@ -2813,6 +2807,69 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(
             "🔍 *Search for Boats*\n\nType your route:\n`Male to Thoddoo`\n`Thoddoo to Male`",
             parse_mode="Markdown")
+
+    elif data.startswith("srt_"):
+        # Sort preference — re-run the last search with new sort
+        sort_key = data.replace("srt_", "")
+        sd2 = await get_user_state(user.id)
+        t2 = sd2.get("temp_data", {}) or {}
+        # Store sort preference and re-trigger search with cached schedules
+        schedules = ctx.user_data.get("schedules_cache", [])
+        if not schedules:
+            await query.answer("Session expired — please search again.", show_alert=True)
+            return
+        await set_user_state(user.id, sd2.get("state", CX_IDLE), {**t2, "sort_by": sort_key})
+        await query.answer(f"Sorted!")
+        # Rebuild the message with new sort
+        route_from = t2.get("route_from","")
+        route_to   = t2.get("route_to","")
+        travel_date = t2.get("travel_date","")
+        sort_labels = {"recommended":"⭐ Rec","earliest":"⏰ Early","cheapest":"💰 Cheap","seats":"💺 Seats"}
+
+        if sort_key == "earliest":
+            schedules = sorted(schedules, key=lambda x: x["departure_time"])
+        elif sort_key == "cheapest":
+            schedules = sorted(schedules, key=lambda x: float(x["price_per_seat"] or 0))
+        elif sort_key == "seats":
+            schedules = sorted(schedules, key=lambda x: x["available_seats"], reverse=True)
+        else:
+            schedules = sorted(schedules, key=lambda x: (not x.get("is_recommended"), x["departure_time"]))
+
+        ctx.user_data["schedules_cache"] = schedules
+        sort_row = [
+            InlineKeyboardButton(f"{'✓ ' if sort_key==k else ''}{v}", callback_data=f"srt_{k}")
+            for k, v in sort_labels.items()
+        ]
+        import json as _j2
+        msg = f"🚢 *Available Boats — {route_from} → {route_to}*\n📅 *{travel_date}*\n\n"
+        buttons = [sort_row]
+        for i, s in enumerate(schedules):
+            rating_val = float(s.get("average_rating") or 0)
+            rec = "✨ *Recommended*\n" if s.get("is_recommended") else ""
+            total_reviews = s.get("total_reviews", 0) or 0
+            trust = "🏆 Top Rated" if total_reviews >= 20 else ("✅ Verified" if total_reviews >= 5 else "🆕 New")
+            try:
+                stops_list = _j2.loads(s.get("sched_stops") or "[]")
+                stops_line = "🛑 " + " → ".join(stops_list) + "\n" if stops_list and len(stops_list) > 2 else ""
+            except: stops_line = ""
+            msg += (
+                f"{'─'*28}\n"
+                f"🚤 *{s['business_name']}* — _{s['boat_name']}_\n"
+                f"{rec}"
+                f"📍 {s['route_from']} → {s['route_to']}\n"
+                f"{stops_line}"
+                f"⏰ *{s['departure_time']}* | 💺 {s['available_seats']} seats | 💰 MVR {s['price_per_seat']}/seat\n"
+                f"{trust} · ⭐ {rating_val:.1f} ({total_reviews} reviews)\n\n"
+            )
+            buttons.append([InlineKeyboardButton(
+                f"Book — {s['business_name']} ({s['departure_time']})",
+                callback_data=f"book_sched_{i}")])
+        try:
+            await query.edit_message_text(msg[:4000], parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(buttons))
+        except Exception:
+            await query.message.reply_text(msg[:4000], parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(buttons))
 
     elif data.startswith("date_select_"):
         selected_date_str = data.replace("date_select_", "")
