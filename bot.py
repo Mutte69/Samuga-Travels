@@ -22,7 +22,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-BOT_TOKEN        = os.environ.get("BOT_TOKEN", "8973602844:AAGXMdvXqNPnTBWZGJNtJLb5ZKcMvjBgGE")
+BOT_TOKEN        = os.environ.get("BOT_TOKEN", "")
+if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN env var not set!")
 DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 ADMIN_GROUP_ID   = int(os.environ.get("ADMIN_GROUP_ID",  "-1004397030483"))
 ADMIN_THREAD_ID  = int(os.environ.get("ADMIN_THREAD_ID", "2"))
@@ -31,8 +32,8 @@ GENERAL_THREAD_ID= int(os.environ.get("GENERAL_THREAD_ID","1"))
 SUPER_ADMINS    = [int(x) for x in os.environ.get("SUPER_ADMINS", "").split(",") if x.strip().isdigit()]
 
 CLOUDINARY_CLOUD = os.environ.get("CLOUDINARY_CLOUD", "dfhj3clbh")
-CLOUDINARY_KEY   = os.environ.get("CLOUDINARY_KEY",   "324844414354471")
-CLOUDINARY_SECRET= os.environ.get("CLOUDINARY_SECRET","F4cmCOwLzIcSyXBhKZFzQDHevOk")
+CLOUDINARY_KEY   = os.environ.get("CLOUDINARY_KEY",   "")
+CLOUDINARY_SECRET= os.environ.get("CLOUDINARY_SECRET","")
 
 cloudinary.config(cloud_name=CLOUDINARY_CLOUD, api_key=CLOUDINARY_KEY, api_secret=CLOUDINARY_SECRET)
 
@@ -1208,10 +1209,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 bookings = await conn.fetch("""
                     SELECT customer_telegram_id, booking_ref FROM bookings
                     WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
-                """, sched_id, today)
+                """, sched_id, tomorrow)
             await set_user_state(user.id, OP_IDLE, {})
             await update.message.reply_text(
-                f"✅ Departure time updated to *{new_time_val}* for today.",
+                f"✅ Departure time updated to *{new_time_val}* for tomorrow.",
                 parse_mode="Markdown", reply_markup=main_kb("operator"))
             for bk in bookings:
                 try:
@@ -1238,10 +1239,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 bookings = await conn.fetch("""
                     SELECT customer_telegram_id, booking_ref FROM bookings
                     WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
-                """, sched_id, today)
+                """, sched_id, tomorrow)
             await set_user_state(user.id, OP_IDLE, {})
             await update.message.reply_text(
-                f"✅ Route updated to *{route_display}* for today.",
+                f"✅ Route updated to *{route_display}* for tomorrow.",
                 parse_mode="Markdown", reply_markup=main_kb("operator"))
             for bk in bookings:
                 try:
@@ -1614,8 +1615,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 JOIN operators o ON s.operator_id = o.id
                 WHERE LOWER(s.route_from) LIKE $1 AND LOWER(s.route_to) LIKE $2
                   AND o.status='approved' AND s.is_active=TRUE AND s.available_seats>0
+                  AND COALESCE(o.subscription_status,'trial') != 'expired'
+                  AND (
+                    s.run_days = 'daily' OR s.run_days IS NULL
+                    OR (s.run_days = 'fri'     AND EXTRACT(DOW FROM $3::date) = 5)
+                    OR (s.run_days = 'sat-thu' AND EXTRACT(DOW FROM $3::date) != 5)
+                    OR (s.run_days = 'weekdays' AND EXTRACT(DOW FROM $3::date) BETWEEN 0 AND 4)
+                    OR (s.run_days = 'weekend'  AND EXTRACT(DOW FROM $3::date) IN (5,6))
+                    OR (s.run_days = 'sun-thu'  AND EXTRACT(DOW FROM $3::date) BETWEEN 0 AND 4)
+                    OR (s.run_days = 'everyday')
+                  )
                 ORDER BY o.is_recommended DESC, s.departure_time ASC
-            """, f"%{route_from.lower()}%", f"%{route_to.lower()}%")
+            """, f"%{route_from.lower()}%", f"%{route_to.lower()}%", str(travel_date))
 
         if not rows:
             await update.message.reply_text(
@@ -1969,7 +1980,11 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
     else:
-        await update.message.reply_text("⚠️ Wasn't expecting an image. Use /start to go back.")
+        # Allow cancel via text — but if they sent a photo we just guide them
+        await update.message.reply_text(
+            "⚠️ Wasn't expecting an image right now.\n\n"
+            "Type `cancel` to go back to the main menu, or /start to restart.",
+            parse_mode="Markdown")
 
 # ── CALLBACK HANDLER ──────────────────────────────────────────────────────────
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2008,8 +2023,18 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 JOIN operators o ON s.operator_id = o.id
                 WHERE LOWER(s.route_from) LIKE $1 AND LOWER(s.route_to) LIKE $2
                   AND o.status='approved' AND s.is_active=TRUE AND s.available_seats>0
+                  AND COALESCE(o.subscription_status,'trial') != 'expired'
+                  AND (
+                    s.run_days = 'daily' OR s.run_days IS NULL
+                    OR (s.run_days = 'fri'     AND EXTRACT(DOW FROM $3::date) = 5)
+                    OR (s.run_days = 'sat-thu' AND EXTRACT(DOW FROM $3::date) != 5)
+                    OR (s.run_days = 'weekdays' AND EXTRACT(DOW FROM $3::date) BETWEEN 0 AND 4)
+                    OR (s.run_days = 'weekend'  AND EXTRACT(DOW FROM $3::date) IN (5,6))
+                    OR (s.run_days = 'sun-thu'  AND EXTRACT(DOW FROM $3::date) BETWEEN 0 AND 4)
+                    OR (s.run_days = 'everyday')
+                  )
                 ORDER BY o.is_recommended DESC, s.departure_time ASC
-            """, f"%{route_from.lower()}%", f"%{route_to.lower()}%")
+            """, f"%{route_from.lower()}%", f"%{route_to.lower()}%", str(travel_date))
         if not rows:
             await query.message.reply_text(
                 f"😔 No boats for *{route_from} → {route_to}* on *{selected_date_str}*. Try another date.",
@@ -2365,13 +2390,12 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ON CONFLICT DO NOTHING
             """, sched_id, tomorrow, new_boat)
             sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
-            # Notify confirmed customers for today
             bookings = await conn.fetch("""
                 SELECT customer_telegram_id, booking_ref FROM bookings
                 WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
-            """, sched_id, today)
+            """, sched_id, tomorrow)
         await query.edit_message_text(
-            f"✅ Today's {sched['departure_time']} departure now uses *{new_boat}*.",
+            f"✅ Tomorrow's {sched['departure_time']} departure now uses *{new_boat}*.",
             parse_mode="Markdown")
         # Notify customers
         for bk in bookings:
@@ -2401,8 +2425,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             bookings = await conn.fetch("""
                 SELECT customer_telegram_id, booking_ref FROM bookings
                 WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
-            """, sched_id, today)
-        await query.edit_message_text(f"❌ Today's {sched['departure_time']} departure marked as cancelled.")
+            """, sched_id, tomorrow)
+        await query.edit_message_text(f"✅ Tomorrow's {sched['departure_time']} departure marked as cancelled.")
         for bk in bookings:
             try:
                 await ctx.bot.send_message(bk["customer_telegram_id"],
@@ -2632,722 +2656,6 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 logger.error(f"Urgent notify error: {e}")
                 await query.answer("Failed to send. Try again.", show_alert=True)
 
-    elif data.startswith("sched_boat_"):
-        # Format: sched_boat_{boat_id}_{boat_name}
-        parts_data = data.split("_", 3)
-        boat_id = int(parts_data[2])
-        boat_name_sel = parts_data[3] if len(parts_data) > 3 else "default"
-        sd2 = await get_user_state(user.id)
-        t2 = sd2.get("temp_data", {}) or {}
-        import json as _j
-        op = await get_operator(user.id)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS sched_stops TEXT DEFAULT '[]'")
-            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'Jetty No. 1, Male'")
-            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS run_days TEXT DEFAULT 'daily'")
-            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS boat_name TEXT")
-            await conn.execute("""
-                INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
-                                       price_per_seat, total_seats, available_seats,
-                                       sched_stops, location, run_days, boat_name)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-            """, op["id"], t2.get("sched_from"), t2.get("sched_to"),
-                t2.get("sched_time"), t2.get("sched_price"),
-                t2.get("sched_seats",0), t2.get("sched_seats",0),
-                _j.dumps(t2.get("sched_stops",[])),
-                t2.get("sched_location","Jetty No. 1, Male"),
-                t2.get("run_days","daily"),
-                None if boat_name_sel == "default" else boat_name_sel)
-        await set_user_state(user.id, OP_IDLE, {})
-        boat_display = boat_name_sel if boat_name_sel != "default" else "Default"
-        await query.edit_message_text(
-            f"✅ *Schedule Added!*\n\n"
-            f"📍 {t2.get('sched_from')} → {t2.get('sched_to')}\n"
-            f"⏰ {t2.get('sched_time')} | 📅 {t2.get('run_days','daily')}\n"
-            f"📌 {t2.get('sched_location','Jetty No. 1, Male')}\n"
-            f"🚤 Boat: {boat_display}\n"
-            f"💰 MVR {t2.get('sched_price')}/seat | 👥 {t2.get('sched_seats',0)} seats",
-            parse_mode="Markdown")
-
-    elif data == "op_fleet":
-        op = await get_operator(user.id)
-        if not op:
-            await query.message.reply_text("⚠️ No operator profile.")
-            return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            boats = await conn.fetch("SELECT * FROM boats WHERE operator_id=$1 ORDER BY created_at", op["id"])
-        if not boats:
-            await query.message.reply_text(
-                "🚤 *Your Fleet*\n\nNo boats added yet.\n\nAdd your first boat:",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("➕ Add a Boat", callback_data="op_add_boat")
-                ]]))
-            return
-        msg = "🚤 *Your Fleet:*\n\n"
-        buttons = []
-        for b in boats:
-            status_icon = "✅" if b["status"] == "active" else "🔧"
-            msg += f"{status_icon} *{b['boat_name']}* — {b['capacity']} seats\n"
-            buttons.append([
-                InlineKeyboardButton(f"🔧 Maintenance — {b['boat_name']}", callback_data=f"boat_maintenance_{b['id']}"),
-                InlineKeyboardButton(f"✅ Active", callback_data=f"boat_active_{b['id']}")
-            ])
-        buttons.append([InlineKeyboardButton("➕ Add Another Boat", callback_data="op_add_boat")])
-        await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data == "op_add_boat":
-        await set_user_state(user.id, OP_AWAIT_BOAT_ADD_NAME, {})
-        await query.message.reply_text(
-            "🚤 *Add a Boat*\n\nWhat is this boat's name?\n\n_Example: SamugaTravels 1, Ocean Star_",
-            parse_mode="Markdown")
-
-    elif data.startswith("boat_maintenance_"):
-        boat_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("UPDATE boats SET status='maintenance' WHERE id=$1 RETURNING boat_name", boat_id)
-        if row:
-            await query.answer(f"🔧 {row['boat_name']} set to maintenance.", show_alert=True)
-            await query.edit_message_text(f"🔧 *{row['boat_name']}* is now under maintenance.\nCustomers won't see it in available boats.", parse_mode="Markdown")
-
-    elif data.startswith("boat_active_"):
-        boat_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("UPDATE boats SET status='active' WHERE id=$1 RETURNING boat_name", boat_id)
-        if row:
-            await query.answer(f"✅ {row['boat_name']} is now active!", show_alert=True)
-            await query.edit_message_text(f"✅ *{row['boat_name']}* is now active.", parse_mode="Markdown")
-
-    elif data == "op_today":
-        op = await get_operator(user.id)
-        if not op:
-            return
-        from datetime import timedelta as _td
-        today = datetime.now().date()
-        tomorrow = today + _td(days=1)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            # Today — view only
-            scheds_today = await conn.fetch("""
-                SELECT s.*, COALESCE(sc.new_boat_name, s.boat_name) as active_boat,
-                       COALESCE(sc.new_time, s.departure_time) as active_time,
-                       sc.note as change_note
-                FROM schedules s
-                LEFT JOIN schedule_changes sc ON sc.schedule_id=s.id AND sc.change_date=$1
-                WHERE s.operator_id=$2 AND s.is_active=TRUE
-                ORDER BY s.departure_time
-            """, today, op["id"])
-            bookings_today = await conn.fetch("""
-                SELECT schedule_id, COUNT(*) as cnt, SUM(passenger_count) as pax
-                FROM bookings WHERE travel_date=$1 AND status='confirmed' AND operator_id=$2
-                GROUP BY schedule_id
-            """, today, op["id"])
-            # Tomorrow — with change buttons
-            scheds_tmr = await conn.fetch("""
-                SELECT s.*, COALESCE(sc.new_boat_name, s.boat_name) as active_boat,
-                       COALESCE(sc.new_time, s.departure_time) as active_time,
-                       sc.note as change_note
-                FROM schedules s
-                LEFT JOIN schedule_changes sc ON sc.schedule_id=s.id AND sc.change_date=$1
-                WHERE s.operator_id=$2 AND s.is_active=TRUE
-                ORDER BY s.departure_time
-            """, tomorrow, op["id"])
-            bookings_tmr = await conn.fetch("""
-                SELECT schedule_id, COUNT(*) as cnt, SUM(passenger_count) as pax
-                FROM bookings WHERE travel_date=$1 AND status='confirmed' AND operator_id=$2
-                GROUP BY schedule_id
-            """, tomorrow, op["id"])
-
-        bk_map_today = {b["schedule_id"]: b for b in bookings_today}
-        bk_map_tmr   = {b["schedule_id"]: b for b in bookings_tmr}
-
-        msg = f"📅 *Today — {today.strftime('%A, %d %b')}*\n\n"
-        if not scheds_today:
-            msg += "_No schedules today._\n"
-        for s in scheds_today:
-            bk = bk_map_today.get(s["id"])
-            pax   = bk["pax"]  if bk else 0
-            cnt   = bk["cnt"]  if bk else 0
-            chng  = f" ⚠️ {s['change_note']}" if s.get("change_note") else ""
-            msg += (
-                f"⏰ *{s['active_time']}* — {s['route_from']} → {s['route_to']}\n"
-                f"🚤 {s['active_boat'] or 'Default'} | 📌 {s.get('location','Jetty No. 1, Male')}\n"
-                f"🎫 {cnt} bookings | 👥 {pax} pax{chng}\n\n"
-            )
-
-        msg += f"\n📅 *Tomorrow — {tomorrow.strftime('%A, %d %b')}* _(tap to manage)_\n\n"
-        buttons = []
-        if not scheds_tmr:
-            msg += "_No schedules tomorrow._\n"
-        for s in scheds_tmr:
-            bk = bk_map_tmr.get(s["id"])
-            pax   = bk["pax"]  if bk else 0
-            cnt   = bk["cnt"]  if bk else 0
-            chng  = f" ⚠️ {s['change_note']}" if s.get("change_note") else ""
-            msg += (
-                f"⏰ *{s['active_time']}* — {s['route_from']} → {s['route_to']}\n"
-                f"🚤 {s['active_boat'] or 'Default'} | 📌 {s.get('location','Jetty No. 1, Male')}\n"
-                f"🎫 {cnt} bookings | 👥 {pax} pax{chng}\n\n"
-            )
-            buttons.append([InlineKeyboardButton(
-                f"✏️ Manage {s['active_time']} — {s['route_from']} → {s['route_to']}",
-                callback_data=f"change_sched_{s['id']}")])
-
-        await query.message.reply_text(msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
-
-    elif data.startswith("change_sched_"):
-        sched_id = int(data.split("_")[-1])
-        op = await get_operator(user.id)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
-            boats = await conn.fetch("SELECT * FROM boats WHERE operator_id=$1 AND status='active'", op["id"])
-        if not sched:
-            await query.answer("Schedule not found.", show_alert=True)
-            return
-        buttons = []
-        for b in boats:
-            buttons.append([InlineKeyboardButton(
-                f"🚤 Swap to {b['boat_name']}",
-                callback_data=f"swap_boat_{sched_id}_{b['boat_name']}")])
-        buttons.append([InlineKeyboardButton("⏰ Change Time", callback_data=f"swap_time_{sched_id}")])
-        buttons.append([InlineKeyboardButton("🗺️ Change Route", callback_data=f"swap_route_{sched_id}")])
-        buttons.append([InlineKeyboardButton("❌ Cancel Today's Departure", callback_data=f"cancel_today_{sched_id}")])
-        await query.message.reply_text(
-            f"✏️ *Manage Tomorrow's Schedule*\n\n"
-            f"⏰ {sched['departure_time']} — {sched['route_from']} → {sched['route_to']}\n"
-            f"📌 {sched.get('location','Jetty No. 1, Male')}\n\n"
-            f"What would you like to change for tomorrow?",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data.startswith("swap_time_"):
-        sched_id = int(data.split("_")[-1])
-        await set_user_state(user.id, OP_AWAIT_CHANGE_NOTE, {"change_type": "time", "change_sched_id": sched_id})
-        await query.message.reply_text(
-            "⏰ *Change Today's Departure Time*\n\nEnter the new time:\n_Example: 05:00 PM_",
-            parse_mode="Markdown")
-
-    elif data.startswith("swap_route_"):
-        sched_id = int(data.split("_")[-1])
-        await set_user_state(user.id, OP_AWAIT_CHANGE_NOTE, {"change_type": "route", "change_sched_id": sched_id})
-        await query.message.reply_text(
-            "🗺️ *Change Today's Route*\n\nEnter new stops comma-separated:\n_Example: Male, Gulhi, Maafushi_",
-            parse_mode="Markdown")
-
-    elif data.startswith("swap_boat_"):
-        parts_s = data.split("_", 3)
-        sched_id = int(parts_s[2])
-        new_boat = parts_s[3]
-        from datetime import timedelta as _td2
-        tomorrow = datetime.now().date() + _td2(days=1)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO schedule_changes (schedule_id, change_date, new_boat_name, note)
-                VALUES ($1,$2,$3,'Boat swapped by operator')
-                ON CONFLICT DO NOTHING
-            """, sched_id, tomorrow, new_boat)
-            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
-            # Notify confirmed customers for today
-            bookings = await conn.fetch("""
-                SELECT customer_telegram_id, booking_ref FROM bookings
-                WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
-            """, sched_id, today)
-        await query.edit_message_text(
-            f"✅ Today's {sched['departure_time']} departure now uses *{new_boat}*.",
-            parse_mode="Markdown")
-        # Notify customers
-        for bk in bookings:
-            try:
-                await ctx.bot.send_message(bk["customer_telegram_id"],
-                    f"🚤 *Schedule Update*\n\n"
-                    f"Your booking `{bk['booking_ref']}` has a small update:\n\n"
-                    f"The boat for your *{sched['departure_time']}* departure has been changed to *{new_boat}*.\n"
-                    f"📌 Location: {sched.get('location','Jetty No. 1, Male')}\n\n"
-                    f"All other details remain the same. Safe travels! 🌊",
-                    parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Customer notify error: {e}")
-
-    elif data.startswith("cancel_today_"):
-        sched_id = int(data.split("_")[-1])
-        from datetime import timedelta as _td3
-        tomorrow = datetime.now().date() + _td3(days=1)
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO schedule_changes (schedule_id, change_date, note, status)
-                VALUES ($1,$2,"Departure cancelled for tomorrow",'cancelled')
-                ON CONFLICT DO NOTHING
-            """, sched_id, tomorrow)
-            sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
-            bookings = await conn.fetch("""
-                SELECT customer_telegram_id, booking_ref FROM bookings
-                WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
-            """, sched_id, today)
-        await query.edit_message_text(f"❌ Today's {sched['departure_time']} departure marked as cancelled.")
-        for bk in bookings:
-            try:
-                await ctx.bot.send_message(bk["customer_telegram_id"],
-                    f"❌ *Departure Cancelled*\n\n"
-                    f"We regret to inform you that your *{sched['departure_time']}* departure\n"
-                    f"{sched['route_from']} → {sched['route_to']} has been cancelled today.\n\n"
-                    f"Booking `{bk['booking_ref']}`\n\n"
-                    f"Please contact the operator for rebooking or refund. Sorry for the inconvenience. 🙏",
-                    parse_mode="Markdown")
-            except Exception as e:
-                logger.error(f"Cancel notify error: {e}")
-
-    # ── ADMIN PANEL CALLBACKS ──────────────────────────────────────────────────
-    elif data == "adm_operators":
-        if not await admin_check(query, ctx): return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            ops = await conn.fetch("SELECT * FROM operators ORDER BY status, created_at DESC LIMIT 20")
-        if not ops:
-            await query.message.reply_text("No operators found.")
-            return
-        for op in ops:
-            status_icon = {"pending":"⏳","approved":"✅","rejected":"❌"}.get(op["status"],"❓")
-            rec = "🌟 " if op["is_recommended"] else ""
-            msg = (
-                f"{status_icon} {rec}*{op['business_name']}*\n"
-                f"🛥️ {op['boat_name']} | 💺 {op['seat_count']} seats\n"
-                f"👤 @{op['telegram_username'] or 'N/A'} (`{op['telegram_id']}`)\n"
-                f"📞 {op['owner_contact'] or 'N/A'}\n"
-                f"📅 {str(op['created_at'])[:10]}"
-            )
-            btns = []
-            if op["status"] != "approved":
-                btns.append([InlineKeyboardButton("✅ Approve", callback_data=f"approve_op_{op['id']}"),
-                             InlineKeyboardButton("❌ Reject",  callback_data=f"reject_op_{op['id']}")])
-            btns.append([
-                InlineKeyboardButton("🌟 Recommend" if not op["is_recommended"] else "⭐ Un-recommend",
-                    callback_data=f"admin_recommend_{op['id']}" if not op["is_recommended"] else f"admin_unrecommend_{op['id']}"),
-                InlineKeyboardButton("🔄 Reset", callback_data=f"admin_reset_{op['id']}"),
-                InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_delete_{op['id']}")
-            ])
-            await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
-
-    elif data == "adm_bookings":
-        if not await admin_check(query, ctx): return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            bks = await conn.fetch("""
-                SELECT b.*, o.business_name FROM bookings b
-                JOIN operators o ON b.operator_id=o.id
-                ORDER BY b.created_at DESC LIMIT 15
-            """)
-        if not bks:
-            await query.message.reply_text("No bookings yet.")
-            return
-        icons = {"pending_payment":"⏳","pending_confirmation":"🔄","confirmed":"✅","cancelled":"❌"}
-        msg = "📦 *Recent Bookings:*\n\n"
-        for b in bks:
-            ic = icons.get(b["status"],"❓")
-            msg += (f"{ic} `{b['booking_ref']}` — {b['business_name']}\n"
-                   f"   👤 {b['customer_name'] or 'N/A'} | 📅 {b['travel_date']} | MVR {b['total_amount']}\n\n")
-        await query.message.reply_text(msg, parse_mode="Markdown")
-
-    elif data == "adm_revenue":
-        if not await admin_check(query, ctx): return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            today_rev = await conn.fetchval(
-                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed' AND created_at::date=CURRENT_DATE")
-            week_rev = await conn.fetchval(
-                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed' AND created_at >= NOW()-INTERVAL '7 days'")
-            month_rev = await conn.fetchval(
-                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed' AND created_at >= NOW()-INTERVAL '30 days'")
-            total_rev = await conn.fetchval(
-                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed'")
-            top_ops = await conn.fetch("""
-                SELECT o.business_name, COUNT(*) as bookings, SUM(b.total_amount) as revenue
-                FROM bookings b JOIN operators o ON b.operator_id=o.id
-                WHERE b.status='confirmed'
-                GROUP BY o.business_name ORDER BY revenue DESC LIMIT 5
-            """)
-        msg = (
-            f"💰 *Revenue Report*\n\n"
-            f"📅 Today: *MVR {today_rev:.2f}*\n"
-            f"📅 This Week: *MVR {week_rev:.2f}*\n"
-            f"📅 This Month: *MVR {month_rev:.2f}*\n"
-            f"📈 All Time: *MVR {total_rev:.2f}*\n\n"
-            f"🏆 *Top Operators:*\n"
-        )
-        for i, op in enumerate(top_ops, 1):
-            msg += f"  {i}. {op['business_name']} — {op['bookings']} bookings | MVR {op['revenue']:.2f}\n"
-        await query.message.reply_text(msg, parse_mode="Markdown")
-
-    elif data == "adm_broadcast":
-        if not await admin_check(query, ctx): return
-        await set_user_state(user.id, ADMIN_AWAIT_BROADCAST, {})
-        await query.message.reply_text(
-            "📢 *Broadcast Message*\n\n"
-            "Type the message to send to *all approved operators*:\n\n"
-            "_Type_ `cancel` _to abort._",
-            parse_mode="Markdown")
-
-    elif data == "adm_upload_logo":
-        if not await admin_check(query, ctx): return
-        await set_user_state(user.id, ADMIN_AWAIT_LOGO, {})
-        await query.message.reply_text(
-            "🖼️ *Upload Samuga Travels Logo*\n\n"
-            "Send the logo image now and it will appear on every ticket! 🎫",
-            parse_mode="Markdown")
-
-    elif data == "adm_settings":
-        if not await admin_check(query, ctx): return
-        samuga_logo = await get_setting("samuga_logo_url", "Not set")
-        sub_fee = await get_setting("subscription_fee", "500")
-        sub_accounts = await get_setting("subscription_accounts", "[]")
-        msg = (
-            f"⚙️ *Settings*\n\n"
-            f"🖼️ Samuga Logo: {'✅ Set' if samuga_logo else '❌ Not set'}\n\n"
-            f"💳 *Subscription:*\n"
-            f"  Monthly fee: *MVR {sub_fee}*\n"
-            f"  Payment accounts: {'✅ Set' if sub_accounts != '[]' else '❌ Not set'}\n"
-        )
-        await query.message.reply_text(msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🖼️ Update Logo", callback_data="adm_upload_logo")],
-                [InlineKeyboardButton("💳 Subscriptions", callback_data="adm_subscriptions")],
-                [InlineKeyboardButton("🔙 Back to Admin", callback_data="adm_back")]
-            ]))
-
-    elif data == "adm_subscriptions":
-        if not await admin_check(query, ctx): return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            subs = await conn.fetch("""
-                SELECT s.*, o.business_name, o.telegram_id
-                FROM subscriptions s JOIN operators o ON s.operator_id=o.id
-                ORDER BY s.created_at DESC LIMIT 20
-            """)
-        fee = await get_setting("subscription_fee", "500")
-        sub_icons = {"trial":"🎁","active":"✅","expired":"❌","pending":"⏳","grace":"⚠️"}
-        msg = f"💳 *Subscriptions* | Fee: MVR {fee}/month\n\n"
-        for s in subs:
-            ic = sub_icons.get(s["status"],"❓")
-            end = s["trial_ends_at"] or s["paid_until"]
-            end_str = end.strftime("%d %b %Y") if end else "N/A"
-            msg += f"{ic} *{s['business_name']}* — {s['status'].upper()} until {end_str}\n"
-        if not subs: msg += "_No subscriptions yet._"
-        await query.message.reply_text(msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("💰 Set Fee", callback_data="adm_set_fee")],
-                [InlineKeyboardButton("🏦 Set Payment Accounts", callback_data="adm_set_sub_accounts")],
-            ]))
-
-    elif data == "adm_set_fee":
-        if not await admin_check(query, ctx): return
-        await set_user_state(user.id, "admin_await_sub_fee", {})
-        await query.message.reply_text(
-            "💰 *Set Subscription Fee*\n\nEnter the monthly fee in MVR:\n_Example: 500_",
-            parse_mode="Markdown")
-
-    elif data == "adm_set_sub_accounts":
-        if not await admin_check(query, ctx): return
-        await set_user_state(user.id, "admin_await_sub_accounts", {})
-        await query.message.reply_text(
-            "🏦 *Set Samuga Travels Payment Accounts*\n\n"
-            "Enter one per line: BANK NUMBER NAME\n\n"
-            "_Example:_\n"
-            "`BML 7770001234567 Samuga Travels`\n"
-            "`MIB 90101234567890 Samuga Travels`",
-            parse_mode="Markdown")
-
-    elif data == "adm_schedules":
-        if not await admin_check(query, ctx): return
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            scheds = await conn.fetch("""
-                SELECT s.*, o.business_name FROM schedules s
-                JOIN operators o ON s.operator_id=o.id
-                WHERE s.is_active=TRUE ORDER BY o.business_name, s.departure_time
-            """)
-        if not scheds:
-            await query.message.reply_text("No active schedules.")
-            return
-        msg = "🚤 *All Active Schedules:*\n\n"
-        for s in scheds:
-            msg += (f"🏢 *{s['business_name']}*\n"
-                   f"  ⏰ {s['departure_time']} | {s['route_from']} → {s['route_to']}\n"
-                   f"  📌 {s.get('location','N/A')} | 💺 {s['available_seats']} seats | MVR {s['price_per_seat']}\n\n")
-        await query.message.reply_text(msg[:4000], parse_mode="Markdown")
-
-    elif data == "adm_find_customer":
-        if not await admin_check(query, ctx): return
-        await query.message.reply_text(
-            "🔍 Use: `/findcustomer <booking_ref or telegram_id>`\n\nExample: `/findcustomer ST-260629-0389`",
-            parse_mode="Markdown")
-
-    elif data == "adm_back":
-        if not await admin_check(query, ctx): return
-        await query.message.reply_text("Back to admin — type /admin", parse_mode="Markdown")
-
-    elif data.startswith("urgent_review_"):
-        op_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            op = await conn.fetchrow("SELECT * FROM operators WHERE id=$1", op_id)
-        if not op:
-            await query.answer("Application not found.", show_alert=True)
-            return
-        urgent_msg = (
-            f"🚨 *URGENT REVIEW REQUEST*\n\n"
-            f"👤 @{op['telegram_username'] or 'N/A'} (`{op['telegram_id']}`)\n"
-            f"🏢 *{op['business_name']}*\n"
-            f"🛥️ {op['boat_name']}\n\n"
-            f"⚡ Operator is requesting urgent approval."
-        )
-        kb = InlineKeyboardMarkup([[
-            InlineKeyboardButton("✅ Approve Now", callback_data=f"approve_op_{op_id}"),
-            InlineKeyboardButton("❌ Reject", callback_data=f"reject_op_{op_id}")
-        ]])
-        try:
-            await ctx.bot.send_message(ADMIN_GROUP_ID, urgent_msg, parse_mode="Markdown",
-                                       message_thread_id=ADMIN_THREAD_ID, reply_markup=kb)
-            await query.edit_message_text(
-                "🚨 *Urgent request sent to admin!*\n\n"
-                "Our team has been notified and will review your application as soon as possible. 🙏",
-                parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Urgent cb error: {e}")
-            await query.answer("Could not send. Contact @SamugaTravels.", show_alert=True)
-
-    elif data.startswith("admin_delete_"):
-        op_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow("DELETE FROM operators WHERE id=$1 RETURNING telegram_id, business_name", op_id)
-        if row:
-            # Also reset user state so they can re-register
-            await set_user_state(row["telegram_id"], CX_IDLE, {}, role="customer")
-            await query.edit_message_text(f"🗑️ Operator *{row['business_name']}* deleted. They can now re-register.", parse_mode="Markdown")
-            try:
-                await ctx.bot.send_message(row["telegram_id"],
-                    "ℹ️ Your operator profile has been removed by Samuga Travels admin.\n"
-                    "You may register again with /register.", parse_mode="Markdown")
-            except: pass
-
-    elif data.startswith("admin_reset_"):
-        op_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "UPDATE operators SET status='pending' WHERE id=$1 RETURNING telegram_id, business_name", op_id)
-        if row:
-            await set_user_state(row["telegram_id"], CX_IDLE, {}, role="customer")
-            await query.edit_message_text(f"🔄 Operator *{row['business_name']}* reset to pending.", parse_mode="Markdown")
-
-    elif data.startswith("admin_recommend_"):
-        op_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "UPDATE operators SET is_recommended=TRUE WHERE id=$1 RETURNING telegram_id, business_name", op_id)
-        if row:
-            await query.edit_message_text(f"🌟 *{row['business_name']}* is now Recommended!", parse_mode="Markdown")
-            try:
-                await ctx.bot.send_message(row["telegram_id"],
-                    "🌟 *Congratulations!* Your business is now *Recommended by Samuga Travels!*\n\n"
-                    "Customers will see your badge when browsing boats. 🎉", parse_mode="Markdown")
-            except: pass
-
-    elif data.startswith("admin_unrecommend_"):
-        op_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "UPDATE operators SET is_recommended=FALSE, review_text=NULL WHERE id=$1 RETURNING business_name", op_id)
-        if row:
-            await query.edit_message_text(f"⭐ Recommended badge removed from *{row['business_name']}*.", parse_mode="Markdown")
-
-    elif data == "op_subscription":
-        op = await get_operator(user.id)
-        if not op:
-            return
-        sub_info = await get_sub_status(op["id"])
-        fee = await get_setting("subscription_fee", "500")
-
-        status_icons = {
-            "trial": "🎁", "active": "✅", "grace": "⚠️", "expired": "❌"
-        }
-        icon = status_icons.get(sub_info["status"], "❓")
-
-        msg = (
-            f"💳 *Subscription — {op['business_name']}*\n\n"
-            f"{icon} *Status:* {sub_info['status'].upper()}\n"
-            f"📅 {sub_info['message']}\n\n"
-        )
-
-        if sub_info["status"] == "trial":
-            msg += (
-                f"🎁 *You're on the Free Trial!*\n"
-                f"Enjoy 2 months completely free.\n\n"
-                f"After your trial, the monthly fee is *MVR {fee}*.\n"
-                f"We'll remind you 7 days before it ends. 🙏"
-            )
-            buttons = [[InlineKeyboardButton("ℹ️ How does billing work?", callback_data="sub_billing_info")]]
-
-        elif sub_info["status"] in ["active", "grace"]:
-            msg += f"💰 Monthly fee: *MVR {fee}*\n\n"
-            if sub_info["status"] == "grace":
-                msg += "⚠️ *Renew soon to avoid interruption!*\n"
-            msg += "Tap below to renew your subscription:"
-            buttons = [[InlineKeyboardButton("💳 Pay & Renew Now", callback_data="sub_pay")]]
-
-        else:  # expired
-            msg += (
-                f"❌ *Your subscription has expired.*\n\n"
-                f"Your schedules are currently hidden from customers.\n\n"
-                f"Monthly fee: *MVR {fee}*\n"
-                f"Tap below to reactivate:"
-            )
-            buttons = [[InlineKeyboardButton("💳 Pay & Reactivate", callback_data="sub_pay")]]
-
-        await query.message.reply_text(msg, parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons))
-
-    elif data == "sub_billing_info":
-        fee = await get_setting("subscription_fee", "500")
-        accounts_raw = await get_setting("subscription_accounts", "[]")
-        try:
-            import json as _j
-            accounts = _j.loads(accounts_raw)
-        except: accounts = []
-        acc_lines = ""
-        for a in accounts:
-            acc_lines += f"🏦 *{a["bank"]}:* `{a["number"]}` — {a.get("name","")}\n"
-        if not acc_lines:
-            acc_lines = "_Payment accounts will be added by admin soon._"
-        await query.message.reply_text(
-            f"ℹ️ *How Billing Works*\n\n"
-            f"💰 *Monthly Fee:* MVR {fee}\n\n"
-            f"After your 2-month free trial:\n"
-            f"• Pay MVR {fee} monthly to stay listed\n"
-            f"• Transfer to our account & send slip\n"
-            f"• Admin confirms within a few hours\n"
-            f"• You get 30 more days instantly\n\n"
-            f"*Samuga Travels Payment Accounts:*\n{acc_lines}\n"
-            f"Questions? Contact @SamugaTravels 🙏",
-            parse_mode="Markdown")
-
-    elif data == "sub_pay":
-        op = await get_operator(user.id)
-        fee = await get_setting("subscription_fee", "500")
-        accounts_raw = await get_setting("subscription_accounts", "[]")
-        try:
-            import json as _j
-            accounts = _j.loads(accounts_raw)
-        except: accounts = []
-        acc_lines = ""
-        for a in accounts:
-            bank = str(a.get("bank","")); num = str(a.get("number","")); nm = str(a.get("name",""))
-            acc_lines += bank + chr(10)
-        if not acc_lines:
-            acc_lines = "_Admin will share payment details soon. Contact @SamugaTravels_"
-        await set_user_state(user.id, OP_AWAIT_SUB_SLIP,
-                             {"sub_operator_id": op["id"], "sub_amount": fee})
-        await query.message.reply_text(
-            f"💳 *Subscribe to Samuga Travels*\n\n"
-            f"💰 Amount: *MVR {fee}*\n\n"
-            f"*Transfer to:*\n{acc_lines}\n"
-            f"After transferring, *send your payment screenshot here* 👇\n\n"
-            f"_Admin will approve within a few hours._",
-            parse_mode="Markdown")
-
-    elif data.startswith("sub_approve_"):
-        # Admin approves subscription payment
-        if not await admin_check(query, ctx): return
-        sub_id = int(data.split("_")[-1])
-        from datetime import timedelta
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            sub = await conn.fetchrow("SELECT * FROM subscriptions WHERE id=$1", sub_id)
-            if not sub:
-                await query.answer("Subscription not found.", show_alert=True)
-                return
-            # Extend 30 days from now (or from current paid_until if still active)
-            now = datetime.now()
-            base = sub["paid_until"] if sub["paid_until"] and sub["paid_until"] > now else now
-            new_until = base + timedelta(days=30)
-            await conn.execute("""
-                UPDATE subscriptions SET status='active', paid_until=$1, updated_at=NOW()
-                WHERE id=$2
-            """, new_until, sub_id)
-            await conn.execute("""
-                UPDATE operators SET subscription_status='active' WHERE id=$1
-            """, sub["operator_id"])
-            op_row = await conn.fetchrow("SELECT telegram_id, business_name FROM operators WHERE id=$1",
-                                          sub["operator_id"])
-        await query.edit_message_text(
-            f"✅ Subscription approved for *{op_row['business_name']}*\n"
-            f"Active until: *{new_until.strftime('%d %b %Y')}*",
-            parse_mode="Markdown")
-        try:
-            await ctx.bot.send_message(op_row["telegram_id"],
-                f"✅ *Subscription Activated!*\n\n"
-                f"Thank you for your payment! *{op_row['business_name']}* is active on Samuga Travels.\n\n"
-                f"📅 Active until: *{new_until.strftime('%d %b %Y')}*\n\n"
-                f"Your schedules are live and customers can book. 🌊",
-                parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Sub notify error: {e}")
-
-    elif data.startswith("sub_reject_"):
-        if not await admin_check(query, ctx): return
-        sub_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            sub = await conn.fetchrow("SELECT * FROM subscriptions WHERE id=$1", sub_id)
-            op_row = await conn.fetchrow("SELECT telegram_id, business_name FROM operators WHERE id=$1",
-                                          sub["operator_id"] if sub else 0)
-        await query.edit_message_text("❌ Subscription payment rejected.")
-        if op_row:
-            try:
-                await ctx.bot.send_message(op_row["telegram_id"],
-                    f"❌ *Payment Not Confirmed*\n\n"
-                    f"We couldn't verify your subscription payment.\n\n"
-                    f"Please check the amount and account number and try again, or contact @SamugaTravels. 🙏",
-                    parse_mode="Markdown")
-            except: pass
-
-    elif data.startswith("not_received_"):
-        booking_id = int(data.split("_")[-1])
-        pool = await get_pool()
-        async with pool.acquire() as conn:
-            bk = await conn.fetchrow("SELECT * FROM bookings WHERE id=$1", booking_id)
-        if not bk:
-            await query.answer("Booking not found.", show_alert=True)
-            return
-        # Notify customer
-        try:
-            await ctx.bot.send_message(bk["customer_telegram_id"],
-                f"⚠️ *Payment Not Confirmed*\n\n"
-                f"Hi there! The operator could not verify your payment for booking `{bk['booking_ref']}`.\n\n"
-                f"This could be because:\n"
-                f"• The transfer was sent to the wrong account\n"
-                f"• The amount was incorrect\n"
-                f"• The screenshot was unclear\n\n"
-                f"Please double-check and resend your payment slip, or contact the operator directly. 🙏",
-                parse_mode="Markdown")
-        except Exception as e:
-            logger.error(f"Not received notify error: {e}")
-        await query.edit_message_caption(
-            caption=f"❌ Customer notified — payment not confirmed for `{bk['booking_ref']}`.",
-            parse_mode="Markdown")
-
-    elif data.startswith("confirm_booking_"):
-        booking_id = int(data.split("_")[-1])
-        await do_confirm_booking(ctx, booking_id, query)
-
     elif data == "op_schedules":
         op = await get_operator(user.id)
         if not op or op.get("status") != "approved":
@@ -3445,6 +2753,96 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{b['id']}")
                 ]]))
+
+
+
+    elif data.startswith("sub_approve_"):
+        if not await admin_check(query, ctx): return
+        sub_id = int(data.split("_")[-1])
+        from datetime import timedelta as _td_sub
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            sub = await conn.fetchrow("SELECT * FROM subscriptions WHERE id=$1", sub_id)
+        if not sub:
+            await query.answer("Subscription not found.", show_alert=True)
+            return
+        now = datetime.now()
+        base = sub["paid_until"] if sub["paid_until"] and sub["paid_until"] > now else now
+        new_until = base + _td_sub(days=30)
+        async with pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE subscriptions SET status='active', paid_until=$1, updated_at=NOW() WHERE id=$2",
+                new_until, sub_id)
+            await conn.execute(
+                "UPDATE operators SET subscription_status='active' WHERE id=$1", sub["operator_id"])
+            op_row = await conn.fetchrow(
+                "SELECT telegram_id, business_name FROM operators WHERE id=$1", sub["operator_id"])
+        biz = op_row["business_name"] if op_row else "Operator"
+        until_str = new_until.strftime("%d %b %Y")
+        await query.edit_message_text(
+            f"✅ Subscription approved for *{biz}*\nActive until: *{until_str}*",
+            parse_mode="Markdown")
+        if op_row:
+            try:
+                await ctx.bot.send_message(op_row["telegram_id"],
+                    f"✅ *Subscription Activated!*\n\n"
+                    f"Thank you! *{biz}* is live on Samuga Travels.\n\n"
+                    f"📅 Active until: *{until_str}*\n\n"
+                    f"Your schedules are live and customers can book. 🌊",
+                    parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Sub approve notify: {e}")
+
+    elif data.startswith("sub_reject_"):
+        if not await admin_check(query, ctx): return
+        sub_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            sub = await conn.fetchrow("SELECT * FROM subscriptions WHERE id=$1", sub_id)
+        if not sub:
+            await query.answer("Subscription not found.", show_alert=True)
+            return
+        async with pool.acquire() as conn:
+            op_row = await conn.fetchrow(
+                "SELECT telegram_id, business_name FROM operators WHERE id=$1", sub["operator_id"])
+        await query.edit_message_text("❌ Subscription payment rejected.")
+        if op_row:
+            try:
+                await ctx.bot.send_message(op_row["telegram_id"],
+                    f"❌ *Payment Not Confirmed*\n\n"
+                    f"We could not verify your payment. Please check the amount and account, "
+                    f"or contact @SamugaTravels. 🙏",
+                    parse_mode="Markdown")
+            except Exception as e:
+                logger.error(f"Sub reject notify: {e}")
+
+    elif data.startswith("not_received_"):
+        booking_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            bk = await conn.fetchrow("SELECT * FROM bookings WHERE id=$1", booking_id)
+        if not bk:
+            await query.answer("Booking not found.", show_alert=True)
+            return
+        try:
+            await ctx.bot.send_message(bk["customer_telegram_id"],
+                f"⚠️ *Payment Not Confirmed*\n\n"
+                f"Hi! The operator could not verify your payment for booking `{bk['booking_ref']}`.\n\n"
+                f"This could be because:\n"
+                f"• Transfer sent to wrong account\n"
+                f"• Amount was incorrect\n"
+                f"• Screenshot was unclear\n\n"
+                f"Please double-check and resend your slip, or contact the operator. 🙏",
+                parse_mode="Markdown")
+        except Exception as e:
+            logger.error(f"Not received notify: {e}")
+        await query.edit_message_caption(
+            caption=f"❌ Customer notified — payment not confirmed for `{bk['booking_ref']}`.",
+            parse_mode="Markdown")
+
+    elif data.startswith("confirm_booking_"):
+        booking_id = int(data.split("_")[-1])
+        await do_confirm_booking(ctx, booking_id, query)
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 async def save_operator(user, temp: dict):
