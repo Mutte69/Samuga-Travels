@@ -50,8 +50,6 @@ else:
 # SamugaAI — Gemini free tier for customer/operator chat
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
 
-cloudinary.config(cloud_name=CLOUDINARY_CLOUD, api_key=CLOUDINARY_KEY, api_secret=CLOUDINARY_SECRET)
-
 # ── STATES ────────────────────────────────────────────────────────────────────
 OP_IDLE="op_idle"; OP_AWAIT_BUSINESS_NAME="op_await_business_name"
 OP_AWAIT_LOGO="op_await_logo"; OP_AWAIT_BOAT_NAME="op_await_boat_name"
@@ -1073,94 +1071,14 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             role = "operator"
         else:
             role = "customer"
+    await update.message.reply_text(
         f"🌊 *Welcome to Samuga Travels!*\n\n"
         f"Hi *{user.first_name}*! Book speedboats across the Maldives — fast, easy, trusted.\n\n"
         f"Just type your route to get started:\n"
         f"`Male to Thoddoo` · `Thoddoo to Male` · `Male to Maafushi`\n\n"
         f"Or tap a button below 👇",
-    """
-    Verify a booking ticket — called via QR scan deep-link or /verify ST-XXXXXX
-    Also handles: /start verify_ST-XXXXXX (from QR code deep-link)
-    """
-    user = update.effective_user
-    args = ctx.args or []
-    ref = None
-
-    # Handle /start verify_ST-XXXXXX
-    if args and args[0].startswith("verify_"):
-        ref = args[0].replace("verify_", "").strip().upper()
-    elif args:
-        ref = args[0].strip().upper()
-
-    if not ref:
-        await update.message.reply_text(
-            "🔍 *Ticket Verification*\n\n"
-            "Usage: `/verify ST-260629-1234`\n\n"
-            "Or scan the QR code on the ticket.",
-            parse_mode="Markdown")
-        return
-
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        bk = await conn.fetchrow("""
-            SELECT b.*, o.business_name, o.owner_contact,
-                   s.route_from, s.route_to, s.departure_time
-            FROM bookings b
-            JOIN operators o ON b.operator_id=o.id
-            JOIN schedules s ON b.schedule_id=s.id
-            WHERE b.booking_ref=$1
-        """, ref)
-
-    if not bk:
-        await update.message.reply_text(
-            f"❌ *Booking Not Found*\n\n`{ref}` does not exist in our system.\n\n"
-            "Check the booking reference and try again.",
-            parse_mode="Markdown")
-        return
-
-    passengers = bk["passengers"] or "[]"
-    if isinstance(passengers, str):
-        try: passengers = __import__("json").loads(passengers)
-        except: passengers = []
-
-    status_icons = {
-        "confirmed": "✅", "pending_confirmation": "⏳",
-        "pending_payment": "💳", "cancelled": "❌"
-    }
-    status_icon = status_icons.get(bk["status"], "❓")
-    boarded = bk.get("boarded_at")
-    pax_list = "\n".join([f"  {i+1}. {p.get('name','')} ({p.get('id_number','')})"
-                           for i, p in enumerate(passengers)])
-
-    msg = (
-        f"{status_icon} *Ticket Verification*\n\n"
-        f"📋 Ref: `{bk['booking_ref']}`\n"
-        f"📊 Status: *{bk['status'].upper().replace('_',' ')}*\n"
-        f"🚤 Operator: {bk['business_name']}\n"
-        f"📍 Route: {bk['route_from']} → {bk['route_to']}\n"
-        f"📅 Date: {bk['travel_date']} @ {bk['departure_time']}\n"
-        f"👥 Passengers ({bk['passenger_count']}):\n{pax_list}\n"
-        f"💰 Total Paid: MVR {bk['total_amount']}\n\n"
-    )
-
-    if boarded:
-        msg += f"🛳️ *Already boarded at {str(boarded)[:16]}*\n⚠️ This ticket has already been used."
-        await update.message.reply_text(msg, parse_mode="Markdown")
-    elif bk["status"] == "confirmed":
-        msg += "✅ *Valid ticket — not yet boarded.*"
-        kb = None
-        # Only operators and admins can mark as boarded
-        op = await get_operator(user.id)
-        if (user.id in SUPER_ADMINS or
-                (op and op.get("id") == bk["operator_id"])):
-            kb = InlineKeyboardMarkup([[
-                InlineKeyboardButton("🛳️ Mark as Boarded",
-                    callback_data=f"mark_boarded_{bk['id']}")
-            ]])
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
-    else:
-        msg += f"⚠️ Status is *{bk['status']}* — ticket not yet confirmed."
-        await update.message.reply_text(msg, parse_mode="Markdown")
+        parse_mode="Markdown",
+        reply_markup=main_kb(role))
 
 async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Verify a booking — /verify ST-XXXXXX or via QR deep-link /start verify_ST-XXXXXX"""
@@ -1805,7 +1723,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     INSERT INTO schedule_changes (schedule_id, change_date, new_time, note)
                     VALUES ($1,$2,$3,'Time changed by operator')
                     ON CONFLICT DO NOTHING
-                """, sched_id, today, new_time_val)
+                """, sched_id, tomorrow, new_time_val)
                 sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
                 bookings = await conn.fetch("""
                     SELECT customer_telegram_id, booking_ref FROM bookings
@@ -3445,7 +3363,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO schedule_changes (schedule_id, change_date, note, status)
-                VALUES ($1,$2,"Departure cancelled for tomorrow",'cancelled')
+                VALUES ($1,$2,'Departure cancelled for tomorrow','cancelled')
                 ON CONFLICT DO NOTHING
             """, sched_id, tomorrow)
             sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
