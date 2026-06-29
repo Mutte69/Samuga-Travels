@@ -57,6 +57,10 @@ OP_AWAIT_BOAT_ADD_CAPACITY="op_await_boat_add_capacity"
 OP_AWAIT_SCHEDULE_LOCATION="op_await_schedule_location"
 OP_AWAIT_SCHEDULE_DAYS="op_await_schedule_days"
 OP_AWAIT_CHANGE_NOTE="op_await_change_note"
+# Admin states
+ADMIN_AWAIT_BROADCAST="admin_await_broadcast"
+ADMIN_AWAIT_LOGO="admin_await_logo"
+ADMIN_AWAIT_REVIEW_TEXT="admin_await_review_text"
 
 # ── SMART INPUT HELPERS ──────────────────────────────────────────────────────
 def normalize_input(text: str) -> str:
@@ -270,6 +274,19 @@ async def init_db():
         await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS boat_name TEXT")
         # Add columns to bookings if missing
         await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS reminder_sent BOOLEAN DEFAULT FALSE")
+        # Settings table for admin-configurable values
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        # Insert defaults
+        await conn.execute("""
+            INSERT INTO settings (key, value) VALUES ('samuga_logo_url', '')
+            ON CONFLICT (key) DO NOTHING
+        """)
     logger.info("✅ Database initialized")
 
 # ── DB HELPERS ────────────────────────────────────────────────────────────────
@@ -312,6 +329,20 @@ async def update_temp_key(telegram_id: int, key: str, value):
             "UPDATE user_states SET temp_data=$1, updated_at=NOW() WHERE telegram_id=$2",
             json.dumps(temp), telegram_id)
 
+async def get_setting(key: str, default: str = "") -> str:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM settings WHERE key=$1", key)
+    return row["value"] if row and row["value"] else default
+
+async def set_setting(key: str, value: str):
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO settings (key, value, updated_at) VALUES ($1,$2,NOW())
+            ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()
+        """, key, value)
+
 async def get_operator(telegram_id: int):
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -333,7 +364,8 @@ async def upload_image(file_bytes: bytes, folder: str, filename: str) -> str:
 # ── PDF TICKET ────────────────────────────────────────────────────────────────
 SAMUGA_LOGO_URL = "https://res.cloudinary.com/dfhj3clbh/image/upload/samuga_travels/logos/logo_{user_id}"
 
-def generate_ticket_pdf(booking: dict, operator: dict, schedule: dict) -> bytes:
+async def generate_ticket_pdf(booking: dict, operator: dict, schedule: dict) -> bytes:
+    samuga_logo_url = await get_setting("samuga_logo_url", "")
     from reportlab.platypus import HRFlowable, KeepTogether
     from reportlab.lib.colors import HexColor
     from reportlab.pdfgen import canvas as rl_canvas
@@ -368,7 +400,15 @@ def generate_ticket_pdf(booking: dict, operator: dict, schedule: dict) -> bytes:
     except:
         op_img = None
 
-    # Try operator logo
+    # Samuga Travels logo top-left (from settings)
+    st_logo_img = None
+    if samuga_logo_url:
+        try:
+            resp = requests.get(samuga_logo_url, timeout=5)
+            st_logo_img = RLImage(io.BytesIO(resp.content), width=22*mm, height=22*mm)
+        except: pass
+
+    # Operator logo top-right
     op_logo_img = None
     if operator.get("logo_url"):
         try:
@@ -391,7 +431,7 @@ def generate_ticket_pdf(booking: dict, operator: dict, schedule: dict) -> bytes:
         f'<font color="#6B8A9E" size="8">{operator.get("owner_contact","")}</font>',
         ParagraphStyle('opc', fontName='Helvetica', fontSize=8, alignment=2))
 
-    left_cell = [[st_brand], [st_sub]]
+    left_cell = [[st_logo_img] if st_logo_img else [], [st_brand], [st_sub]]
     right_cell_content = []
     if op_logo_img:
         right_cell_content.append(op_logo_img)
@@ -598,40 +638,57 @@ async def cmd_recommend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
 # ── ADMIN COMMANDS ────────────────────────────────────────────────────────────
+def is_admin(user_id: int, chat_id: int) -> bool:
+    return user_id in SUPER_ADMINS or chat_id == ADMIN_GROUP_ID
+
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Main admin dashboard — /admin"""
     user = update.effective_user
-    if user.id not in SUPER_ADMINS and update.effective_chat.id != ADMIN_GROUP_ID:
+    if not is_admin(user.id, update.effective_chat.id):
         await update.message.reply_text("⛔ Admin only.")
         return
+
     pool = await get_pool()
     async with pool.acquire() as conn:
-        ops = await conn.fetch("SELECT * FROM operators ORDER BY created_at DESC LIMIT 20")
-    if not ops:
-        await update.message.reply_text("No operators found.")
-        return
-    for op in ops:
-        status_icon = {"pending":"⏳","approved":"✅","rejected":"❌"}.get(op["status"],"❓")
-        rec_icon = "🌟" if op["is_recommended"] else ""
-        msg = (
-            f"{status_icon}{rec_icon} *{op['business_name']}*\n"
-            f"🛥️ {op['boat_name']} | 👤 @{op['telegram_username'] or 'N/A'} (`{op['telegram_id']}`)\n"
-            f"📊 Status: *{op['status'].upper()}*\n"
-            f"📅 Registered: {str(op['created_at'])[:10]}"
-        )
-        buttons = []
-        if op["status"] != "approved":
-            buttons.append(InlineKeyboardButton("✅ Approve", callback_data=f"approve_op_{op['id']}"))
-        if op["status"] != "rejected":
-            buttons.append(InlineKeyboardButton("❌ Reject", callback_data=f"reject_op_{op['id']}"))
-        row2 = []
-        if not op["is_recommended"]:
-            row2.append(InlineKeyboardButton("🌟 Recommend", callback_data=f"admin_recommend_{op['id']}"))
-        else:
-            row2.append(InlineKeyboardButton("⭐ Remove Badge", callback_data=f"admin_unrecommend_{op['id']}"))
-        row2.append(InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_delete_{op['id']}"))
-        row2.append(InlineKeyboardButton("🔄 Reset", callback_data=f"admin_reset_{op['id']}"))
-        kb = InlineKeyboardMarkup([buttons, row2] if buttons else [row2])
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+        total_ops     = await conn.fetchval("SELECT COUNT(*) FROM operators WHERE status='approved'")
+        pending_ops   = await conn.fetchval("SELECT COUNT(*) FROM operators WHERE status='pending'")
+        total_bookings= await conn.fetchval("SELECT COUNT(*) FROM bookings")
+        confirmed_bk  = await conn.fetchval("SELECT COUNT(*) FROM bookings WHERE status='confirmed'")
+        total_revenue = await conn.fetchval("SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed'")
+        total_customers = await conn.fetchval("SELECT COUNT(DISTINCT customer_telegram_id) FROM bookings")
+
+    samuga_logo = await get_setting("samuga_logo_url", "")
+
+    msg = (
+        f"🛠️ *Samuga Travels — Admin Panel*\n\n"
+        f"📊 *Platform Stats:*\n"
+        f"  ✅ Approved Operators: *{total_ops}*\n"
+        f"  ⏳ Pending Review: *{pending_ops}*\n"
+        f"  🎫 Total Bookings: *{total_bookings}* ({confirmed_bk} confirmed)\n"
+        f"  👥 Unique Customers: *{total_customers}*\n"
+        f"  💰 Total Revenue: *MVR {total_revenue:.2f}*\n\n"
+        f"🖼️ Samuga Logo: {'✅ Set' if samuga_logo else '❌ Not set'}\n\n"
+        f"Choose an action below:"
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("👥 Manage Operators",    callback_data="adm_operators"),
+         InlineKeyboardButton("📦 All Bookings",        callback_data="adm_bookings")],
+        [InlineKeyboardButton("📢 Broadcast Message",  callback_data="adm_broadcast"),
+         InlineKeyboardButton("📊 Revenue Report",     callback_data="adm_revenue")],
+        [InlineKeyboardButton("🖼️ Upload Samuga Logo", callback_data="adm_upload_logo"),
+         InlineKeyboardButton("⚙️ Settings",           callback_data="adm_settings")],
+        [InlineKeyboardButton("🔍 Find Customer",      callback_data="adm_find_customer"),
+         InlineKeyboardButton("🚤 All Schedules",      callback_data="adm_schedules")],
+    ])
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+async def admin_check(query, ctx) -> bool:
+    """Check admin access for callbacks"""
+    user = query.from_user
+    if not is_admin(user.id, query.message.chat.id):
+        await query.answer("⛔ Admin only.", show_alert=True)
+        return False
+    return True
 
 async def cmd_urgent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Operator sends urgent review request"""
@@ -703,6 +760,56 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"{'Type /urgent if you need urgent review.' if op['status'] == 'pending' else ''}",
         parse_mode="Markdown")
 
+async def cmd_findcustomer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Find customer by booking ref or telegram ID"""
+    user = update.effective_user
+    if not is_admin(user.id, update.effective_chat.id):
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    args = ctx.args
+    if not args:
+        await update.message.reply_text("Usage: `/findcustomer ST-260629-0389` or `/findcustomer 123456789`", parse_mode="Markdown")
+        return
+    query_str = args[0].strip()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if query_str.startswith("ST-"):
+            bk = await conn.fetchrow("""
+                SELECT b.*, o.business_name FROM bookings b
+                JOIN operators o ON b.operator_id=o.id
+                WHERE b.booking_ref=$1
+            """, query_str)
+        else:
+            try:
+                tg_id = int(query_str)
+                bk = await conn.fetchrow("""
+                    SELECT b.*, o.business_name FROM bookings b
+                    JOIN operators o ON b.operator_id=o.id
+                    WHERE b.customer_telegram_id=$1 ORDER BY b.created_at DESC LIMIT 1
+                """, tg_id)
+            except ValueError:
+                await update.message.reply_text("⚠️ Invalid format. Use booking ref or Telegram ID.")
+                return
+    if not bk:
+        await update.message.reply_text("❌ No booking found.")
+        return
+    icons = {"pending_payment":"⏳","pending_confirmation":"🔄","confirmed":"✅","cancelled":"❌"}
+    ic = icons.get(bk["status"],"❓")
+    msg = (
+        f"🔍 *Booking Found:*\n\n"
+        f"{ic} `{bk['booking_ref']}`\n"
+        f"👤 Customer: {bk['customer_name'] or 'N/A'}\n"
+        f"🆔 Telegram ID: `{bk['customer_telegram_id']}`\n"
+        f"🚤 Operator: {bk['business_name']}\n"
+        f"📅 {bk['travel_date']} | 💰 MVR {bk['total_amount']}\n"
+        f"📊 Status: *{bk['status'].upper()}*\n"
+        f"🕐 Created: {str(bk['created_at'])[:16]}"
+    )
+    btns = [[InlineKeyboardButton("✉️ Message Customer", callback_data=f"msg_customer_{bk['customer_telegram_id']}")]]
+    if bk["status"] == "pending_confirmation":
+        btns.append([InlineKeyboardButton("✅ Force Confirm", callback_data=f"confirm_booking_{bk['id']}")])
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
+
 async def cmd_ops(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """List all approved operators"""
     user = update.effective_user
@@ -764,6 +871,47 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state= sd.get("state", CX_IDLE)
     temp = sd.get("temp_data", {}) or {}
     text = (update.message.text or "").strip()
+
+    # ── ADMIN MESSAGE STATES ─────────────────────────────────────────────────
+    if state == ADMIN_AWAIT_BROADCAST:
+        if is_cancel(text):
+            await set_user_state(user.id, CX_IDLE, {})
+            await update.message.reply_text("❌ Broadcast cancelled.")
+            return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            operators = await conn.fetch("SELECT telegram_id, business_name FROM operators WHERE status='approved'")
+        sent = 0
+        failed = 0
+        for op in operators:
+            try:
+                await ctx.bot.send_message(op["telegram_id"],
+                    f"📢 *Message from Samuga Travels:*\n\n{text}",
+                    parse_mode="Markdown")
+                sent += 1
+            except Exception:
+                failed += 1
+        await set_user_state(user.id, CX_IDLE, {})
+        await update.message.reply_text(
+            f"📢 *Broadcast Complete!*\n\n✅ Sent: {sent}\n❌ Failed: {failed}",
+            parse_mode="Markdown")
+        return
+
+    elif state == ADMIN_AWAIT_REVIEW_TEXT:
+        op_id = (sd.get("temp_data") or {}).get("review_op_id")
+        if op_id and not is_cancel(text):
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "UPDATE operators SET is_recommended=TRUE, review_text=$1 WHERE id=$2 RETURNING telegram_id, business_name",
+                    text, op_id)
+            if row:
+                await ctx.bot.send_message(row["telegram_id"],
+                    f"🌟 *Congratulations!*\n\nYour business is now *Recommended by Samuga Travels!*\n\n💬 _{text}_",
+                    parse_mode="Markdown")
+                await update.message.reply_text(f"🌟 *{row['business_name']}* is now Recommended!", parse_mode="Markdown")
+        await set_user_state(user.id, CX_IDLE, {})
+        return
 
     # ── GLOBAL CANCEL CHECK ──────────────────────────────────────────────────
     if is_cancel(text) and state not in [CX_IDLE, OP_IDLE]:
@@ -1340,6 +1488,20 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
 
 
+    elif state == ADMIN_AWAIT_LOGO:
+        if not is_admin(user.id, update.effective_chat.id):
+            await update.message.reply_text("⛔ Admin only.")
+            return
+        await update.message.reply_text("⏳ Uploading Samuga Travels logo...")
+        url = await upload_image(file_bytes, "branding", "samuga_travels_logo")
+        await set_setting("samuga_logo_url", url)
+        await set_user_state(user.id, CX_IDLE, {})
+        await update.message.reply_text(
+            f"✅ *Samuga Travels logo updated!*\n\n"
+            f"It will now appear on every ticket. 🎫\n\n"
+            f"URL: `{url}`",
+            parse_mode="Markdown")
+
     else:
         await update.message.reply_text("⚠️ Wasn't expecting an image. Use /start to go back.")
 
@@ -1726,6 +1888,147 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 logger.error(f"Cancel notify error: {e}")
 
+    # ── ADMIN PANEL CALLBACKS ──────────────────────────────────────────────────
+    elif data == "adm_operators":
+        if not await admin_check(query, ctx): return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            ops = await conn.fetch("SELECT * FROM operators ORDER BY status, created_at DESC LIMIT 20")
+        if not ops:
+            await query.message.reply_text("No operators found.")
+            return
+        for op in ops:
+            status_icon = {"pending":"⏳","approved":"✅","rejected":"❌"}.get(op["status"],"❓")
+            rec = "🌟 " if op["is_recommended"] else ""
+            msg = (
+                f"{status_icon} {rec}*{op['business_name']}*\n"
+                f"🛥️ {op['boat_name']} | 💺 {op['seat_count']} seats\n"
+                f"👤 @{op['telegram_username'] or 'N/A'} (`{op['telegram_id']}`)\n"
+                f"📞 {op['owner_contact'] or 'N/A'}\n"
+                f"📅 {str(op['created_at'])[:10]}"
+            )
+            btns = []
+            if op["status"] != "approved":
+                btns.append([InlineKeyboardButton("✅ Approve", callback_data=f"approve_op_{op['id']}"),
+                             InlineKeyboardButton("❌ Reject",  callback_data=f"reject_op_{op['id']}")])
+            btns.append([
+                InlineKeyboardButton("🌟 Recommend" if not op["is_recommended"] else "⭐ Un-recommend",
+                    callback_data=f"admin_recommend_{op['id']}" if not op["is_recommended"] else f"admin_unrecommend_{op['id']}"),
+                InlineKeyboardButton("🔄 Reset", callback_data=f"admin_reset_{op['id']}"),
+                InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_delete_{op['id']}")
+            ])
+            await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
+
+    elif data == "adm_bookings":
+        if not await admin_check(query, ctx): return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            bks = await conn.fetch("""
+                SELECT b.*, o.business_name FROM bookings b
+                JOIN operators o ON b.operator_id=o.id
+                ORDER BY b.created_at DESC LIMIT 15
+            """)
+        if not bks:
+            await query.message.reply_text("No bookings yet.")
+            return
+        icons = {"pending_payment":"⏳","pending_confirmation":"🔄","confirmed":"✅","cancelled":"❌"}
+        msg = "📦 *Recent Bookings:*\n\n"
+        for b in bks:
+            ic = icons.get(b["status"],"❓")
+            msg += (f"{ic} `{b['booking_ref']}` — {b['business_name']}\n"
+                   f"   👤 {b['customer_name'] or 'N/A'} | 📅 {b['travel_date']} | MVR {b['total_amount']}\n\n")
+        await query.message.reply_text(msg, parse_mode="Markdown")
+
+    elif data == "adm_revenue":
+        if not await admin_check(query, ctx): return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            today_rev = await conn.fetchval(
+                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed' AND created_at::date=CURRENT_DATE")
+            week_rev = await conn.fetchval(
+                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed' AND created_at >= NOW()-INTERVAL '7 days'")
+            month_rev = await conn.fetchval(
+                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed' AND created_at >= NOW()-INTERVAL '30 days'")
+            total_rev = await conn.fetchval(
+                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed'")
+            top_ops = await conn.fetch("""
+                SELECT o.business_name, COUNT(*) as bookings, SUM(b.total_amount) as revenue
+                FROM bookings b JOIN operators o ON b.operator_id=o.id
+                WHERE b.status='confirmed'
+                GROUP BY o.business_name ORDER BY revenue DESC LIMIT 5
+            """)
+        msg = (
+            f"💰 *Revenue Report*\n\n"
+            f"📅 Today: *MVR {today_rev:.2f}*\n"
+            f"📅 This Week: *MVR {week_rev:.2f}*\n"
+            f"📅 This Month: *MVR {month_rev:.2f}*\n"
+            f"📈 All Time: *MVR {total_rev:.2f}*\n\n"
+            f"🏆 *Top Operators:*\n"
+        )
+        for i, op in enumerate(top_ops, 1):
+            msg += f"  {i}. {op['business_name']} — {op['bookings']} bookings | MVR {op['revenue']:.2f}\n"
+        await query.message.reply_text(msg, parse_mode="Markdown")
+
+    elif data == "adm_broadcast":
+        if not await admin_check(query, ctx): return
+        await set_user_state(user.id, ADMIN_AWAIT_BROADCAST, {})
+        await query.message.reply_text(
+            "📢 *Broadcast Message*\n\n"
+            "Type the message to send to *all approved operators*:\n\n"
+            "_Type_ `cancel` _to abort._",
+            parse_mode="Markdown")
+
+    elif data == "adm_upload_logo":
+        if not await admin_check(query, ctx): return
+        await set_user_state(user.id, ADMIN_AWAIT_LOGO, {})
+        await query.message.reply_text(
+            "🖼️ *Upload Samuga Travels Logo*\n\n"
+            "Send the logo image now and it will appear on every ticket! 🎫",
+            parse_mode="Markdown")
+
+    elif data == "adm_settings":
+        if not await admin_check(query, ctx): return
+        samuga_logo = await get_setting("samuga_logo_url", "Not set")
+        msg = (
+            f"⚙️ *Settings*\n\n"
+            f"🖼️ Samuga Logo URL:\n`{samuga_logo[:60]}...`\n\n"
+            f"_More settings coming soon_"
+        )
+        await query.message.reply_text(msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🖼️ Update Logo", callback_data="adm_upload_logo")],
+                [InlineKeyboardButton("🔙 Back to Admin", callback_data="adm_back")]
+            ]))
+
+    elif data == "adm_schedules":
+        if not await admin_check(query, ctx): return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            scheds = await conn.fetch("""
+                SELECT s.*, o.business_name FROM schedules s
+                JOIN operators o ON s.operator_id=o.id
+                WHERE s.is_active=TRUE ORDER BY o.business_name, s.departure_time
+            """)
+        if not scheds:
+            await query.message.reply_text("No active schedules.")
+            return
+        msg = "🚤 *All Active Schedules:*\n\n"
+        for s in scheds:
+            msg += (f"🏢 *{s['business_name']}*\n"
+                   f"  ⏰ {s['departure_time']} | {s['route_from']} → {s['route_to']}\n"
+                   f"  📌 {s.get('location','N/A')} | 💺 {s['available_seats']} seats | MVR {s['price_per_seat']}\n\n")
+        await query.message.reply_text(msg[:4000], parse_mode="Markdown")
+
+    elif data == "adm_find_customer":
+        if not await admin_check(query, ctx): return
+        await query.message.reply_text(
+            "🔍 Use: `/findcustomer <booking_ref or telegram_id>`\n\nExample: `/findcustomer ST-260629-0389`",
+            parse_mode="Markdown")
+
+    elif data == "adm_back":
+        if not await admin_check(query, ctx): return
+        await query.message.reply_text("Back to admin — type /admin", parse_mode="Markdown")
+
     elif data.startswith("urgent_review_"):
         op_id = int(data.split("_")[-1])
         pool = await get_pool()
@@ -1975,6 +2278,147 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown")
             except Exception as e:
                 logger.error(f"Cancel notify error: {e}")
+
+    # ── ADMIN PANEL CALLBACKS ──────────────────────────────────────────────────
+    elif data == "adm_operators":
+        if not await admin_check(query, ctx): return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            ops = await conn.fetch("SELECT * FROM operators ORDER BY status, created_at DESC LIMIT 20")
+        if not ops:
+            await query.message.reply_text("No operators found.")
+            return
+        for op in ops:
+            status_icon = {"pending":"⏳","approved":"✅","rejected":"❌"}.get(op["status"],"❓")
+            rec = "🌟 " if op["is_recommended"] else ""
+            msg = (
+                f"{status_icon} {rec}*{op['business_name']}*\n"
+                f"🛥️ {op['boat_name']} | 💺 {op['seat_count']} seats\n"
+                f"👤 @{op['telegram_username'] or 'N/A'} (`{op['telegram_id']}`)\n"
+                f"📞 {op['owner_contact'] or 'N/A'}\n"
+                f"📅 {str(op['created_at'])[:10]}"
+            )
+            btns = []
+            if op["status"] != "approved":
+                btns.append([InlineKeyboardButton("✅ Approve", callback_data=f"approve_op_{op['id']}"),
+                             InlineKeyboardButton("❌ Reject",  callback_data=f"reject_op_{op['id']}")])
+            btns.append([
+                InlineKeyboardButton("🌟 Recommend" if not op["is_recommended"] else "⭐ Un-recommend",
+                    callback_data=f"admin_recommend_{op['id']}" if not op["is_recommended"] else f"admin_unrecommend_{op['id']}"),
+                InlineKeyboardButton("🔄 Reset", callback_data=f"admin_reset_{op['id']}"),
+                InlineKeyboardButton("🗑️ Delete", callback_data=f"admin_delete_{op['id']}")
+            ])
+            await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
+
+    elif data == "adm_bookings":
+        if not await admin_check(query, ctx): return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            bks = await conn.fetch("""
+                SELECT b.*, o.business_name FROM bookings b
+                JOIN operators o ON b.operator_id=o.id
+                ORDER BY b.created_at DESC LIMIT 15
+            """)
+        if not bks:
+            await query.message.reply_text("No bookings yet.")
+            return
+        icons = {"pending_payment":"⏳","pending_confirmation":"🔄","confirmed":"✅","cancelled":"❌"}
+        msg = "📦 *Recent Bookings:*\n\n"
+        for b in bks:
+            ic = icons.get(b["status"],"❓")
+            msg += (f"{ic} `{b['booking_ref']}` — {b['business_name']}\n"
+                   f"   👤 {b['customer_name'] or 'N/A'} | 📅 {b['travel_date']} | MVR {b['total_amount']}\n\n")
+        await query.message.reply_text(msg, parse_mode="Markdown")
+
+    elif data == "adm_revenue":
+        if not await admin_check(query, ctx): return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            today_rev = await conn.fetchval(
+                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed' AND created_at::date=CURRENT_DATE")
+            week_rev = await conn.fetchval(
+                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed' AND created_at >= NOW()-INTERVAL '7 days'")
+            month_rev = await conn.fetchval(
+                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed' AND created_at >= NOW()-INTERVAL '30 days'")
+            total_rev = await conn.fetchval(
+                "SELECT COALESCE(SUM(total_amount),0) FROM bookings WHERE status='confirmed'")
+            top_ops = await conn.fetch("""
+                SELECT o.business_name, COUNT(*) as bookings, SUM(b.total_amount) as revenue
+                FROM bookings b JOIN operators o ON b.operator_id=o.id
+                WHERE b.status='confirmed'
+                GROUP BY o.business_name ORDER BY revenue DESC LIMIT 5
+            """)
+        msg = (
+            f"💰 *Revenue Report*\n\n"
+            f"📅 Today: *MVR {today_rev:.2f}*\n"
+            f"📅 This Week: *MVR {week_rev:.2f}*\n"
+            f"📅 This Month: *MVR {month_rev:.2f}*\n"
+            f"📈 All Time: *MVR {total_rev:.2f}*\n\n"
+            f"🏆 *Top Operators:*\n"
+        )
+        for i, op in enumerate(top_ops, 1):
+            msg += f"  {i}. {op['business_name']} — {op['bookings']} bookings | MVR {op['revenue']:.2f}\n"
+        await query.message.reply_text(msg, parse_mode="Markdown")
+
+    elif data == "adm_broadcast":
+        if not await admin_check(query, ctx): return
+        await set_user_state(user.id, ADMIN_AWAIT_BROADCAST, {})
+        await query.message.reply_text(
+            "📢 *Broadcast Message*\n\n"
+            "Type the message to send to *all approved operators*:\n\n"
+            "_Type_ `cancel` _to abort._",
+            parse_mode="Markdown")
+
+    elif data == "adm_upload_logo":
+        if not await admin_check(query, ctx): return
+        await set_user_state(user.id, ADMIN_AWAIT_LOGO, {})
+        await query.message.reply_text(
+            "🖼️ *Upload Samuga Travels Logo*\n\n"
+            "Send the logo image now and it will appear on every ticket! 🎫",
+            parse_mode="Markdown")
+
+    elif data == "adm_settings":
+        if not await admin_check(query, ctx): return
+        samuga_logo = await get_setting("samuga_logo_url", "Not set")
+        msg = (
+            f"⚙️ *Settings*\n\n"
+            f"🖼️ Samuga Logo URL:\n`{samuga_logo[:60]}...`\n\n"
+            f"_More settings coming soon_"
+        )
+        await query.message.reply_text(msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🖼️ Update Logo", callback_data="adm_upload_logo")],
+                [InlineKeyboardButton("🔙 Back to Admin", callback_data="adm_back")]
+            ]))
+
+    elif data == "adm_schedules":
+        if not await admin_check(query, ctx): return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            scheds = await conn.fetch("""
+                SELECT s.*, o.business_name FROM schedules s
+                JOIN operators o ON s.operator_id=o.id
+                WHERE s.is_active=TRUE ORDER BY o.business_name, s.departure_time
+            """)
+        if not scheds:
+            await query.message.reply_text("No active schedules.")
+            return
+        msg = "🚤 *All Active Schedules:*\n\n"
+        for s in scheds:
+            msg += (f"🏢 *{s['business_name']}*\n"
+                   f"  ⏰ {s['departure_time']} | {s['route_from']} → {s['route_to']}\n"
+                   f"  📌 {s.get('location','N/A')} | 💺 {s['available_seats']} seats | MVR {s['price_per_seat']}\n\n")
+        await query.message.reply_text(msg[:4000], parse_mode="Markdown")
+
+    elif data == "adm_find_customer":
+        if not await admin_check(query, ctx): return
+        await query.message.reply_text(
+            "🔍 Use: `/findcustomer <booking_ref or telegram_id>`\n\nExample: `/findcustomer ST-260629-0389`",
+            parse_mode="Markdown")
+
+    elif data == "adm_back":
+        if not await admin_check(query, ctx): return
+        await query.message.reply_text("Back to admin — type /admin", parse_mode="Markdown")
 
     elif data.startswith("urgent_review_"):
         op_id = int(data.split("_")[-1])
@@ -2308,7 +2752,7 @@ async def do_confirm_booking(ctx, booking_id: int, query):
         "location": sched_full["location"] if sched_full and "location" in sched_full.keys() else "Jetty No. 1, Male",
     }
 
-    pdf_bytes = generate_ticket_pdf(booking_dict, op_dict, sched_dict)
+    pdf_bytes = await generate_ticket_pdf(booking_dict, op_dict, sched_dict)
     pdf_file  = io.BytesIO(pdf_bytes)
     pdf_file.name = f"ticket_{booking['booking_ref']}.pdf"
 
@@ -2322,8 +2766,12 @@ async def do_confirm_booking(ctx, booking_id: int, query):
             f"📍 {booking['route_from']} → {booking['route_to']}\n"
             f"📅 {booking['travel_date']} @ {booking['departure_time']}\n\n"
             f"Present this ticket when boarding. Safe travels! 🌊"
-        ), parse_mode="Markdown")
-
+        ),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔍 Book Your Next Trip", callback_data="cx_search")],
+            [InlineKeyboardButton("📋 My Bookings", callback_data="cx_my_bookings")]
+        ]))
     await query.edit_message_caption(
         caption=f"✅ Booking `{booking['booking_ref']}` confirmed! Ticket sent.", parse_mode="Markdown")
 
@@ -2441,8 +2889,9 @@ async def main():
     app.add_handler(CommandHandler("recommend", cmd_recommend))
     app.add_handler(CommandHandler("admin",     cmd_admin))
     app.add_handler(CommandHandler("ops",       cmd_ops))
-    app.add_handler(CommandHandler("urgent",    cmd_urgent))
-    app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("urgent",       cmd_urgent))
+    app.add_handler(CommandHandler("status",       cmd_status))
+    app.add_handler(CommandHandler("findcustomer", cmd_findcustomer))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
