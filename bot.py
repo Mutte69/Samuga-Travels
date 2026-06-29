@@ -57,6 +57,12 @@ OP_AWAIT_BOAT_ADD_CAPACITY="op_await_boat_add_capacity"
 OP_AWAIT_SCHEDULE_LOCATION="op_await_schedule_location"
 OP_AWAIT_SCHEDULE_DAYS="op_await_schedule_days"
 OP_AWAIT_CHANGE_NOTE="op_await_change_note"
+# Bulk schedule setup
+OP_BULK_LOCATION="op_bulk_location"
+OP_BULK_PRICE="op_bulk_price"
+OP_BULK_SEATS="op_bulk_seats"
+OP_BULK_SATHU_DEPS="op_bulk_sathu_deps"
+OP_BULK_FRI_DEPS="op_bulk_fri_deps"
 # Admin states
 ADMIN_AWAIT_BROADCAST="admin_await_broadcast"
 ADMIN_AWAIT_LOGO="admin_await_logo"
@@ -131,8 +137,8 @@ def parse_date_flexible(text: str):
     text = text.strip()
     formats = [
         "%d-%m-%Y", "%d/%m/%Y", "%d.%m.%Y",
-        "%Y-%m-%d",  # ISO format
-        "%d-%m-%y", "%d/%m/%y",  # short year
+        "%Y-%m-%d",
+        "%d-%m-%y", "%d/%m/%y",
     ]
     for fmt in formats:
         try:
@@ -140,6 +146,38 @@ def parse_date_flexible(text: str):
         except ValueError:
             continue
     return None
+
+def parse_bulk_departures(text: str):
+    """
+    Parse multiple departure lines like:
+      10:15 Male to Thoddoo
+      06:45 Thoddoo to Male
+      10:15AM Male to Airport to Thoddoo
+    Returns list of {"time": "10:15", "from": "Male", "to": "Thoddoo"}
+    or None if nothing parseable found.
+    """
+    import re
+    results = []
+    lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+    time_pat = re.compile(r'^(\d{1,2}[:.:]\d{2}\s*(?:AM|PM)?)', re.IGNORECASE)
+    to_pat   = re.compile(r'\bto\b', re.IGNORECASE)
+
+    for line in lines:
+        # Strip leading numbers like "1." or "1)"
+        line = re.sub(r'^\d+[.)\-\s]+', '', line).strip()
+        m = time_pat.match(line)
+        if not m:
+            continue
+        time_str = m.group(1).strip().replace(".", ":").replace(" ", "")
+        rest = line[m.end():].strip()
+        # Split by "to" — first part = from, last part = to (ignoring middle stops for display)
+        parts = to_pat.split(rest)
+        if len(parts) >= 2:
+            frm = parts[0].strip().title()
+            to  = parts[-1].strip().title()
+            if frm and to:
+                results.append({"time": time_str, "from": frm, "to": to})
+    return results if results else None
 
 # ── DB POOL ───────────────────────────────────────────────────────────────────
 _pool = None
@@ -416,34 +454,35 @@ async def generate_ticket_pdf(booking: dict, operator: dict, schedule: dict) -> 
             op_logo_img = RLImage(io.BytesIO(resp.content), width=28*mm, height=28*mm)
         except: pass
 
-    # Header row: ST branding left, operator logo right
-    st_brand = Paragraph(
-        '<font color="#00B4D8"><b>SAMUGA</b></font><font color="#1B6CA8"><b>TRAVELS</b></font>',
-        ParagraphStyle('stb', fontName='Helvetica-Bold', fontSize=13, alignment=0))
-    st_sub = Paragraph(
-        '<font color="#6B8A9E" size="7">Official Travel Partner · Maldives</font>',
-        ParagraphStyle('sts', fontName='Helvetica', fontSize=7, alignment=0))
+    # Header: Samuga logo left (just the logo, no text), operator right
+    from reportlab.platypus import KeepInFrame
 
-    op_name_p = Paragraph(
-        f'<font color="#0D2137"><b>{operator.get("business_name","")}</b></font>',
-        ParagraphStyle('opn', fontName='Helvetica-Bold', fontSize=11, alignment=2))
-    op_contact_p = Paragraph(
-        f'<font color="#6B8A9E" size="8">{operator.get("owner_contact","")}</font>',
-        ParagraphStyle('opc', fontName='Helvetica', fontSize=8, alignment=2))
+    # Left: Samuga logo only — fixed size, no squeezing
+    left_items = []
+    if st_logo_img:
+        st_logo_img.hAlign = 'LEFT'
+        left_items.append(st_logo_img)
 
-    left_cell = [[st_logo_img] if st_logo_img else [], [st_brand], [st_sub]]
-    right_cell_content = []
+    # Right: operator logo + name + contact
+    right_items = []
     if op_logo_img:
-        right_cell_content.append(op_logo_img)
-    right_cell_content.append(op_name_p)
-    right_cell_content.append(op_contact_p)
+        op_logo_img.hAlign = 'RIGHT'
+        right_items.append(op_logo_img)
+    right_items.append(Paragraph(
+        f'<font color="#0D2137"><b>{operator.get("business_name","")}</b></font>',
+        ParagraphStyle('opn', fontName='Helvetica-Bold', fontSize=11, alignment=2)))
+    right_items.append(Paragraph(
+        f'<font color="#6B8A9E" size="8">{operator.get("owner_contact","")}</font>',
+        ParagraphStyle('opc', fontName='Helvetica', fontSize=8, alignment=2)))
 
-    header_table = Table([[left_cell, right_cell_content]], colWidths=[90*mm, 85*mm])
+    header_table = Table([[left_items, right_items]], colWidths=[85*mm, 90*mm])
     header_table.setStyle(TableStyle([
         ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
         ('ALIGN', (0,0), (0,0), 'LEFT'),
         ('ALIGN', (1,0), (1,0), 'RIGHT'),
-        ('PADDING', (0,0), (-1,-1), 4),
+        ('PADDING', (0,0), (-1,-1), 2),
+        ('LEFTPADDING', (0,0), (0,-1), 0),
+        ('RIGHTPADDING', (1,0), (1,-1), 0),
     ]))
     story.append(header_table)
     story.append(HRFlowable(width="100%", thickness=2, color=ST_ACCENT, spaceAfter=4*mm))
@@ -1005,6 +1044,225 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "⏳ We\'ll verify your details and notify you here within 24 hours. Thank you! 🌊",
             parse_mode="Markdown")
 
+    # ── SCHEDULE CHANGE HANDLERS ─────────────────────────────────────────────────
+    elif state == OP_AWAIT_CHANGE_NOTE:
+        t2 = temp or {}
+        change_type = t2.get("change_type")
+        sched_id = t2.get("change_sched_id")
+        from datetime import timedelta as _td4
+        tomorrow = datetime.now().date() + _td4(days=1)
+        pool = await get_pool()
+
+        if change_type == "time":
+            new_time_val = text.strip()
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO schedule_changes (schedule_id, change_date, new_time, note)
+                    VALUES ($1,$2,$3,'Time changed by operator')
+                    ON CONFLICT DO NOTHING
+                """, sched_id, today, new_time_val)
+                sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
+                bookings = await conn.fetch("""
+                    SELECT customer_telegram_id, booking_ref FROM bookings
+                    WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
+                """, sched_id, today)
+            await set_user_state(user.id, OP_IDLE, {})
+            await update.message.reply_text(
+                f"✅ Departure time updated to *{new_time_val}* for today.",
+                parse_mode="Markdown", reply_markup=main_kb("operator"))
+            for bk in bookings:
+                try:
+                    await ctx.bot.send_message(bk["customer_telegram_id"],
+                        f"⏰ *Schedule Update*\n\nYour booking `{bk['booking_ref']}` has a time change:\n\n"
+                        f"New departure time: *{new_time_val}*\n"
+                        f"📌 {sched.get('location','Jetty No. 1, Male')}\n\nSorry for any inconvenience! 🙏",
+                        parse_mode="Markdown")
+                except: pass
+
+        elif change_type == "route":
+            stops = [s.strip().title() for s in text.split(",") if s.strip()]
+            if len(stops) < 2:
+                await update.message.reply_text("⚠️ Enter at least 2 stops e.g. `Male, Gulhi, Maafushi`", parse_mode="Markdown")
+                return
+            route_display = " → ".join(stops)
+            import json as _j
+            async with pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO schedule_changes (schedule_id, change_date, note)
+                    VALUES ($1,$2,$3)
+                    ON CONFLICT DO NOTHING
+                """, sched_id, tomorrow, f"Route changed: {route_display}")
+                bookings = await conn.fetch("""
+                    SELECT customer_telegram_id, booking_ref FROM bookings
+                    WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
+                """, sched_id, today)
+            await set_user_state(user.id, OP_IDLE, {})
+            await update.message.reply_text(
+                f"✅ Route updated to *{route_display}* for today.",
+                parse_mode="Markdown", reply_markup=main_kb("operator"))
+            for bk in bookings:
+                try:
+                    await ctx.bot.send_message(bk["customer_telegram_id"],
+                        f"🗺️ *Route Update*\n\nYour booking `{bk['booking_ref']}` route has changed:\n\n"
+                        f"New route: *{route_display}*\n\nSorry for any inconvenience! 🙏",
+                        parse_mode="Markdown")
+                except: pass
+
+    # ── BULK SCHEDULE SETUP FLOW ─────────────────────────────────────────────────
+    elif state == OP_BULK_LOCATION:
+        stops = [s.strip().title() for s in text.split(",") if s.strip()]
+        if len(stops) < 2:
+            await update.message.reply_text(
+                "⚠️ Enter at least 2 stops e.g. `Male, Airport, Thoddoo`",
+                parse_mode="Markdown")
+            return
+        route_display = " → ".join(stops)
+        await set_user_state(user.id, OP_BULK_SATHU_DEPS,
+                             {**temp, "bulk_stops": stops, "bulk_route": route_display})
+        await update.message.reply_text(
+            f"✅ Route: *{route_display}*\n\n"
+            f"*Step 2:* What is your *departure location/jetty*?\n\n"
+            f"_Example: Jetty No. 1, Male_",
+            parse_mode="Markdown")
+
+    elif state == OP_BULK_SATHU_DEPS:
+        # First message after route — might be location or departures
+        if not temp.get("bulk_location"):
+            # This is the location step
+            location = text.strip()
+            await set_user_state(user.id, OP_BULK_SATHU_DEPS,
+                                 {**temp, "bulk_location": location})
+            stops = temp.get("bulk_stops", [])
+            route_display = temp.get("bulk_route", "")
+            example = (
+                f"10:15 {stops[0]} to {stops[-1]}\n"
+                f"16:00 {stops[0]} to {stops[-1]}\n"
+                f"06:45 {stops[-1]} to {stops[0]}\n"
+                f"13:00 {stops[-1]} to {stops[0]}"
+            )
+            await update.message.reply_text(
+                f"✅ Location: *{location}*\n\n"
+                f"*Step 3:* Enter your *Saturday–Thursday departures*\n"
+                f"_(one per line: TIME FROM to TO)_\n\n"
+                f"_Example:_\n`{example}`\n\n"
+                f"_Use 24hr or 12hr time. Direction matters!_",
+                parse_mode="Markdown")
+            return
+        # This is the Sat-Thu departures
+        deps = parse_bulk_departures(text)
+        if not deps:
+            await update.message.reply_text(
+                "⚠️ Couldn't read departures. Use format:\n"
+                "`10:15 Male to Thoddoo`\n"
+                "`06:45 Thoddoo to Male`",
+                parse_mode="Markdown")
+            return
+        await set_user_state(user.id, OP_BULK_FRI_DEPS,
+                             {**temp, "bulk_sathu": deps})
+        await update.message.reply_text(
+            f"✅ Got *{len(deps)} Sat–Thu departures!*\n\n"
+            f"*Step 4:* Do your *Friday departures differ*?\n\n"
+            f"• Type your Friday departures if different\n"
+            f"• Type `same` if Friday is the same\n"
+            f"• Type `skip` if you don't operate on Fridays",
+            parse_mode="Markdown")
+
+    elif state == OP_BULK_FRI_DEPS:
+        if not temp.get("bulk_price"):
+            # This is Friday deps step
+            fri_deps = None
+            if is_skip(text):
+                fri_deps = []
+            elif text.strip().lower() == "same":
+                fri_deps = temp.get("bulk_sathu", [])
+            else:
+                fri_deps = parse_bulk_departures(text)
+                if fri_deps is None:
+                    await update.message.reply_text(
+                        "⚠️ Couldn't read Friday departures.\n"
+                        "Type `same`, `skip`, or list times like:\n`10:00 Male to Thoddoo`",
+                        parse_mode="Markdown")
+                    return
+            await set_user_state(user.id, OP_BULK_PRICE,
+                                 {**temp, "bulk_fri": fri_deps})
+            fri_msg = f"{len(fri_deps)} Friday departures" if fri_deps else "No Friday service"
+            await update.message.reply_text(
+                f"✅ *{fri_msg}*\n\n"
+                f"*Step 5:* What is the *price per seat* (MVR)?\n\n"
+                f"_Example: 535_",
+                parse_mode="Markdown")
+            return
+
+    elif state == OP_BULK_PRICE:
+        price = parse_price(text)
+        if not price or price <= 0:
+            await update.message.reply_text("⚠️ Enter valid price e.g. `535`", parse_mode="Markdown")
+            return
+        await set_user_state(user.id, OP_BULK_SEATS, {**temp, "bulk_price": price})
+        await update.message.reply_text(
+            f"✅ Price: *MVR {price}/seat*\n\n"
+            f"*Step 6:* How many *seats per departure*?\n\n"
+            f"_Example: 18_",
+            parse_mode="Markdown")
+
+    elif state == OP_BULK_SEATS:
+        seats = parse_number(text)
+        if not seats or seats < 1:
+            await update.message.reply_text("⚠️ Enter valid number e.g. `18`", parse_mode="Markdown")
+            return
+        # Build all schedules
+        op = await get_operator(user.id)
+        stops       = temp.get("bulk_stops", [])
+        location    = temp.get("bulk_location", "Jetty No. 1, Male")
+        price       = temp.get("bulk_price", 0)
+        sathu_deps  = temp.get("bulk_sathu", [])
+        fri_deps    = temp.get("bulk_fri", [])
+        import json as _j
+
+        pool = await get_pool()
+        created = 0
+        async with pool.acquire() as conn:
+            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS sched_stops TEXT DEFAULT '[]'")
+            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS location TEXT DEFAULT 'Jetty No. 1, Male'")
+            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS run_days TEXT DEFAULT 'daily'")
+            await conn.execute("ALTER TABLE schedules ADD COLUMN IF NOT EXISTS boat_name TEXT")
+            for dep in sathu_deps:
+                await conn.execute("""
+                    INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
+                                           price_per_seat, total_seats, available_seats,
+                                           sched_stops, location, run_days)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'sat-thu')
+                """, op["id"], dep["from"], dep["to"], dep["time"],
+                    price, seats, seats, _j.dumps(stops), location)
+                created += 1
+            for dep in fri_deps:
+                await conn.execute("""
+                    INSERT INTO schedules (operator_id, route_from, route_to, departure_time,
+                                           price_per_seat, total_seats, available_seats,
+                                           sched_stops, location, run_days)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'fri')
+                """, op["id"], dep["from"], dep["to"], dep["time"],
+                    price, seats, seats, _j.dumps(stops), location)
+                created += 1
+
+        await set_user_state(user.id, OP_IDLE, {})
+
+        # Build summary
+        route_display = temp.get("bulk_route","")
+        sathu_lines = "\n".join([f"  ⏰ {d['time']} — {d['from']} → {d['to']}" for d in sathu_deps])
+        fri_lines   = "\n".join([f"  ⏰ {d['time']} — {d['from']} → {d['to']}" for d in fri_deps]) if fri_deps else "  _No Friday service_"
+
+        await update.message.reply_text(
+            f"🎉 *{created} Schedules Created!*\n\n"
+            f"📍 Route: *{route_display}*\n"
+            f"📌 Location: *{location}*\n"
+            f"💰 Price: *MVR {price}/seat*\n"
+            f"💺 Seats: *{seats} per departure*\n\n"
+            f"*Sat–Thu ({len(sathu_deps)} departures):*\n{sathu_lines}\n\n"
+            f"*Friday ({len(fri_deps)} departures):*\n{fri_lines}\n\n"
+            f"✅ All schedules are now live for customers!",
+            parse_mode="Markdown", reply_markup=main_kb("operator"))
+
     # ── FLEET / BOAT ADD FLOW ────────────────────────────────────────────────────
     elif state == OP_AWAIT_BOAT_ADD_NAME:
         boat_name = text.strip()
@@ -1271,19 +1529,22 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⚠️ Only *{temp.get('sel_seats')} seats* available.", parse_mode="Markdown")
             return
         # Build example format based on count
-        example_lines = "\n".join([f"{i+1}. Full Name, ID Number" for i in range(count)])
-        example_filled = "\n".join([
-            "1. Ahmed Ali, A123456",
-            "2. Fatima Mohamed, A654321",
-            "3. Hassan Ali, A789012"
-        ][:count])
+        cx_name = temp.get("cx_name", "You")
+        # Build example with booker's name as passenger 1
+        example_lines = []
+        example_lines.append(f"1. {cx_name}, (your ID/passport number)")
+        for i in range(1, count):
+            example_lines.append(f"{i+1}. Full Name, ID/Passport Number")
+        example_str = "\n".join(example_lines)
+
         await set_user_state(user.id, CX_COLLECTING_PASSENGERS,
                              {**temp, "passenger_count": count, "passengers_collected": [], "current_passenger": 1})
         await update.message.reply_text(
             f"👥 *Enter all {count} passenger(s) at once:*\n\n"
-            f"_Format — one per line:_\n`Name, ID Number`\n\n"
-            f"_Example:_\n`{example_filled}`\n\n"
-            f"Send all {count} passengers in one message 👇",
+            f"_One per line — Name, ID or Passport Number_\n\n"
+            f"_Example:_\n`{example_str}`\n\n"
+            f"📌 ID card for Maldivians, Passport number for foreigners\n\n"
+            f"Send all {count} in one message 👇",
             parse_mode="Markdown")
 
     elif state == CX_COLLECTING_PASSENGERS:
@@ -1763,9 +2024,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         from datetime import timedelta as _td
         today = datetime.now().date()
+        tomorrow = today + _td(days=1)
         pool = await get_pool()
         async with pool.acquire() as conn:
-            scheds = await conn.fetch("""
+            # Today — view only
+            scheds_today = await conn.fetch("""
                 SELECT s.*, COALESCE(sc.new_boat_name, s.boat_name) as active_boat,
                        COALESCE(sc.new_time, s.departure_time) as active_time,
                        sc.note as change_note
@@ -1774,33 +2037,64 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 WHERE s.operator_id=$2 AND s.is_active=TRUE
                 ORDER BY s.departure_time
             """, today, op["id"])
-            # Count bookings for each schedule today
             bookings_today = await conn.fetch("""
-                SELECT schedule_id, COUNT(*) as count, SUM(passenger_count) as pax
+                SELECT schedule_id, COUNT(*) as cnt, SUM(passenger_count) as pax
                 FROM bookings WHERE travel_date=$1 AND status='confirmed' AND operator_id=$2
                 GROUP BY schedule_id
             """, today, op["id"])
-        booking_map = {b["schedule_id"]: b for b in bookings_today}
-        if not scheds:
-            await query.message.reply_text("📅 No schedules found.")
-            return
-        msg = f"📅 *Today's Schedule — {today.strftime('%A, %d %b')}*\n\n"
-        buttons = []
-        for s in scheds:
-            bk = booking_map.get(s["id"])
-            pax = bk["pax"] if bk else 0
-            count = bk["count"] if bk else 0
-            change_note = f"\n⚠️ *Change:* {s['change_note']}" if s.get("change_note") else ""
+            # Tomorrow — with change buttons
+            scheds_tmr = await conn.fetch("""
+                SELECT s.*, COALESCE(sc.new_boat_name, s.boat_name) as active_boat,
+                       COALESCE(sc.new_time, s.departure_time) as active_time,
+                       sc.note as change_note
+                FROM schedules s
+                LEFT JOIN schedule_changes sc ON sc.schedule_id=s.id AND sc.change_date=$1
+                WHERE s.operator_id=$2 AND s.is_active=TRUE
+                ORDER BY s.departure_time
+            """, tomorrow, op["id"])
+            bookings_tmr = await conn.fetch("""
+                SELECT schedule_id, COUNT(*) as cnt, SUM(passenger_count) as pax
+                FROM bookings WHERE travel_date=$1 AND status='confirmed' AND operator_id=$2
+                GROUP BY schedule_id
+            """, tomorrow, op["id"])
+
+        bk_map_today = {b["schedule_id"]: b for b in bookings_today}
+        bk_map_tmr   = {b["schedule_id"]: b for b in bookings_tmr}
+
+        msg = f"📅 *Today — {today.strftime('%A, %d %b')}*\n\n"
+        if not scheds_today:
+            msg += "_No schedules today._\n"
+        for s in scheds_today:
+            bk = bk_map_today.get(s["id"])
+            pax   = bk["pax"]  if bk else 0
+            cnt   = bk["cnt"]  if bk else 0
+            chng  = f" ⚠️ {s['change_note']}" if s.get("change_note") else ""
             msg += (
                 f"⏰ *{s['active_time']}* — {s['route_from']} → {s['route_to']}\n"
-                f"🚤 {s['active_boat'] or 'Default boat'}\n"
-                f"📌 {s.get('location','Jetty No. 1, Male')}\n"
-                f"🎫 {count} bookings | 👥 {pax} passengers{change_note}\n\n"
+                f"🚤 {s['active_boat'] or 'Default'} | 📌 {s.get('location','Jetty No. 1, Male')}\n"
+                f"🎫 {cnt} bookings | 👥 {pax} pax{chng}\n\n"
+            )
+
+        msg += f"\n📅 *Tomorrow — {tomorrow.strftime('%A, %d %b')}* _(tap to manage)_\n\n"
+        buttons = []
+        if not scheds_tmr:
+            msg += "_No schedules tomorrow._\n"
+        for s in scheds_tmr:
+            bk = bk_map_tmr.get(s["id"])
+            pax   = bk["pax"]  if bk else 0
+            cnt   = bk["cnt"]  if bk else 0
+            chng  = f" ⚠️ {s['change_note']}" if s.get("change_note") else ""
+            msg += (
+                f"⏰ *{s['active_time']}* — {s['route_from']} → {s['route_to']}\n"
+                f"🚤 {s['active_boat'] or 'Default'} | 📌 {s.get('location','Jetty No. 1, Male')}\n"
+                f"🎫 {cnt} bookings | 👥 {pax} pax{chng}\n\n"
             )
             buttons.append([InlineKeyboardButton(
-                f"✏️ Change {s['active_time']} schedule",
+                f"✏️ Manage {s['active_time']} — {s['route_from']} → {s['route_to']}",
                 callback_data=f"change_sched_{s['id']}")])
-        await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+        await query.message.reply_text(msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
 
     elif data.startswith("change_sched_"):
         sched_id = int(data.split("_")[-1])
@@ -1818,26 +2112,42 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"🚤 Swap to {b['boat_name']}",
                 callback_data=f"swap_boat_{sched_id}_{b['boat_name']}")])
         buttons.append([InlineKeyboardButton("⏰ Change Time", callback_data=f"swap_time_{sched_id}")])
+        buttons.append([InlineKeyboardButton("🗺️ Change Route", callback_data=f"swap_route_{sched_id}")])
         buttons.append([InlineKeyboardButton("❌ Cancel Today's Departure", callback_data=f"cancel_today_{sched_id}")])
         await query.message.reply_text(
-            f"✏️ *Change Today's Schedule*\n\n"
+            f"✏️ *Manage Tomorrow's Schedule*\n\n"
             f"⏰ {sched['departure_time']} — {sched['route_from']} → {sched['route_to']}\n"
             f"📌 {sched.get('location','Jetty No. 1, Male')}\n\n"
-            f"What would you like to change?",
+            f"What would you like to change for tomorrow?",
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("swap_time_"):
+        sched_id = int(data.split("_")[-1])
+        await set_user_state(user.id, OP_AWAIT_CHANGE_NOTE, {"change_type": "time", "change_sched_id": sched_id})
+        await query.message.reply_text(
+            "⏰ *Change Today's Departure Time*\n\nEnter the new time:\n_Example: 05:00 PM_",
+            parse_mode="Markdown")
+
+    elif data.startswith("swap_route_"):
+        sched_id = int(data.split("_")[-1])
+        await set_user_state(user.id, OP_AWAIT_CHANGE_NOTE, {"change_type": "route", "change_sched_id": sched_id})
+        await query.message.reply_text(
+            "🗺️ *Change Today's Route*\n\nEnter new stops comma-separated:\n_Example: Male, Gulhi, Maafushi_",
+            parse_mode="Markdown")
 
     elif data.startswith("swap_boat_"):
         parts_s = data.split("_", 3)
         sched_id = int(parts_s[2])
         new_boat = parts_s[3]
-        today = datetime.now().date()
+        from datetime import timedelta as _td2
+        tomorrow = datetime.now().date() + _td2(days=1)
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO schedule_changes (schedule_id, change_date, new_boat_name, note)
                 VALUES ($1,$2,$3,'Boat swapped by operator')
                 ON CONFLICT DO NOTHING
-            """, sched_id, today, new_boat)
+            """, sched_id, tomorrow, new_boat)
             sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
             # Notify confirmed customers for today
             bookings = await conn.fetch("""
@@ -1862,14 +2172,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("cancel_today_"):
         sched_id = int(data.split("_")[-1])
-        today = datetime.now().date()
+        from datetime import timedelta as _td3
+        tomorrow = datetime.now().date() + _td3(days=1)
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO schedule_changes (schedule_id, change_date, note, status)
-                VALUES ($1,$2,'Departure cancelled for today','cancelled')
+                VALUES ($1,$2,"Departure cancelled for tomorrow",'cancelled')
                 ON CONFLICT DO NOTHING
-            """, sched_id, today)
+            """, sched_id, tomorrow)
             sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
             bookings = await conn.fetch("""
                 SELECT customer_telegram_id, booking_ref FROM bookings
@@ -2154,9 +2465,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         from datetime import timedelta as _td
         today = datetime.now().date()
+        tomorrow = today + _td(days=1)
         pool = await get_pool()
         async with pool.acquire() as conn:
-            scheds = await conn.fetch("""
+            # Today — view only
+            scheds_today = await conn.fetch("""
                 SELECT s.*, COALESCE(sc.new_boat_name, s.boat_name) as active_boat,
                        COALESCE(sc.new_time, s.departure_time) as active_time,
                        sc.note as change_note
@@ -2165,33 +2478,64 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 WHERE s.operator_id=$2 AND s.is_active=TRUE
                 ORDER BY s.departure_time
             """, today, op["id"])
-            # Count bookings for each schedule today
             bookings_today = await conn.fetch("""
-                SELECT schedule_id, COUNT(*) as count, SUM(passenger_count) as pax
+                SELECT schedule_id, COUNT(*) as cnt, SUM(passenger_count) as pax
                 FROM bookings WHERE travel_date=$1 AND status='confirmed' AND operator_id=$2
                 GROUP BY schedule_id
             """, today, op["id"])
-        booking_map = {b["schedule_id"]: b for b in bookings_today}
-        if not scheds:
-            await query.message.reply_text("📅 No schedules found.")
-            return
-        msg = f"📅 *Today's Schedule — {today.strftime('%A, %d %b')}*\n\n"
-        buttons = []
-        for s in scheds:
-            bk = booking_map.get(s["id"])
-            pax = bk["pax"] if bk else 0
-            count = bk["count"] if bk else 0
-            change_note = f"\n⚠️ *Change:* {s['change_note']}" if s.get("change_note") else ""
+            # Tomorrow — with change buttons
+            scheds_tmr = await conn.fetch("""
+                SELECT s.*, COALESCE(sc.new_boat_name, s.boat_name) as active_boat,
+                       COALESCE(sc.new_time, s.departure_time) as active_time,
+                       sc.note as change_note
+                FROM schedules s
+                LEFT JOIN schedule_changes sc ON sc.schedule_id=s.id AND sc.change_date=$1
+                WHERE s.operator_id=$2 AND s.is_active=TRUE
+                ORDER BY s.departure_time
+            """, tomorrow, op["id"])
+            bookings_tmr = await conn.fetch("""
+                SELECT schedule_id, COUNT(*) as cnt, SUM(passenger_count) as pax
+                FROM bookings WHERE travel_date=$1 AND status='confirmed' AND operator_id=$2
+                GROUP BY schedule_id
+            """, tomorrow, op["id"])
+
+        bk_map_today = {b["schedule_id"]: b for b in bookings_today}
+        bk_map_tmr   = {b["schedule_id"]: b for b in bookings_tmr}
+
+        msg = f"📅 *Today — {today.strftime('%A, %d %b')}*\n\n"
+        if not scheds_today:
+            msg += "_No schedules today._\n"
+        for s in scheds_today:
+            bk = bk_map_today.get(s["id"])
+            pax   = bk["pax"]  if bk else 0
+            cnt   = bk["cnt"]  if bk else 0
+            chng  = f" ⚠️ {s['change_note']}" if s.get("change_note") else ""
             msg += (
                 f"⏰ *{s['active_time']}* — {s['route_from']} → {s['route_to']}\n"
-                f"🚤 {s['active_boat'] or 'Default boat'}\n"
-                f"📌 {s.get('location','Jetty No. 1, Male')}\n"
-                f"🎫 {count} bookings | 👥 {pax} passengers{change_note}\n\n"
+                f"🚤 {s['active_boat'] or 'Default'} | 📌 {s.get('location','Jetty No. 1, Male')}\n"
+                f"🎫 {cnt} bookings | 👥 {pax} pax{chng}\n\n"
+            )
+
+        msg += f"\n📅 *Tomorrow — {tomorrow.strftime('%A, %d %b')}* _(tap to manage)_\n\n"
+        buttons = []
+        if not scheds_tmr:
+            msg += "_No schedules tomorrow._\n"
+        for s in scheds_tmr:
+            bk = bk_map_tmr.get(s["id"])
+            pax   = bk["pax"]  if bk else 0
+            cnt   = bk["cnt"]  if bk else 0
+            chng  = f" ⚠️ {s['change_note']}" if s.get("change_note") else ""
+            msg += (
+                f"⏰ *{s['active_time']}* — {s['route_from']} → {s['route_to']}\n"
+                f"🚤 {s['active_boat'] or 'Default'} | 📌 {s.get('location','Jetty No. 1, Male')}\n"
+                f"🎫 {cnt} bookings | 👥 {pax} pax{chng}\n\n"
             )
             buttons.append([InlineKeyboardButton(
-                f"✏️ Change {s['active_time']} schedule",
+                f"✏️ Manage {s['active_time']} — {s['route_from']} → {s['route_to']}",
                 callback_data=f"change_sched_{s['id']}")])
-        await query.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+        await query.message.reply_text(msg, parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
 
     elif data.startswith("change_sched_"):
         sched_id = int(data.split("_")[-1])
@@ -2209,26 +2553,42 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"🚤 Swap to {b['boat_name']}",
                 callback_data=f"swap_boat_{sched_id}_{b['boat_name']}")])
         buttons.append([InlineKeyboardButton("⏰ Change Time", callback_data=f"swap_time_{sched_id}")])
+        buttons.append([InlineKeyboardButton("🗺️ Change Route", callback_data=f"swap_route_{sched_id}")])
         buttons.append([InlineKeyboardButton("❌ Cancel Today's Departure", callback_data=f"cancel_today_{sched_id}")])
         await query.message.reply_text(
-            f"✏️ *Change Today's Schedule*\n\n"
+            f"✏️ *Manage Tomorrow's Schedule*\n\n"
             f"⏰ {sched['departure_time']} — {sched['route_from']} → {sched['route_to']}\n"
             f"📌 {sched.get('location','Jetty No. 1, Male')}\n\n"
-            f"What would you like to change?",
+            f"What would you like to change for tomorrow?",
             parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+    elif data.startswith("swap_time_"):
+        sched_id = int(data.split("_")[-1])
+        await set_user_state(user.id, OP_AWAIT_CHANGE_NOTE, {"change_type": "time", "change_sched_id": sched_id})
+        await query.message.reply_text(
+            "⏰ *Change Today's Departure Time*\n\nEnter the new time:\n_Example: 05:00 PM_",
+            parse_mode="Markdown")
+
+    elif data.startswith("swap_route_"):
+        sched_id = int(data.split("_")[-1])
+        await set_user_state(user.id, OP_AWAIT_CHANGE_NOTE, {"change_type": "route", "change_sched_id": sched_id})
+        await query.message.reply_text(
+            "🗺️ *Change Today's Route*\n\nEnter new stops comma-separated:\n_Example: Male, Gulhi, Maafushi_",
+            parse_mode="Markdown")
 
     elif data.startswith("swap_boat_"):
         parts_s = data.split("_", 3)
         sched_id = int(parts_s[2])
         new_boat = parts_s[3]
-        today = datetime.now().date()
+        from datetime import timedelta as _td2
+        tomorrow = datetime.now().date() + _td2(days=1)
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO schedule_changes (schedule_id, change_date, new_boat_name, note)
                 VALUES ($1,$2,$3,'Boat swapped by operator')
                 ON CONFLICT DO NOTHING
-            """, sched_id, today, new_boat)
+            """, sched_id, tomorrow, new_boat)
             sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
             # Notify confirmed customers for today
             bookings = await conn.fetch("""
@@ -2253,14 +2613,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif data.startswith("cancel_today_"):
         sched_id = int(data.split("_")[-1])
-        today = datetime.now().date()
+        from datetime import timedelta as _td3
+        tomorrow = datetime.now().date() + _td3(days=1)
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute("""
                 INSERT INTO schedule_changes (schedule_id, change_date, note, status)
-                VALUES ($1,$2,'Departure cancelled for today','cancelled')
+                VALUES ($1,$2,"Departure cancelled for tomorrow",'cancelled')
                 ON CONFLICT DO NOTHING
-            """, sched_id, today)
+            """, sched_id, tomorrow)
             sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
             bookings = await conn.fetch("""
                 SELECT customer_telegram_id, booking_ref FROM bookings
@@ -2532,9 +2893,35 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not op or op.get("status") != "approved":
             await query.message.reply_text("⚠️ Account not yet approved.")
             return
+        await query.message.reply_text(
+            "🗓️ *Add Schedules*\n\nHow would you like to add?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📋 Bulk Setup (recommended)", callback_data="op_bulk_setup")],
+                [InlineKeyboardButton("➕ Add Single Schedule", callback_data="op_single_schedule")],
+            ]))
+
+    elif data == "op_single_schedule":
+        op = await get_operator(user.id)
+        if not op or op.get("status") != "approved":
+            return
         await set_user_state(user.id, OP_AWAIT_SCHEDULE_ROUTE, {})
         await query.message.reply_text(
-            "🗓️ *Add a New Schedule*\n\nEnter the route:\n_Format: Male to Thoddoo_",
+            "🗓️ *Add a Single Schedule*\n\n"
+            "Enter stops comma-separated:\n_Male, Airport, Thoddoo_",
+            parse_mode="Markdown")
+
+    elif data == "op_bulk_setup":
+        op = await get_operator(user.id)
+        if not op or op.get("status") != "approved":
+            return
+        await set_user_state(user.id, OP_BULK_LOCATION, {})
+        await query.message.reply_text(
+            "📋 *Bulk Schedule Setup*\n\n"
+            "This will create all your weekly schedules at once!\n\n"
+            "*Step 1:* What are your route stops?\n"
+            "_Enter comma-separated in order:_\n"
+            "`Male, Airport, Thoddoo`",
             parse_mode="Markdown")
 
     elif data == "op_profile":
@@ -2551,7 +2938,17 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"📍 *Routes:* {routes}\n"
             f"📊 *Status:* {op['status'].upper()}\n"
             f"⭐ *Rating:* {op['average_rating']} ({op['total_reviews']} reviews)\n"
-            f"✨ *Recommended:* {'Yes 🌟' if op['is_recommended'] else 'No'}\n",
+            f"✨ *Recommended:* {'Yes 🌟' if op['is_recommended'] else 'No'}\n\n"
+            f"{'─'*30}\n"
+            f"💡 *Quick Guide:*\n"
+            f"• 📌 Pin this message for quick access\n"
+            f"• Type `/profile` anytime to see your profile\n"
+            f"• Type `/schedules` to manage your routes\n"
+            f"• Type `/bookings` to see pending bookings\n"
+            f"• Type `/fleet` to manage your boats\n"
+            f"• Type `/today` to view today\'s schedule\n"
+            f"• Type `/help` for all commands\n\n"
+            f"_Commands are flexible — just type naturally!_",
             parse_mode="Markdown", reply_markup=main_kb("operator"))
 
     elif data == "op_bookings":
@@ -2892,6 +3289,88 @@ async def main():
     app.add_handler(CommandHandler("urgent",       cmd_urgent))
     app.add_handler(CommandHandler("status",       cmd_status))
     app.add_handler(CommandHandler("findcustomer", cmd_findcustomer))
+
+    # ── Flexible operator shortcuts ──
+    async def cmd_profile(u, c):
+        sd = await get_user_state(u.effective_user.id)
+        if sd.get("role") == "operator":
+            # fake callback
+            class FQ: message=u.message; from_user=u.effective_user; data="op_profile"
+            class FU: callback_query=FQ(); effective_user=u.effective_user
+            await handle_callback(FU(), c)
+        else:
+            await cmd_start(u, c)
+    async def cmd_schedules_shortcut(u, c):
+        op = await get_operator(u.effective_user.id)
+        if op and op.get("status") == "approved":
+            await set_user_state(u.effective_user.id, OP_AWAIT_SCHEDULE_ROUTE, {})
+            await u.message.reply_text("🗓️ *Add a Schedule*\n\nEnter the route stops comma-separated:\n_Example: Male, Thoddoo_", parse_mode="Markdown")
+        else:
+            await u.message.reply_text("⚠️ Operator account required.")
+    async def cmd_bookings_shortcut(u, c):
+        class FQ: message=u.message; from_user=u.effective_user; data="op_bookings"
+        class FU: callback_query=FQ(); effective_user=u.effective_user
+        await handle_callback(FU(), c)
+    async def cmd_fleet_shortcut(u, c):
+        class FQ: message=u.message; from_user=u.effective_user; data="op_fleet"
+        class FU: callback_query=FQ(); effective_user=u.effective_user
+        await handle_callback(FU(), c)
+    async def cmd_today_shortcut(u, c):
+        class FQ: message=u.message; from_user=u.effective_user; data="op_today"
+        class FU: callback_query=FQ(); effective_user=u.effective_user
+        await handle_callback(FU(), c)
+    async def cmd_search_shortcut(u, c):
+        await u.message.reply_text("🔍 Type your route to search:\n_Example: Male to Thoddoo_", parse_mode="Markdown")
+    async def cmd_mybookings_shortcut(u, c):
+        class FQ: message=u.message; from_user=u.effective_user; data="cx_my_bookings"
+        class FU: callback_query=FQ(); effective_user=u.effective_user
+        await handle_callback(FU(), c)
+    async def cmd_help_full(u, c):
+        sd = await get_user_state(u.effective_user.id)
+        role = sd.get("role","customer")
+        op = await get_operator(u.effective_user.id)
+        is_op = op and op.get("status") == "approved"
+        if is_op:
+            await u.message.reply_text(
+                "🌊 *Samuga Travels — Operator Commands*\n\n"
+                "Just type naturally or use any of these:\n\n"
+                "/profile — View your profile\n"
+                "/schedules — Add a schedule\n"
+                "/bookings — Pending bookings\n"
+                "/fleet — Manage your boats\n"
+                "/today — Today\'s schedule\n"
+                "/status — Your account status\n"
+                "/urgent — Request urgent review\n"
+                "/cancel — Cancel current action\n"
+                "/start — Main menu\n\n"
+                "_Commands are flexible — close enough works!_",
+                parse_mode="Markdown")
+        else:
+            await u.message.reply_text(
+                "🌊 *Samuga Travels — Help*\n\n"
+                "Just type a route like *Male to Thoddoo* to start!\n\n"
+                "/start — Main menu\n"
+                "/mybookings — Your bookings\n"
+                "/search — Search boats\n"
+                "/status — Application status\n"
+                "/cancel — Cancel current action\n\n"
+                "_You can also just type naturally — the bot understands!_",
+                parse_mode="Markdown")
+
+    for cmd in ["profile", "myprofile"]:
+        app.add_handler(CommandHandler(cmd, cmd_profile))
+    for cmd in ["schedules", "addschedule", "schedule"]:
+        app.add_handler(CommandHandler(cmd, cmd_schedules_shortcut))
+    for cmd in ["bookings", "mybookings", "pending"]:
+        app.add_handler(CommandHandler(cmd, cmd_bookings_shortcut))
+    for cmd in ["fleet", "boats", "myfleet"]:
+        app.add_handler(CommandHandler(cmd, cmd_fleet_shortcut))
+    for cmd in ["today", "todayschedule"]:
+        app.add_handler(CommandHandler(cmd, cmd_today_shortcut))
+    for cmd in ["search", "searchboats", "book"]:
+        app.add_handler(CommandHandler(cmd, cmd_search_shortcut))
+    for cmd in ["help", "commands"]:
+        app.add_handler(CommandHandler(cmd, cmd_help_full))
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
@@ -2901,7 +3380,7 @@ async def main():
     from datetime import time as dt_time
     jq = app.job_queue
     # Morning ping: 6:00 AM MVT = 01:00 UTC
-    jq.run_daily(job_morning_ping, time=dt_time(1, 0, 0), name="morning_ping")
+    jq.run_daily(job_morning_ping, time=dt_time(15, 0, 0), name="morning_ping")  # 8:00 PM MVT
     # Departure reminders: every 5 minutes
     jq.run_repeating(job_departure_reminders, interval=300, first=30, name="departure_reminders")
     logger.info("✅ Scheduled jobs registered")
