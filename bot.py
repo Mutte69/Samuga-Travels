@@ -1038,7 +1038,7 @@ def main_kb(role="customer"):
              InlineKeyboardButton("🤖 Ask SamugaAI",    callback_data="op_ai_chat")],
         ])
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Search Boats",           callback_data="cx_search"),
+        [InlineKeyboardButton("🚢 Book a Trip",            callback_data="cx_search"),
          InlineKeyboardButton("📋 My Bookings",            callback_data="cx_my_bookings")],
         [InlineKeyboardButton("🤖 Ask SamugaAI",          callback_data="cx_ai_chat")],
         [InlineKeyboardButton("🤝 Register as Operator",   callback_data="register_operator")],
@@ -1061,11 +1061,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             role = "operator"
         else:
             role = "customer"
-    await update.message.reply_text(
-        f"🌊 *Welcome to Samuga Travels!*\n\nHi *{user.first_name}*! The Maldives' smartest speedboat booking platform.\n\nWhat would you like to do?",
-        parse_mode="Markdown", reply_markup=main_kb(role))
-
-async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        f"🌊 *Welcome to Samuga Travels!*\n\n"
+        f"Hi *{user.first_name}*! Book speedboats across the Maldives — fast, easy, trusted.\n\n"
+        f"Just type your route to get started:\n"
+        f"`Male to Thoddoo` · `Thoddoo to Male` · `Male to Maafushi`\n\n"
+        f"Or tap a button below 👇",
     """
     Verify a booking ticket — called via QR scan deep-link or /verify ST-XXXXXX
     Also handles: /start verify_ST-XXXXXX (from QR code deep-link)
@@ -2158,7 +2158,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     OR (s.run_days = 'everyday')
                   )
                 ORDER BY o.is_recommended DESC, s.departure_time ASC
-            """, f"%{route_from.lower()}%", f"%{route_to.lower()}%", str(travel_date))
+            """, f"%{route_from.lower()}%", f"%{route_to.lower()}%", travel_date)
 
         if not rows:
             await update.message.reply_text(
@@ -2383,9 +2383,32 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if role == "operator":
                 op = await get_operator(user.id)
                 role = "operator" if (op and op.get("status")=="approved") else "customer"
-            await update.message.reply_text(
-                "👋 Type a route like *Male to Thoddoo* to search, or use the menu.",
-                parse_mode="Markdown", reply_markup=main_kb(role))
+            # Show available routes as suggestions
+            try:
+                pool2 = await get_pool()
+                async with pool2.acquire() as conn2:
+                    avail = await conn2.fetch("""
+                        SELECT DISTINCT s.route_from, s.route_to
+                        FROM schedules s JOIN operators o ON s.operator_id=o.id
+                        WHERE o.status='approved' AND s.is_active=TRUE AND s.available_seats>0
+                        AND COALESCE(o.subscription_status,'trial') != 'expired'
+                        ORDER BY s.route_from LIMIT 6
+                    """)
+                if avail:
+                    route_list = "\n".join([f"  `{r['route_from']} to {r['route_to']}`" for r in avail])
+                    await update.message.reply_text(
+                        f"👋 Just type your route to search!\n\n"
+                        f"*Available routes:*\n{route_list}\n\n"
+                        f"_Or type any route you need_ 👇",
+                        parse_mode="Markdown", reply_markup=main_kb(role))
+                else:
+                    await update.message.reply_text(
+                        "👋 Type a route like *Male to Thoddoo* to search for boats!",
+                        parse_mode="Markdown", reply_markup=main_kb(role))
+            except Exception:
+                await update.message.reply_text(
+                    "👋 Type a route like *Male to Thoddoo* to search for boats!",
+                    parse_mode="Markdown", reply_markup=main_kb(role))
 
 # ── PHOTO HANDLER ─────────────────────────────────────────────────────────────
 async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2805,9 +2828,21 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif data == "cx_search":
         await set_user_state(user.id, CX_IDLE, {})
-        await query.message.reply_text(
-            "🔍 *Search for Boats*\n\nType your route:\n`Male to Thoddoo`\n`Thoddoo to Male`",
-            parse_mode="Markdown")
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            ar = await conn.fetch("""
+                SELECT DISTINCT s.route_from, s.route_to
+                FROM schedules s JOIN operators o ON s.operator_id=o.id
+                WHERE o.status='approved' AND s.is_active=TRUE AND s.available_seats>0
+                AND COALESCE(o.subscription_status,'trial') != 'expired'
+                ORDER BY s.route_from, s.route_to LIMIT 8
+            """)
+        if ar:
+            rlines = "\n".join([f"  `{r['route_from']} to {r['route_to']}`" for r in ar])
+            msg = f"🔍 *Search for Boats*\n\n*Available routes right now:*\n{rlines}\n\n_Just type your route below_ 👇"
+        else:
+            msg = "🔍 *Search for Boats*\n\nType your route — example:\n`Male to Thoddoo`\n`Thoddoo to Male`\n`Male to Maafushi`\n\n_Just type naturally_ 👇"
+        await query.message.reply_text(msg, parse_mode="Markdown")
 
     elif data.startswith("srt_"):
         # Sort preference — re-run the last search with new sort
@@ -2902,7 +2937,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     OR (s.run_days = 'everyday')
                   )
                 ORDER BY o.is_recommended DESC, s.departure_time ASC
-            """, f"%{route_from.lower()}%", f"%{route_to.lower()}%", str(travel_date))
+            """, f"%{route_from.lower()}%", f"%{route_to.lower()}%", travel_date)
         if not rows:
             await query.message.reply_text(
                 f"😔 No boats for *{route_from} → {route_to}* on *{selected_date_str}*. Try another date.",
@@ -4248,7 +4283,7 @@ async def do_confirm_booking(ctx, booking_id: int, query):
         ),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔍 Book Your Next Trip", callback_data="cx_search")],
+            [InlineKeyboardButton("🚢 Book Your Next Trip", callback_data="cx_search")],
             [InlineKeyboardButton("📋 My Bookings", callback_data="cx_my_bookings")]
         ]))
     await query.edit_message_caption(
