@@ -9,6 +9,25 @@ import cloudinary, cloudinary.uploader, requests
 import asyncpg
 from datetime import datetime
 from decimal import Decimal
+
+def now_mvt() -> datetime:
+    """Current time in Maldives Time (UTC+5). Railway servers run in UTC,
+    but departure_time / 'MVT' labels throughout this bot assume Maldives
+    local time, so anything timestamped 'MVT' must go through this."""
+    from datetime import timezone, timedelta
+    return datetime.now(timezone.utc) + timedelta(hours=5)
+
+def fmt_mvt(ts, fmt: str = "%d %b %Y %H:%M") -> str:
+    """Format a timestamp pulled from the DB (stored in UTC, since that's
+    the Railway server's session timezone) as Maldives local time for
+    display. Falls back to a plain string if ts isn't a real datetime."""
+    if ts is None:
+        return ""
+    from datetime import timedelta
+    try:
+        return (ts + timedelta(hours=5)).strftime(fmt)
+    except (TypeError, AttributeError):
+        return str(ts)[:16]
 from reportlab.lib.pagesizes import A4
 from reportlab.lib import colors
 from reportlab.lib.units import mm
@@ -366,6 +385,16 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        # Dedupe tracker for the 1hr-before operator manifest reminder —
+        # one row per schedule per day, so the job only sends it once.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS manifest_reminders (
+                schedule_id INTEGER NOT NULL,
+                reminder_date DATE NOT NULL,
+                sent_at TIMESTAMP DEFAULT NOW(),
+                PRIMARY KEY (schedule_id, reminder_date)
+            )
+        """)
         # Prevent duplicate daily overrides for the same schedule/date.
         # Clean old duplicates first so index creation will not fail on existing databases.
         await conn.execute("""
@@ -464,6 +493,10 @@ async def init_db():
         # Add trial columns to operators if missing
         await conn.execute("ALTER TABLE operators ADD COLUMN IF NOT EXISTS trial_started_at TIMESTAMP DEFAULT NOW()")
         await conn.execute("ALTER TABLE operators ADD COLUMN IF NOT EXISTS subscription_status TEXT DEFAULT 'trial'")
+        # Mini app scan behaviour: if TRUE, scanning a ticket marks it
+        # boarded immediately. If FALSE (default), the operator gets a
+        # confirm tap first. Set per-operator from the mini app.
+        await conn.execute("ALTER TABLE operators ADD COLUMN IF NOT EXISTS auto_mark_boarded BOOLEAN DEFAULT FALSE")
     logger.info("✅ Database initialized")
 
 # ── DB HELPERS ────────────────────────────────────────────────────────────────
@@ -912,7 +945,7 @@ async def generate_report_pdf(title: str, rows: list, summary: dict, operator_na
     story.append(Spacer(1, 3*mm))
     if operator_name:
         story.append(Paragraph(f"<b>Operator:</b> {operator_name}  |  "
-                               f"Generated: {datetime.now().strftime('%d %b %Y %H:%M')} MVT",
+                               f"Generated: {now_mvt().strftime('%d %b %Y %H:%M')} MVT",
             ParagraphStyle("meta", fontName="Helvetica", fontSize=9, textColor=ST_MUTED, spaceAfter=4)))
     story.append(HRFlowable(width="100%", thickness=2, color=ST_ACCENT, spaceAfter=4*mm))
 
@@ -1330,7 +1363,7 @@ async def generate_ticket_pdf(booking: dict, operator: dict, schedule: dict) -> 
                                textColor=ST_TEXT, spaceAfter=2)),
             Paragraph(
                 f"<font color='#1B6CA8'><b>Samuga Travels</b></font> · Maldives · "
-                f"Issued {datetime.now().strftime('%d %b %Y %H:%M')} MVT",
+                f"Issued {now_mvt().strftime('%d %b %Y %H:%M')} MVT",
                 ParagraphStyle('f2q', fontName='Helvetica', fontSize=7,
                                textColor=ST_MUTED)),
         ]
@@ -1459,7 +1492,7 @@ async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"💰 MVR {bk['total_amount']}\n"
     )
     if boarded:
-        msg += f"\n🛳️ *Already boarded at {str(boarded)[:16]}* — ticket used."
+        msg += f"\n🛳️ *Already boarded at {fmt_mvt(boarded)}* — ticket used."
         await update.message.reply_text(msg, parse_mode="Markdown")
     elif bk["status"] == "confirmed":
         msg += "\n✅ *Valid — not yet boarded.*"
@@ -1725,7 +1758,7 @@ async def cmd_locate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"📍 *{row['business_name']} — Live Location*\n\n"
         f"🚤 {row['route_from']} → {row['route_to']}\n"
-        f"🕐 Updated: {str(row['updated_at'])[:16]} MVT\n\n"
+        f"🕐 Updated: {fmt_mvt(row['updated_at'])} MVT\n\n"
         f"[Open in Google Maps]({maps_url})",
         parse_mode="Markdown")
     await ctx.bot.send_location(user.id, latitude=lat, longitude=lng)
@@ -3877,7 +3910,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             for line in pax_lines:
                 msg += f"   {line}\n"
             if r["boarded_at"]:
-                msg += f"   Boarded: {str(r['boarded_at'])[:16]}\n\n"
+                msg += f"   Boarded: {fmt_mvt(r['boarded_at'])}\n\n"
             else:
                 msg += "\n"
                 buttons.append([InlineKeyboardButton(
@@ -4705,7 +4738,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🛳️ *Passenger boarded!*\n\n"
             f"Ref: `{bk['booking_ref']}`\n"
             f"Passenger: *{pax_names}*\n"
-            f"Marked at: {datetime.now().strftime('%d %b %Y %H:%M')} MVT\n\n"
+            f"Marked at: {now_mvt().strftime('%d %b %Y %H:%M')} MVT\n\n"
             f"✅ Ticket used — cannot be reused.",
             parse_mode="Markdown")
 
@@ -5341,8 +5374,11 @@ async def job_subscription_check(ctx: ContextTypes.DEFAULT_TYPE):
 
 async def job_departure_reminders(ctx: ContextTypes.DEFAULT_TYPE):
     """Run every 5 minutes — send 45-min reminders to confirmed customers"""
-    from datetime import timedelta
-    now = datetime.now()
+    from datetime import timedelta, timezone as _tz
+    # Railway runs in UTC but departure_time is stored in MVT (UTC+5) —
+    # convert now() to MVT before building the reminder window, otherwise
+    # this fires up to 5 hours off from the real departure time.
+    now = datetime.now(_tz.utc) + timedelta(hours=5)
     today = now.date()
     # Target: departures happening in 40-50 minutes from now
     remind_from = (now.replace(second=0, microsecond=0) + timedelta(minutes=40)).strftime("%H:%M")
@@ -5389,6 +5425,84 @@ async def job_departure_reminders(ctx: ContextTypes.DEFAULT_TYPE):
                 logger.info(f"✅ Reminder sent to {bk['customer_telegram_id']} for {bk['booking_ref']}")
             except Exception as e:
                 logger.error(f"Reminder failed for {bk['customer_telegram_id']}: {e}")
+
+async def job_operator_manifest_reminder(ctx: ContextTypes.DEFAULT_TYPE):
+    """Run every 5 minutes — ~1hr before each departure, text the operator
+    the full passenger manifest for that schedule. Sent once per schedule
+    per day (manifest_reminders table) so it doesn't repeat."""
+    from datetime import timedelta as _td1h, timezone as _tz1h
+    # Railway runs in UTC, departure_time is stored in MVT (UTC+5) — convert
+    # before building the window (see job_departure_reminders for the same fix).
+    now = datetime.now(_tz1h.utc) + _td1h(hours=5)
+    today = now.date()
+    remind_from = (now.replace(second=0, microsecond=0) + _td1h(minutes=55)).strftime("%H:%M")
+    remind_to   = (now.replace(second=0, microsecond=0) + _td1h(minutes=65)).strftime("%H:%M")
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        scheds = await conn.fetch("""
+            SELECT s.id as schedule_id, s.route_from, s.route_to, s.departure_time,
+                   s.location, o.id as operator_id, o.telegram_id, o.business_name,
+                   COALESCE(sc.new_time, s.departure_time) as dep_time
+            FROM schedules s
+            JOIN operators o ON s.operator_id = o.id
+            LEFT JOIN schedule_changes sc ON sc.schedule_id=s.id AND sc.change_date=$1 AND sc.status='active'
+            WHERE o.status='approved' AND s.is_active=TRUE
+              AND COALESCE(sc.new_time, s.departure_time) >= $2
+              AND COALESCE(sc.new_time, s.departure_time) <= $3
+        """, today, remind_from, remind_to)
+
+        for s in scheds:
+            try:
+                already = await conn.fetchrow(
+                    "SELECT 1 FROM manifest_reminders WHERE schedule_id=$1 AND reminder_date=$2",
+                    s["schedule_id"], today)
+                if already:
+                    continue
+
+                bookings = await conn.fetch("""
+                    SELECT booking_ref, passengers, passenger_count, customer_name
+                    FROM bookings
+                    WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'
+                    ORDER BY created_at
+                """, s["schedule_id"], today)
+
+                # Mark as sent regardless of whether there are bookings, so
+                # an empty departure doesn't get checked again all day.
+                await conn.execute("""
+                    INSERT INTO manifest_reminders (schedule_id, reminder_date) VALUES ($1,$2)
+                    ON CONFLICT (schedule_id, reminder_date) DO NOTHING
+                """, s["schedule_id"], today)
+
+                if not bookings:
+                    continue
+
+                total_pax = sum(int(b["passenger_count"] or 0) for b in bookings)
+                lines = []
+                for b in bookings:
+                    passengers = b["passengers"] or "[]"
+                    if isinstance(passengers, str):
+                        try: passengers = json.loads(passengers)
+                        except Exception: passengers = []
+                    if passengers:
+                        names = ", ".join([p.get("name","") for p in passengers if p.get("name")])
+                    else:
+                        names = b["customer_name"] or "Passenger details on file"
+                    lines.append(f"  🎫 `{b['booking_ref']}` — {names}")
+                pax_text = "\n".join(lines)
+
+                msg = (
+                    f"⏰ *Departure in ~1 hour!*\n\n"
+                    f"📍 {s['route_from']} → {s['route_to']}\n"
+                    f"🕐 {s['dep_time']}\n"
+                    f"📌 {s.get('location') or 'Jetty No. 1, Male'}\n\n"
+                    f"👥 *{total_pax} passenger(s) booked:*\n{pax_text}\n\n"
+                    f"📲 Tip: open the SamugaTravels app for an easy QR scan and live boarding manifest."
+                )
+                await ctx.bot.send_message(s["telegram_id"], msg[:4000], parse_mode="Markdown")
+                logger.info(f"✅ Manifest reminder sent to {s['business_name']} for schedule {s['schedule_id']}")
+            except Exception as e:
+                logger.error(f"Manifest reminder failed for schedule {s['schedule_id']}: {e}")
 
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 async def main():
@@ -5531,6 +5645,7 @@ async def main():
     jq.run_daily(job_morning_ping, time=dt_time(15, 0, 0), name="evening_schedule_ping")
     # Departure reminders: every 5 minutes
     jq.run_repeating(job_departure_reminders, interval=300, first=30, name="departure_reminders")
+    jq.run_repeating(job_operator_manifest_reminder, interval=300, first=45, name="operator_manifest_reminder")
     # Payment confirmation watchdog: first ping after 15 min, second ping 5 min later
     jq.run_repeating(job_payment_confirmation_watchdog, interval=300, first=120, name="payment_confirmation_watchdog")
     # Subscription expiry check: daily 9AM MVT = 04:00 UTC
