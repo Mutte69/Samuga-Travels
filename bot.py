@@ -83,6 +83,7 @@ CX_AWAIT_CONTACT="cx_await_contact"
 CX_AWAIT_PASSENGER_COUNT="cx_await_passenger_count"
 CX_COLLECTING_PASSENGERS="cx_collecting_passengers"; CX_AWAIT_PAYMENT_SLIP="cx_await_payment_slip"
 CX_BOOKING_COMPLETE="cx_booking_complete"
+CX_AWAIT_INVOICE_SLIP="cx_await_invoice_slip"  # customer paying an operator-created invoice
 # Fleet/boat states
 OP_AWAIT_BOAT_ADD_NAME="op_await_boat_add_name"
 OP_AWAIT_BOAT_ADD_CAPACITY="op_await_boat_add_capacity"
@@ -426,6 +427,21 @@ async def init_db():
         await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS refund_at TIMESTAMP")
         await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_alert_stage INTEGER DEFAULT 0")
         await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_alert_last_at TIMESTAMP")
+        # ── Operator-created invoice (phone-in / private hire) support ──
+        # These bookings have no fixed schedule and may have no customer
+        # telegram_id until the customer opens the invoice link.
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS invoice_code TEXT")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS is_operator_invoice BOOLEAN DEFAULT FALSE")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_phone TEXT")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_route_from TEXT")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_route_to TEXT")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_departure_time TEXT")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_return_time TEXT")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_location TEXT")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_trip_type TEXT DEFAULT 'oneway'")
+        await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_invoice_code ON bookings(invoice_code) WHERE invoice_code IS NOT NULL")
+        # customer_telegram_id must allow NULL for invoices created before the customer opens the link
+        await conn.execute("ALTER TABLE bookings ALTER COLUMN customer_telegram_id DROP NOT NULL")
         # Live boat location tracking
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS boat_locations (
@@ -1021,8 +1037,11 @@ async def job_daily_report(ctx: ContextTypes.DEFAULT_TYPE):
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch("""
-                    SELECT b.*, s.route_from, s.route_to FROM bookings b
-                    JOIN schedules s ON b.schedule_id=s.id
+                    SELECT b.*,
+                           COALESCE(s.route_from, b.inv_route_from) as route_from,
+                           COALESCE(s.route_to, b.inv_route_to) as route_to
+                    FROM bookings b
+                    LEFT JOIN schedules s ON b.schedule_id=s.id
                     WHERE b.operator_id=$1 AND b.travel_date=$2 ORDER BY b.created_at
                 """, op["id"], today)
                 stats = await conn.fetchrow("""
@@ -1070,8 +1089,11 @@ async def job_monthly_report(ctx: ContextTypes.DEFAULT_TYPE):
         try:
             async with pool.acquire() as conn:
                 rows = await conn.fetch("""
-                    SELECT b.*, s.route_from, s.route_to FROM bookings b
-                    JOIN schedules s ON b.schedule_id=s.id
+                    SELECT b.*,
+                           COALESCE(s.route_from, b.inv_route_from) as route_from,
+                           COALESCE(s.route_to, b.inv_route_to) as route_to
+                    FROM bookings b
+                    LEFT JOIN schedules s ON b.schedule_id=s.id
                     WHERE b.operator_id=$1
                       AND EXTRACT(YEAR FROM b.travel_date)=$2
                       AND EXTRACT(MONTH FROM b.travel_date)=$3
@@ -1426,6 +1448,11 @@ def boat_type_kb():
 # ── COMMANDS ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    # ── Operator invoice deep link: t.me/SamugaTravelsBot?start=inv_XXXXX ──
+    args = ctx.args or []
+    if args and args[0].startswith("inv_"):
+        await show_invoice_to_customer(update, ctx, args[0].replace("inv_", "").strip())
+        return
     sd = await get_user_state(user.id)
     role = sd.get("role","customer")
     if role == "operator":
@@ -1442,6 +1469,78 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Or tap a button below 👇",
         parse_mode="Markdown",
         reply_markup=main_kb(role))
+
+async def show_invoice_to_customer(update: Update, ctx: ContextTypes.DEFAULT_TYPE, code: str):
+    """Customer opened an operator-created invoice link. Attach them to the
+    booking and show the pre-filled invoice with an Upload Slip button."""
+    user = update.effective_user
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        bk = await conn.fetchrow(
+            "SELECT * FROM bookings WHERE invoice_code=$1 AND is_operator_invoice=TRUE", code)
+        if not bk:
+            await update.message.reply_text(
+                "⚠️ This invoice link is invalid or has expired.\n\n"
+                "Please contact your operator for a new link, or message @SamugaTravels.",
+                parse_mode="Markdown")
+            return
+        # Already paid / confirmed?
+        if bk["status"] in ("confirmed",):
+            await update.message.reply_text(
+                f"✅ This booking is already confirmed!\n\n"
+                f"📋 Ref: `{bk['booking_ref']}`\n"
+                f"Use the menu button to open the app and view your ticket.",
+                parse_mode="Markdown")
+            return
+        if bk["status"] == "pending_confirmation":
+            await update.message.reply_text(
+                f"⏳ We've already received your payment slip for `{bk['booking_ref']}`.\n\n"
+                f"The operator is reviewing it — your ticket will arrive within 5–10 minutes. "
+                f"Please don't resend.",
+                parse_mode="Markdown")
+            return
+        # Attach this customer to the invoice (first time opening)
+        if not bk["customer_telegram_id"]:
+            await conn.execute(
+                "UPDATE bookings SET customer_telegram_id=$1 WHERE id=$2", user.id, bk["id"])
+        op = await conn.fetchrow("SELECT * FROM operators WHERE id=$1", bk["operator_id"])
+
+    # Build payment account display from operator's stored accounts
+    pay_line = ""
+    try:
+        accts = json.loads(op.get("payment_accounts") or "[]") if op else []
+        if accts:
+            a = accts[0]
+            pay_line = f"\n\n🏦 *Transfer to:*\n{a.get('bank','BML')}: `{a.get('number','')}`\n{a.get('name','')}"
+    except Exception:
+        pass
+    if not pay_line and op and op.get("owner_contact"):
+        pay_line = f"\n\n📞 Contact operator for payment details: {op['owner_contact']}"
+
+    trip_line = f"{bk['inv_route_from']} → {bk['inv_route_to']}"
+    if bk.get("inv_trip_type") == "roundtrip" and bk.get("inv_return_time"):
+        time_line = f"🕐 Departure: {bk['inv_departure_time']}  ·  Return: {bk['inv_return_time']}  (round trip)"
+    else:
+        time_line = f"🕐 Departure: {bk['inv_departure_time']}"
+
+    # Stash booking id so the slip upload updates THIS invoice
+    await set_user_state(user.id, CX_AWAIT_INVOICE_SLIP, {"invoice_booking_id": bk["id"], "invoice_ref": bk["booking_ref"]})
+
+    await update.message.reply_text(
+        f"🧾 *Your Samuga Travels Invoice*\n\n"
+        f"📋 Ref: `{bk['booking_ref']}`\n"
+        f"🚤 {op['business_name'] if op else 'Operator'}\n"
+        f"📍 {trip_line}\n"
+        f"📅 {bk['travel_date']}\n"
+        f"{time_line}\n"
+        f"👥 Passengers: {bk['passenger_count']}\n"
+        f"💰 *Total: MVR {bk['total_amount']}*"
+        f"{pay_line}\n\n"
+        f"After transferring, tap below to upload your payment slip 👇",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 Upload Payment Slip", callback_data=f"inv_upload_{bk['id']}")]
+        ]))
 
 async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Verify a booking — /verify ST-XXXXXX or via QR deep-link /start verify_ST-XXXXXX"""
@@ -1461,10 +1560,12 @@ async def cmd_verify(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async with pool.acquire() as conn:
         bk = await conn.fetchrow("""
             SELECT b.*, o.business_name, o.owner_contact,
-                   s.route_from, s.route_to, s.departure_time
+                   COALESCE(s.route_from, b.inv_route_from) as route_from,
+                   COALESCE(s.route_to, b.inv_route_to) as route_to,
+                   COALESCE(s.departure_time, b.inv_departure_time) as departure_time
             FROM bookings b
             JOIN operators o ON b.operator_id=o.id
-            JOIN schedules s ON b.schedule_id=s.id
+            LEFT JOIN schedules s ON b.schedule_id=s.id
             WHERE b.booking_ref=$1
         """, ref)
     if not bk:
@@ -2914,6 +3015,66 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "_Format: AccountNumber AccountName_\n_Example: 7770000234231 Samuga Art_",
             parse_mode="Markdown")
 
+    elif state == CX_AWAIT_INVOICE_SLIP:
+        await update.message.reply_text("⏳ Processing your payment slip...")
+        inv_bk_id = (temp or {}).get("invoice_booking_id")
+        if not inv_bk_id:
+            await update.message.reply_text("⚠️ Session expired. Please reopen your invoice link.")
+            return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            bk = await conn.fetchrow("SELECT * FROM bookings WHERE id=$1 AND is_operator_invoice=TRUE", inv_bk_id)
+            if not bk:
+                await update.message.reply_text("⚠️ Invoice not found. Contact your operator.")
+                return
+            if bk["status"] != "pending_payment":
+                await update.message.reply_text(
+                    f"ℹ️ We've already received your slip for `{bk['booking_ref']}`. No need to resend.",
+                    parse_mode="Markdown")
+                return
+            ref = bk["booking_ref"]
+            url = await upload_image(file_bytes, "private/payment_slips", f"slip_{ref}")
+            await conn.execute(
+                "UPDATE bookings SET payment_slip_url=$1, status='pending_confirmation', customer_telegram_id=COALESCE(customer_telegram_id,$2) WHERE id=$3",
+                url, user.id, inv_bk_id)
+            op = await conn.fetchrow("SELECT * FROM operators WHERE id=$1", bk["operator_id"])
+
+        await set_user_state(user.id, CX_BOOKING_COMPLETE, {"booking_ref": ref, "booking_id": inv_bk_id})
+        await update.message.reply_text(
+            f"✅ *Payment slip received!*\n\n"
+            f"📋 Booking Ref: `{ref}`\n\n"
+            f"Your booking is being reviewed by the operator. "
+            f"You'll receive your confirmed ticket within *5–10 minutes*. "
+            f"Please do not resend your slip — we have it!",
+            parse_mode="Markdown")
+
+        # Notify the operator with the slip + confirm/reject buttons (reuse existing confirm flow)
+        try:
+            trip = f"{bk['inv_route_from']} → {bk['inv_route_to']}"
+            cust_line = bk["customer_name"] or "Customer"
+            if bk.get("customer_phone"):
+                cust_line += f" · {bk['customer_phone']}"
+            await ctx.bot.send_photo(
+                op["telegram_id"],
+                photo=photo.file_id,
+                caption=(
+                    f"🧾 *Invoice Payment Received*\n\n"
+                    f"📋 `{ref}`\n"
+                    f"👤 {cust_line}\n"
+                    f"📍 {trip}\n"
+                    f"📅 {bk['travel_date']} · 🕐 {bk['inv_departure_time']}\n"
+                    f"👥 {bk['passenger_count']} pax\n"
+                    f"💰 MVR {bk['total_amount']}\n\n"
+                    f"Verify the payment, then confirm to send the ticket."
+                ),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{inv_bk_id}")],
+                    [InlineKeyboardButton("❌ Not Received / Wrong Transfer", callback_data=f"not_received_{inv_bk_id}")]
+                ]))
+        except Exception as e:
+            logger.error(f"Invoice operator notify error (booking saved): {e}", exc_info=True)
+
     elif state == CX_AWAIT_PAYMENT_SLIP:
         await update.message.reply_text("⏳ Processing your payment slip...")
         sd2 = await get_user_state(user.id)
@@ -3146,6 +3307,26 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "register_operator":
         await start_op_reg(update, ctx)
 
+    elif data.startswith("inv_upload_"):
+        bk_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            bk = await conn.fetchrow(
+                "SELECT booking_ref, status FROM bookings WHERE id=$1 AND is_operator_invoice=TRUE", bk_id)
+        if not bk:
+            await query.answer("Invoice not found.", show_alert=True)
+            return
+        if bk["status"] not in ("pending_payment",):
+            await query.answer("This invoice is no longer awaiting payment.", show_alert=True)
+            return
+        await set_user_state(user.id, CX_AWAIT_INVOICE_SLIP,
+                             {"invoice_booking_id": bk_id, "invoice_ref": bk["booking_ref"]})
+        await query.message.reply_text(
+            "📤 *Upload your payment slip*\n\n"
+            "Send a clear photo or screenshot of your transfer confirmation now.",
+            parse_mode="Markdown")
+        await query.answer()
+
     elif data.startswith("verify_ticket_"):
         bk_id = int(data.split("_")[-1])
         pool = await get_pool()
@@ -3236,11 +3417,14 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pool = await get_pool()
         async with pool.acquire() as conn:
             bk = await conn.fetchrow("""
-                SELECT b.*, s.departure_time, s.route_from, s.route_to,
+                SELECT b.*,
+                       COALESCE(s.departure_time, b.inv_departure_time) as departure_time,
+                       COALESCE(s.route_from, b.inv_route_from) as route_from,
+                       COALESCE(s.route_to, b.inv_route_to) as route_to,
                        o.telegram_id as op_tg_id, o.business_name as op_name,
                        o.owner_contact as op_contact
                 FROM bookings b
-                JOIN schedules s ON b.schedule_id=s.id
+                LEFT JOIN schedules s ON b.schedule_id=s.id
                 JOIN operators o ON b.operator_id=o.id
                 WHERE b.id=$1 AND b.customer_telegram_id=$2
             """, bk_id, user.id)
@@ -4485,8 +4669,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pool = await get_pool()
         async with pool.acquire() as conn:
             rows = await conn.fetch("""
-                SELECT b.*, s.route_from, s.route_to, s.departure_time
-                FROM bookings b JOIN schedules s ON b.schedule_id=s.id
+                SELECT b.*,
+                       COALESCE(s.route_from, b.inv_route_from) as route_from,
+                       COALESCE(s.route_to, b.inv_route_to) as route_to,
+                       COALESCE(s.departure_time, b.inv_departure_time) as departure_time
+                FROM bookings b LEFT JOIN schedules s ON b.schedule_id=s.id
                 WHERE b.operator_id=$1 AND b.status='pending_confirmation'
                 ORDER BY b.created_at DESC LIMIT 10
             """, op["id"])
@@ -4979,6 +5166,105 @@ async def notify_operator_payment(ctx, booking_id, sel, temp, ref, customer, sli
 
 async def do_confirm_booking(ctx, booking_id: int, query):
     pool = await get_pool()
+    # Detect invoice bookings (no schedule, no seat pool to deduct)
+    async with pool.acquire() as conn:
+        is_invoice = await conn.fetchval(
+            "SELECT is_operator_invoice FROM bookings WHERE id=$1", booking_id)
+
+    if is_invoice:
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                booking = await conn.fetchrow("""
+                    SELECT b.*, o.business_name, o.boat_name, o.logo_url,
+                           o.owner_contact, o.telegram_id as op_telegram_id
+                    FROM bookings b
+                    JOIN operators o ON b.operator_id=o.id
+                    WHERE b.id=$1 AND b.status='pending_confirmation'
+                    FOR UPDATE
+                """, booking_id)
+                if not booking:
+                    try:
+                        await query.answer("⚠️ Already confirmed or no longer pending.", show_alert=True)
+                        await safe_edit(query, "⚠️ Already processed — no action needed.", parse_mode="Markdown")
+                    except: pass
+                    return
+                await conn.execute(
+                    "UPDATE bookings SET status='confirmed', confirmed_at=NOW() WHERE id=$1", booking_id)
+        logger.info(f"✅ Invoice booking {booking['booking_ref']} confirmed.")
+
+        booking_dict = dict(booking)
+        passengers = booking_dict.get("passengers", "[]")
+        if isinstance(passengers, str):
+            try: booking_dict["passengers"] = json.loads(passengers)
+            except: booking_dict["passengers"] = []
+        op_dict = {
+            "business_name": booking["business_name"],
+            "boat_name": booking["boat_name"],
+            "logo_url": booking["logo_url"],
+            "owner_contact": booking["owner_contact"] or "",
+            "telegram_id": booking["op_telegram_id"] or 0,
+        }
+        sched_dict = {
+            "route_from": booking["inv_route_from"],
+            "route_to": booking["inv_route_to"],
+            "departure_time": booking["inv_departure_time"],
+            "price_per_seat": "",
+            "location": booking["inv_location"] or "Jetty No. 1, Male",
+        }
+        # Build a ticket-compatible booking dict (ticket reads schedule fields from sched_dict,
+        # but the caption helpers below read route fields off booking — supply them).
+        booking_dict["route_from"] = booking["inv_route_from"]
+        booking_dict["route_to"] = booking["inv_route_to"]
+        booking_dict["departure_time"] = booking["inv_departure_time"]
+
+        ticket_sent = False
+        try:
+            pdf_bytes = await generate_ticket_pdf(booking_dict, op_dict, sched_dict)
+            pdf_file = io.BytesIO(pdf_bytes)
+            pdf_file.name = f"ticket_{booking['booking_ref']}.pdf"
+            await ctx.bot.send_document(
+                booking["customer_telegram_id"], document=pdf_file,
+                caption=(
+                    f"✅ *Booking Confirmed!*\n\n"
+                    f"🎫 Your ticket is attached.\n"
+                    f"🔖 Ref: `{booking['booking_ref']}`\n"
+                    f"🚤 {booking['business_name']}\n"
+                    f"📍 {booking['inv_route_from']} → {booking['inv_route_to']}\n"
+                    f"📅 {booking['travel_date']} @ {booking['inv_departure_time']}\n\n"
+                    f"📲 Tip: open the Samuga Travels app to see your full booking details and ticket any time.\n\n"
+                    f"Present this ticket when boarding. Safe travels! 🌊"
+                ),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 My Bookings", callback_data="cx_my_bookings")]
+                ]))
+            ticket_sent = True
+        except Exception as e:
+            logger.error(f"❌ Invoice ticket send error for {booking['booking_ref']}: {e}", exc_info=True)
+            try:
+                await ctx.bot.send_message(
+                    booking["customer_telegram_id"],
+                    f"✅ *Booking Confirmed!*\n\n"
+                    f"🔖 Ref: `{booking['booking_ref']}`\n"
+                    f"🚤 {booking['business_name']}\n"
+                    f"📍 {booking['inv_route_from']} → {booking['inv_route_to']}\n"
+                    f"📅 {booking['travel_date']} @ {booking['inv_departure_time']}\n"
+                    f"👥 {booking['passenger_count']} passengers | 💰 MVR {booking['total_amount']}\n\n"
+                    f"📲 Open the Samuga Travels app to view full details.\n\n"
+                    f"Show this confirmation when boarding. Safe travels! 🌊",
+                    parse_mode="Markdown")
+                ticket_sent = True
+            except Exception as e2:
+                logger.error(f"❌ Invoice text confirm also failed: {e2}")
+        try:
+            if ticket_sent:
+                await safe_edit(query, f"✅ Invoice `{booking['booking_ref']}` confirmed! Ticket sent.", parse_mode="Markdown")
+            else:
+                await safe_edit(query, f"✅ Invoice `{booking['booking_ref']}` confirmed! ⚠️ Could not auto-send ticket — contact the customer.", parse_mode="Markdown")
+        except Exception:
+            pass
+        return
+
     async with pool.acquire() as conn:
         # ── ATOMIC TRANSACTION: lock booking + deduct seats in one operation ──
         async with conn.transaction():
