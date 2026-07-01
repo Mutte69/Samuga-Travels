@@ -204,6 +204,25 @@ def parse_time_24hr(text: str) -> str | None:
             return f"{h:02d}:00"
     return None
 
+def time_to_minutes(text) -> int | None:
+    """Convert any stored departure-time string to minutes-since-midnight for
+    safe numeric comparison. Handles both 24h ('16:00', '16.00') and legacy
+    12h ('04:00PM', '4pm') values so reminders never misfire on mixed formats."""
+    if not text:
+        return None
+    norm = parse_time_24hr(str(text))
+    if not norm:
+        # last-ditch: strip and try HH:MM only
+        import re as _re
+        m = _re.match(r"(\d{1,2})[:.](\d{2})", str(text).strip())
+        if m:
+            h, mn = int(m.group(1)), int(m.group(2))
+            if 0 <= h <= 23 and 0 <= mn <= 59:
+                return h * 60 + mn
+        return None
+    h, mn = norm.split(":")
+    return int(h) * 60 + int(mn)
+
 def parse_date_flexible(text: str):
     """Parse date from many formats"""
     from datetime import datetime as _dt
@@ -950,6 +969,27 @@ async def generate_report_pdf(title: str, rows: list, summary: dict, operator_na
     val = ParagraphStyle("val", fontName="Helvetica-Bold", fontSize=11, textColor=ST_TEXT, alignment=TA_CENTER)
     cell_s = ParagraphStyle("cell", fontName="Helvetica", fontSize=8, textColor=ST_TEXT)
 
+    # Samuga logo top-left (from Cloudinary via settings)
+    try:
+        samuga_logo_url = await get_setting("samuga_logo_url", "")
+        if samuga_logo_url:
+            resp = requests.get(samuga_logo_url, timeout=5)
+            from PIL import Image as PILImage
+            pil_img = PILImage.open(io.BytesIO(resp.content))
+            nat_w, nat_h = pil_img.size
+            logo_w = 40*mm
+            logo_h = logo_w * nat_h / nat_w
+            if logo_h > 15*mm:
+                logo_h = 15*mm
+                logo_w = logo_h * nat_w / nat_h
+            lbuf = io.BytesIO(resp.content); lbuf.seek(0)
+            logo_img = RLImage(lbuf, width=logo_w, height=logo_h)
+            logo_img.hAlign = 'LEFT'
+            story.append(logo_img)
+            story.append(Spacer(1, 3*mm))
+    except Exception:
+        pass
+
     # Title band
     title_t = Table([[f"  {title}  "]], colWidths=[175*mm])
     title_t.setStyle(TableStyle([
@@ -1029,7 +1069,7 @@ async def generate_report_pdf(title: str, rows: list, summary: dict, operator_na
 
 async def job_daily_report(ctx: ContextTypes.DEFAULT_TYPE):
     """Send daily sales PDF to each operator at 11PM MVT (18:00 UTC)"""
-    today = datetime.now().date()
+    today = now_mvt().date()
     pool = await get_pool()
     async with pool.acquire() as conn:
         operators = await conn.fetch("SELECT * FROM operators WHERE status='approved'")
@@ -1053,7 +1093,6 @@ async def job_daily_report(ctx: ContextTypes.DEFAULT_TYPE):
                         COALESCE(SUM(total_amount) FILTER (WHERE status='confirmed'),0) as revenue
                     FROM bookings WHERE operator_id=$1 AND travel_date=$2
                 """, op["id"], today)
-            if not rows: continue
             summary = {
                 "Confirmed": str(stats["confirmed"]), "Cancelled": str(stats["cancelled"]),
                 "Seats Sold": str(stats["seats"]), "Revenue": f"MVR {float(stats['revenue']):,.0f}",
@@ -1073,13 +1112,13 @@ async def job_daily_report(ctx: ContextTypes.DEFAULT_TYPE):
                 parse_mode="Markdown")
             logger.info(f"✅ Daily report sent to {op['business_name']}")
         except Exception as e:
-            logger.error(f"Daily report error for {op['business_name']}: {e}")
+            logger.error(f"Daily report error for {op['business_name']}: {e}", exc_info=True)
 
 async def job_monthly_report(ctx: ContextTypes.DEFAULT_TYPE):
     """Send monthly PDF on 1st of each month at 8AM MVT (03:00 UTC)"""
-    if datetime.now().day != 1: return
+    if now_mvt().day != 1: return
     from datetime import timedelta as _tdm
-    yesterday = (datetime.now() - _tdm(days=1)).date()
+    yesterday = (now_mvt() - _tdm(days=1)).date()
     year, month = yesterday.year, yesterday.month
     month_name = datetime(year, month, 1).strftime("%B %Y")
     pool = await get_pool()
@@ -5662,17 +5701,18 @@ async def job_departure_reminders(ctx: ContextTypes.DEFAULT_TYPE):
     """Run every 5 minutes — send 45-min reminders to confirmed customers"""
     from datetime import timedelta, timezone as _tz
     # Railway runs in UTC but departure_time is stored in MVT (UTC+5) —
-    # convert now() to MVT before building the reminder window, otherwise
-    # this fires up to 5 hours off from the real departure time.
+    # convert now() to MVT before building the reminder window.
     now = datetime.now(_tz.utc) + timedelta(hours=5)
     today = now.date()
-    # Target: departures happening in 40-50 minutes from now
-    remind_from = (now.replace(second=0, microsecond=0) + timedelta(minutes=40)).strftime("%H:%M")
-    remind_to   = (now.replace(second=0, microsecond=0) + timedelta(minutes=50)).strftime("%H:%M")
+    now_min = now.hour * 60 + now.minute
+    # Target: departures happening in 40-50 minutes from now (numeric, format-proof)
+    win_from = now_min + 40
+    win_to   = now_min + 50
 
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Find bookings with departures in ~45 min, not yet reminded
+        # Pull all of today's un-reminded confirmed bookings, then match the
+        # ~45-min window in Python so mixed 12h/24h stored times can't misfire.
         bookings = await conn.fetch("""
             SELECT b.customer_telegram_id, b.booking_ref, b.passenger_count,
                    COALESCE(sc.new_time, s.departure_time) as dep_time,
@@ -5685,11 +5725,12 @@ async def job_departure_reminders(ctx: ContextTypes.DEFAULT_TYPE):
             WHERE b.travel_date = $1
               AND b.status = 'confirmed'
               AND b.reminder_sent = FALSE
-              AND COALESCE(sc.new_time, s.departure_time) >= $2
-              AND COALESCE(sc.new_time, s.departure_time) <= $3
-        """, today, remind_from, remind_to)
+        """, today)
 
         for bk in bookings:
+            dep_min = time_to_minutes(bk["dep_time"])
+            if dep_min is None or not (win_from <= dep_min <= win_to):
+                continue
             try:
                 await ctx.bot.send_message(bk["customer_telegram_id"],
                     f"🌊 *Almost time to set sail!*\n\n"
@@ -5704,7 +5745,6 @@ async def job_departure_reminders(ctx: ContextTypes.DEFAULT_TYPE):
                     f"Wishing you a safe, smooth and wonderful journey! 🌟\n"
                     f"Safe travels from all of us at *Samuga Travels* 🌊🤝",
                     parse_mode="Markdown")
-                # Mark as reminded
                 await conn.execute(
                     "UPDATE bookings SET reminder_sent=TRUE WHERE booking_ref=$1",
                     bk["booking_ref"])
@@ -5721,11 +5761,14 @@ async def job_operator_manifest_reminder(ctx: ContextTypes.DEFAULT_TYPE):
     # before building the window (see job_departure_reminders for the same fix).
     now = datetime.now(_tz1h.utc) + _td1h(hours=5)
     today = now.date()
-    remind_from = (now.replace(second=0, microsecond=0) + _td1h(minutes=55)).strftime("%H:%M")
-    remind_to   = (now.replace(second=0, microsecond=0) + _td1h(minutes=65)).strftime("%H:%M")
+    now_min = now.hour * 60 + now.minute
+    win_from = now_min + 55
+    win_to   = now_min + 65
 
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # Pull all of today's active schedules, filter the ~1hr window in Python
+        # so mixed 12h/24h stored times can't misfire.
         scheds = await conn.fetch("""
             SELECT s.id as schedule_id, s.route_from, s.route_to, s.departure_time,
                    s.location, o.id as operator_id, o.telegram_id, o.business_name,
@@ -5734,11 +5777,12 @@ async def job_operator_manifest_reminder(ctx: ContextTypes.DEFAULT_TYPE):
             JOIN operators o ON s.operator_id = o.id
             LEFT JOIN schedule_changes sc ON sc.schedule_id=s.id AND sc.change_date=$1 AND sc.status='active'
             WHERE o.status='approved' AND s.is_active=TRUE
-              AND COALESCE(sc.new_time, s.departure_time) >= $2
-              AND COALESCE(sc.new_time, s.departure_time) <= $3
-        """, today, remind_from, remind_to)
+        """, today)
 
         for s in scheds:
+            dep_min = time_to_minutes(s["dep_time"])
+            if dep_min is None or not (win_from <= dep_min <= win_to):
+                continue
             try:
                 already = await conn.fetchrow(
                     "SELECT 1 FROM manifest_reminders WHERE schedule_id=$1 AND reminder_date=$2",
