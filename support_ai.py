@@ -19,7 +19,7 @@ SUPPORT_ADMIN_REPLY = "support_admin_reply"
 SUPPORT_AI_CHAT = "support_ai_chat"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
 SUPPORT_AI_ENABLED = os.environ.get("SUPPORT_AI_ENABLED", "true").lower() not in ("0", "false", "no", "off")
 
 
@@ -34,15 +34,16 @@ def _fmt_user(u) -> str:
 
 
 def _support_kb() -> InlineKeyboardMarkup:
+    # Human handover is still available when the user asks for it or when AI cannot help,
+    # but we do not show it as the first option. Samuga Assist should try first.
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Ask Samuga Assist", callback_data="support_ai_chat")],
         [InlineKeyboardButton("👤 Customer Help", callback_data="support_cat_customer"),
          InlineKeyboardButton("🚤 Operator Help", callback_data="support_cat_operator")],
         [InlineKeyboardButton("💳 Payment Issue", callback_data="support_cat_payment"),
          InlineKeyboardButton("🎫 Ticket Issue", callback_data="support_cat_ticket")],
         [InlineKeyboardButton("🚤 Boat Request", callback_data="support_cat_boat_request"),
          InlineKeyboardButton("🧾 Invoice Help", callback_data="support_cat_invoice")],
-        [InlineKeyboardButton("🤖 Ask Samuga Assist", callback_data="support_ai_chat")],
-        [InlineKeyboardButton("🙋 Talk to Human", callback_data="support_human")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
     ])
 
@@ -198,7 +199,7 @@ Samuga Travels support rules:
 - If no boat is available: tell customer to use Request a Boat and wait for Samuga to contact operators.
 - If operator application is pending less than 24 hours: tell them it is under review.
 - If operator application is pending more than 24 hours: tell them to open Profile in Mini App and tap “Ping Samuga Travels”.
-- If user asks for a human, agent, staff, admin, or your answer is uncertain, tell them to tap “Talk to Human”.
+- If user asks for a human, agent, staff, admin, or your answer is uncertain, clearly say Samuga Assist should connect them to the Samuga Travels team.
 - Keep answers short, warm, professional, and action-focused. Do not invent phone numbers, prices, routes, or policies.
 """.strip()
 
@@ -213,7 +214,7 @@ Database context JSON:
 User message:
 {user_text}
 
-Write the best support reply now. If the user needs a human, say that clearly and tell them to tap Talk to Human."""
+Write the best support reply now. If the user needs a human or you are not sure, say that Samuga Assist should connect them to the Samuga Travels team."""
 
 
 def _call_gemini_sync(prompt: str) -> str | None:
@@ -289,11 +290,29 @@ async def cmd_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deps: dict
         role = "operator"
     await deps["set_user_state"](user.id, deps["OP_IDLE"] if role == "operator" else deps["CX_IDLE"], {}, role=role)
     await update.effective_message.reply_text(
-        "🤖 Samuga Assist\n\n"
+        "Customer Support\n\n"
         "Hi, I’m Samuga Assist — your Samuga Travels support assistant.\n\n"
         "I can help with bookings, payments, tickets, boat requests, invoices, operator accounts and schedules.\n\n"
-        "Choose what you need help with:",
+        "Ask Samuga Assist first. If I can’t help, I’ll connect you to the Samuga Travels team.",
         reply_markup=_support_kb(),
+    )
+
+
+async def cmd_support_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deps: dict):
+    """Open Samuga Assist directly from the Mini App floating support button."""
+    user = update.effective_user
+    op = await deps["get_operator"](user.id)
+    role = "operator" if (op and op.get("status") == "approved") else "customer"
+    await deps["set_user_state"](user.id, SUPPORT_AI_CHAT, {}, role=role)
+    status_line = "Smart support is active." if GEMINI_API_KEY else "Smart support key is not set yet, but I can still guide you with support rules."
+    await update.effective_message.reply_text(
+        "Ask Samuga Assist\n\n"
+        f"{status_line}\n\n"
+        "Send your question in English, Dhivehi, or mixed Dhivehi-English.\n"
+        "Example: I uploaded payment but no ticket yet.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+        ]),
     )
 
 
@@ -384,7 +403,7 @@ async def handle_support_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         await q.message.reply_text(
             _answer_for(category, role),
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🙋 Talk to Human", callback_data="support_human")],
+                [InlineKeyboardButton("Ask Samuga Assist", callback_data="support_ai_chat")],
                 [InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
             ]),
         )
@@ -401,7 +420,7 @@ async def handle_support_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             "Send your question in English, Dhivehi, or mixed Dhivehi-English.\n"
             "Example: I uploaded payment but no ticket yet.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🙋 Talk to Human", callback_data="support_human")],
+                [InlineKeyboardButton("Ask Samuga Assist", callback_data="support_ai_chat")],
                 [InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
             ]),
         )
@@ -412,7 +431,7 @@ async def handle_support_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         role = "operator" if (op and op.get("status") == "approved") else "customer"
         await deps["set_user_state"](user.id, SUPPORT_AWAIT_ISSUE, {"support_category": "human"}, role=role)
         await q.message.reply_text(
-            "🙋 Talk to Human\n\n"
+            "Talk to Human\n\n"
             "Please describe your issue in one message.\n\n"
             "Add booking/request reference if you have it.\n"
             "Example: ST-260701-5173 payment uploaded but ticket not received.",
@@ -477,22 +496,22 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             return True
         op = await deps["get_operator"](user.id)
         role = "operator" if (op and op.get("status") == "approved") else "customer"
-        await update.message.reply_text("🤖 Checking your Samuga Travels details...")
+        await update.message.reply_text("Checking your Samuga Travels details...")
         dbctx = await _support_db_context(deps, user.id)
         ans = await _ask_gemini(text, role, dbctx)
         if not ans:
             ans = (
-                "🤖 Samuga Assist\n\n"
+                "Samuga Assist\n\n"
                 "I can help with bookings, payments, tickets, boat requests, invoices, and operator accounts.\n\n"
-                "Gemini smart answers are not active right now, so please choose a support category or tap Talk to Human."
+                "Smart support is not active right now. Please choose a support category, or write that you want a human agent."
             )
-        await update.message.reply_text(
-            ans[:3900],
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🙋 Talk to Human", callback_data="support_human")],
-                [InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
-            ]),
-        )
+        needs_human_button = bool(re.search(r"human|agent|admin|staff|team|މީހ|އެހީ", ans, re.I))
+        rows = []
+        if needs_human_button:
+            rows.append([InlineKeyboardButton("Talk to Human", callback_data="support_human")])
+        rows.append([InlineKeyboardButton("Ask another question", callback_data="support_ai_chat")])
+        rows.append([InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
+        await update.message.reply_text(ans[:3900], reply_markup=InlineKeyboardMarkup(rows))
         return True
 
     if state == SUPPORT_AWAIT_ISSUE:
@@ -529,7 +548,7 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await ctx.bot.send_message(
             target,
             f"💬 Samuga Travels Support\n\nTicket: {ticket_ref}\n\n{text}\n\nReply here if you need more help.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🙋 Talk to Human", callback_data="support_human")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Talk to Human", callback_data="support_human")]]),
         )
         await deps["set_user_state"](user.id, deps["CX_IDLE"], {}, role="admin")
         await update.message.reply_text(f"✅ Reply sent to user for {ticket_ref}.")
