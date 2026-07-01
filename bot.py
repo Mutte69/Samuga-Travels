@@ -7043,6 +7043,8 @@ async def main():
         args = ctx.args or []
         if args and args[0].startswith("verify_"):
             await cmd_verify(update, ctx)
+        elif args and args[0] in ("support_ai", "assist_ai", "ask_assist"):
+            await support_ai.cmd_support_ai(update, ctx, boat_request_deps())
         elif args and args[0] in ("support", "assist", "care"):
             await support_ai.cmd_support(update, ctx, boat_request_deps())
         else:
