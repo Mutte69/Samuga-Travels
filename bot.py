@@ -36,6 +36,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+import boat_requests
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -656,6 +657,12 @@ async def init_db():
         await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_return_time TEXT")
         await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_location TEXT")
         await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_trip_type TEXT DEFAULT 'oneway'")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_mode TEXT DEFAULT 'operator_direct'")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_price NUMERIC(12,2)")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS operator_cost NUMERIC(12,2)")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS samuga_margin NUMERIC(12,2) DEFAULT 0")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_receiver TEXT DEFAULT 'operator'")
+        await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_confirmed_by TEXT")
         await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_invoice_code ON bookings(invoice_code) WHERE invoice_code IS NOT NULL")
         # customer_telegram_id must allow NULL for invoices created before the customer opens the link
         await conn.execute("ALTER TABLE bookings ALTER COLUMN customer_telegram_id DROP NOT NULL")
@@ -839,6 +846,23 @@ async def set_setting(key: str, value: str):
         """, key, value)
 
 
+def format_payment_accounts_from_json(raw: str, fallback: str = "Payment account not set") -> str:
+    try:
+        accounts = json.loads(raw or "[]")
+        lines = []
+        for a in accounts:
+            bank = str(a.get("bank") or "Bank").upper().strip()
+            num = str(a.get("number") or "").strip()
+            name = str(a.get("name") or "").strip()
+            if num:
+                lines.append(f"{bank}: `{num}`" + (f"\n{name}" if name else ""))
+        if lines:
+            return "\n".join(lines)
+    except Exception:
+        pass
+    return fallback
+
+
 def render_message_template(template: str, values: dict) -> str:
     """Safe placeholder replacement for admin-editable messages."""
     text = template or ""
@@ -866,6 +890,12 @@ async def ensure_invoice_schema(conn):
     await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_return_time TEXT")
     await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_location TEXT")
     await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_trip_type TEXT DEFAULT 'oneway'")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_mode TEXT DEFAULT 'operator_direct'")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_price NUMERIC(12,2)")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS operator_cost NUMERIC(12,2)")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS samuga_margin NUMERIC(12,2) DEFAULT 0")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_receiver TEXT DEFAULT 'operator'")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS payment_confirmed_by TEXT")
     await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_invoice_code ON bookings(invoice_code) WHERE invoice_code IS NOT NULL")
     await conn.execute("""
         CREATE TABLE IF NOT EXISTS places (
@@ -2178,17 +2208,26 @@ async def show_invoice_to_customer(update: Update, ctx: ContextTypes.DEFAULT_TYP
                 "UPDATE bookings SET customer_telegram_id=$1 WHERE id=$2", user.id, bk["id"])
         op = await conn.fetchrow("SELECT * FROM operators WHERE id=$1", bk["operator_id"])
 
-    # Build payment account display from operator's stored accounts
-    pay_line = ""
-    try:
-        accts = json.loads(op.get("payment_accounts") or "[]") if op else []
-        if accts:
-            a = accts[0]
-            pay_line = f"\n\n🏦 *Transfer to:*\n{a.get('bank','BML')}: `{a.get('number','')}`\n{a.get('name','')}"
-    except Exception:
-        pass
-    if not pay_line and op and op.get("owner_contact"):
-        pay_line = f"\n\n📞 Contact operator for payment details: {op['owner_contact']}"
+    # Build payment account display. Samuga-managed request boats use Samuga accounts;
+    # normal operator invoices use operator accounts.
+    payment_mode = bk["payment_mode"] or "operator_direct"
+    if payment_mode == "samuga_managed":
+        samuga_accounts = await get_setting("subscription_accounts", "[]")
+        pay_text = format_payment_accounts_from_json(samuga_accounts, "Samuga Travels payment account is not set. Please contact Samuga Travels.")
+        pay_line = f"\n\n🏦 *Transfer to Samuga Travels:*\n{pay_text}"
+        review_line = "\n\nSamuga Travels will review your payment slip."
+    else:
+        pay_line = ""
+        try:
+            accts = json.loads(op.get("payment_accounts") or "[]") if op else []
+            if accts:
+                a = accts[0]
+                pay_line = f"\n\n🏦 *Transfer to:*\n{a.get('bank','BML')}: `{a.get('number','')}`\n{a.get('name','')}"
+        except Exception:
+            pass
+        if not pay_line and op and op.get("owner_contact"):
+            pay_line = f"\n\n📞 Contact operator for payment details: {op['owner_contact']}"
+        review_line = "\n\nThe operator will review your payment slip."
 
     trip_line = f"{bk['inv_route_from']} → {bk['inv_route_to']}"
     if bk.get("inv_trip_type") == "roundtrip" and bk.get("inv_return_time"):
@@ -2209,6 +2248,7 @@ async def show_invoice_to_customer(update: Update, ctx: ContextTypes.DEFAULT_TYP
         f"👥 Passengers: {bk['passenger_count']}\n"
         f"💰 *Total: MVR {bk['total_amount']}*"
         f"{pay_line}\n\n"
+        f"{review_line}\n\n"
         f"After transferring, tap below to upload your payment slip 👇",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
@@ -2642,6 +2682,21 @@ async def start_op_reg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "*Step 1:* What is your *business/company name*?\n\n_Example: Thoddoo Express Travels_",
         parse_mode="Markdown")
 
+# ── BOAT REQUEST MARKETPLACE DEPS ─────────────────────────────────────────────
+def boat_request_deps():
+    return {
+        "get_pool": get_pool,
+        "get_user_state": get_user_state,
+        "set_user_state": set_user_state,
+        "get_operator": get_operator,
+        "parse_time_24hr": parse_time_24hr,
+        "create_text_invoice_booking": create_text_invoice_booking,
+        "is_admin": is_admin,
+        "ADMIN_GROUP_ID": ADMIN_GROUP_ID,
+        "CX_IDLE": CX_IDLE,
+        "OP_IDLE": OP_IDLE,
+    }
+
 # ── MESSAGE HANDLER ───────────────────────────────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -2673,6 +2728,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     "`Customer Name\n30/07/26 15:00\nHulhumale Jetty to Sandbank\nReturn Hulhumale Jetty\n7500 MVR`",
                     parse_mode="Markdown", reply_markup=back_main_kb("operator"))
                 return
+
+    # ── BOAT REQUEST MARKETPLACE FLOW ───────────────────────────────────────
+    if await boat_requests.handle_boat_request_message(update, ctx, boat_request_deps()):
+        return
 
     # ── OPERATOR TEXT INVOICE FLOW ──────────────────────────────────────────
     if state == OP_AWAIT_INVOICE_LOCATION:
@@ -3456,11 +3515,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             """, f"%{route_from.lower()}%", f"%{route_to.lower()}%", travel_date)
 
         if not rows:
+            await set_user_state(user.id, CX_IDLE, {**temp, "route_from": route_from, "route_to": route_to, "travel_date": str(travel_date)})
             await update.message.reply_text(
-                f"😔 No boats found for *{route_from} → {route_to}* on *{text}*.\n\nTry a different date or route.",
+                f"😔 No boats found for *{route_from} → {route_to}* on *{text}*.\n\nWant Samuga Travels to help find one?",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔍 Search Again", callback_data="cx_search")]]))
-            await set_user_state(user.id, CX_IDLE, {})
+                reply_markup=boat_requests.request_boat_button())
             return
 
         schedules = [dict(r) for r in rows]
@@ -3805,37 +3864,41 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ *Payment slip received!*\n\n"
             f"📋 Booking Ref: `{ref}`\n\n"
-            f"Your booking is being reviewed by the operator. "
+            f"Your booking is being reviewed by {'Samuga Travels' if (bk['payment_mode'] == 'samuga_managed') else 'the operator'}. "
             f"You'll receive your confirmed ticket within *5–10 minutes*. "
             f"Please do not resend your slip — we have it!",
             parse_mode="Markdown")
 
-        # Notify the operator with the slip + confirm/reject buttons (reuse existing confirm flow)
+        # Notify the right reviewer. Samuga-managed invoices go to admin, not operator.
         try:
             trip = f"{bk['inv_route_from']} → {bk['inv_route_to']}"
             cust_line = bk["customer_name"] or "Customer"
             if bk.get("customer_phone"):
                 cust_line += f" · {bk['customer_phone']}"
-            await ctx.bot.send_photo(
-                op["telegram_id"],
-                photo=photo.file_id,
-                caption=(
-                    f"🧾 *Invoice Payment Received*\n\n"
-                    f"📋 `{ref}`\n"
-                    f"👤 {cust_line}\n"
-                    f"📍 {trip}\n"
-                    f"📅 {bk['travel_date']} · 🕐 {bk['inv_departure_time']}\n"
-                    f"👥 {bk['passenger_count']} pax\n"
-                    f"💰 MVR {bk['total_amount']}\n\n"
-                    f"Verify the payment, then confirm to send the ticket."
-                ),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{inv_bk_id}")],
-                    [InlineKeyboardButton("❌ Not Received / Wrong Transfer", callback_data=f"not_received_{inv_bk_id}")]
-                ]))
+            caption = (
+                f"🧾 *Invoice Payment Received*\n\n"
+                f"📋 `{ref}`\n"
+                f"👤 {cust_line}\n"
+                f"🚤 {op['business_name'] if op else 'Operator'}\n"
+                f"📍 {trip}\n"
+                f"📅 {bk['travel_date']} · 🕐 {bk['inv_departure_time']}\n"
+                f"👥 {bk['passenger_count']} pax\n"
+                f"💰 MVR {bk['total_amount']}\n"
+                f"Payment mode: {'Samuga managed' if bk['payment_mode'] == 'samuga_managed' else 'Operator direct'}\n\n"
+                f"Verify the payment, then confirm to send the ticket."
+            )
+            buttons = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{inv_bk_id}")],
+                [InlineKeyboardButton("❌ Not Received / Wrong Transfer", callback_data=f"not_received_{inv_bk_id}")]
+            ])
+            if bk["payment_mode"] == "samuga_managed":
+                await ctx.bot.send_photo(ADMIN_GROUP_ID, photo=photo.file_id, caption=caption,
+                                         parse_mode="Markdown", message_thread_id=ADMIN_THREAD_ID, reply_markup=buttons)
+            else:
+                await ctx.bot.send_photo(op["telegram_id"], photo=photo.file_id, caption=caption,
+                                         parse_mode="Markdown", reply_markup=buttons)
         except Exception as e:
-            logger.error(f"Invoice operator notify error (booking saved): {e}", exc_info=True)
+            logger.error(f"Invoice payment reviewer notify error (booking saved): {e}", exc_info=True)
 
     elif state == CX_AWAIT_PAYMENT_SLIP:
         await update.message.reply_text("⏳ Processing your payment slip...")
@@ -4065,6 +4128,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = query.data
     sd   = await get_user_state(user.id)
     temp = sd.get("temp_data", {}) or {}
+
+    # Boat request marketplace callbacks live in boat_requests.py
+    if await boat_requests.handle_boat_request_callback(update, ctx, boat_request_deps()):
+        return
 
     if data == "main_menu":
         op = await get_operator(user.id)
@@ -4499,9 +4566,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ORDER BY o.is_recommended DESC, s.departure_time ASC
             """, f"%{route_from.lower()}%", f"%{route_to.lower()}%", travel_date)
         if not rows:
+            await set_user_state(user.id, CX_IDLE, {**t2, "route_from": route_from, "route_to": route_to, "travel_date": str(travel_date)})
             await query.message.reply_text(
-                f"😔 No boats for *{route_from} → {route_to}* on *{selected_date_str}*. Try another date.",
-                parse_mode="Markdown")
+                f"😔 No boats for *{route_from} → {route_to}* on *{selected_date_str}*.\n\nWant Samuga Travels to help find one?",
+                parse_mode="Markdown", reply_markup=boat_requests.request_boat_button())
             return
         schedules = [dict(r) for r in rows]
         ctx.user_data["schedules_cache"] = schedules
@@ -6050,8 +6118,9 @@ async def do_confirm_booking(ctx, booking_id: int, query):
                         await safe_edit(query, "⚠️ Already processed — no action needed.", parse_mode="Markdown")
                     except: pass
                     return
+                confirmer = 'admin' if (booking['payment_mode'] == 'samuga_managed') else 'operator'
                 await conn.execute(
-                    "UPDATE bookings SET status='confirmed', confirmed_at=NOW() WHERE id=$1", booking_id)
+                    "UPDATE bookings SET status='confirmed', confirmed_at=NOW(), payment_confirmed_by=$2 WHERE id=$1", booking_id, confirmer)
         logger.info(f"✅ Invoice booking {booking['booking_ref']} confirmed.")
 
         booking_dict = dict(booking)
@@ -6118,6 +6187,23 @@ async def do_confirm_booking(ctx, booking_id: int, query):
                 ticket_sent = True
             except Exception as e2:
                 logger.error(f"❌ Invoice text confirm also failed: {e2}")
+        # For Samuga-managed request boats, share customer/operator connection only after payment is confirmed.
+        if booking["payment_mode"] == "samuga_managed":
+            try:
+                await ctx.bot.send_message(
+                    booking["op_telegram_id"],
+                    f"✅ Payment confirmed by Samuga Travels!\n\n"
+                    f"Ref: {booking['booking_ref']}\n"
+                    f"Customer: {booking['customer_name'] or 'Customer'}\n"
+                    f"Contact: {booking['customer_phone'] or '-'}\n"
+                    f"Route: {booking['inv_route_from']} → {booking['inv_route_to']}\n"
+                    f"Date: {booking['travel_date']} @ {booking['inv_departure_time']}\n"
+                    f"Passengers: {booking['passenger_count']}\n\n"
+                    f"Please prepare for the trip.",
+                )
+            except Exception as e:
+                logger.error(f"Samuga-managed operator final notify failed: {e}")
+
         try:
             if ticket_sent:
                 await safe_edit(query, f"✅ Invoice `{booking['booking_ref']}` confirmed! Ticket sent.", parse_mode="Markdown")
@@ -6662,6 +6748,7 @@ async def main():
     # Init DB first before anything else
     logger.info("🌊 Starting Samuga Travels Bot v1.2...")
     await init_db()
+    await boat_requests.init_boat_request_db(get_pool)
     logger.info("✅ DB ready — building bot...")
 
     app = (
