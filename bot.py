@@ -181,46 +181,88 @@ def parse_price(text: str) -> float | None:
 
 def parse_time_24hr(text: str) -> str | None:
     """
-    Parse and normalise departure time to 24hr HH:MM format.
-    Accepts: 16:00, 04:00PM, 4:00pm, 16.00, 4pm, 16h00
-    Rejects AM/PM and converts to 24hr.
-    Returns None if unparseable.
+    Human-proof time parser. Always returns clean 24-hour HH:MM.
+
+    Accepts examples operators commonly type:
+      16:00, 16.00, 16;00, 16-00, 16h00, 16 h 00, 16:00hrs,
+      1600, 1600hrs, 04:00PM, 04;00pm, 4.00 pm, 4pm, Evening 4:00.
+
+    This is important because reminders compare stored departure_time against
+    Maldives local time. If 04:00PM is saved as 04:00, the bot sends night/morning
+    alerts at the wrong time.
     """
     import re as _re
-    text = text.strip().upper().replace("H", ":").replace(".", ":")
-    # Try HH:MM AM/PM
-    m = _re.match(r"(\d{1,2}):(\d{2})\s*(AM|PM)?$", text)
-    if m:
-        h, mn, period = int(m.group(1)), int(m.group(2)), m.group(3)
-        if period == "PM" and h != 12: h += 12
-        if period == "AM" and h == 12: h = 0
-        if 0 <= h <= 23 and 0 <= mn <= 59:
-            return f"{h:02d}:{mn:02d}"
-    # Try HH AM/PM (no minutes)
-    m2 = _re.match(r"(\d{1,2})\s*(AM|PM)$", text)
-    if m2:
-        h, period = int(m2.group(1)), m2.group(2)
-        if period == "PM" and h != 12: h += 12
-        if period == "AM" and h == 12: h = 0
-        if 0 <= h <= 23:
-            return f"{h:02d}:00"
+    if text is None:
+        return None
+
+    raw = str(text).strip()
+    if not raw:
+        return None
+
+    upper_raw = raw.upper()
+    # Daypart helps with ambiguous entries like "Evening 4" or "Afternoon 3:30".
+    daypart_pm = bool(_re.search(r"\b(EVENING|AFTERNOON|NIGHT)\b", upper_raw))
+    daypart_am = bool(_re.search(r"\b(MORNING|AM)\b", upper_raw))
+
+    s = upper_raw
+    # Normalise common AM/PM spellings and noisy suffixes.
+    s = s.replace("A.M.", "AM").replace("P.M.", "PM")
+    s = s.replace("A M", "AM").replace("P M", "PM")
+    s = _re.sub(r"\s*(HOURS?|HRS?|HOUR)\b", "", s)
+    s = _re.sub(r"\b(O\s*'?CLOCK)\b", "", s)
+    s = _re.sub(r"\b(DEPARTURE|TIME|EVENING|AFTERNOON|MORNING|NIGHT)\b", "", s)
+    s = s.strip()
+
+    # Convert separators only between hour and minute.
+    # 16;00 / 16.00 / 16-00 / 16h00 / 16 h 00 -> 16:00
+    s = _re.sub(r"(?<=\d)\s*[;\.\-H]\s*(?=\d{2})", ":", s)
+    s = _re.sub(r"\s+", " ", s).strip()
+
+    # Find first time-like token anywhere in the string.
+    # Examples matched: 16:00, 04:00PM, 4 PM, 1600, 1600PM
+    m = _re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?\b", s)
+    compact = None
+    # Prefer compact 3/4 digit time if no colon match exists: 930, 0930, 1600hrs.
+    if not m or (m and m.group(2) is None and len(m.group(1)) <= 2):
+        compact = _re.search(r"\b(\d{3,4})\s*(AM|PM)?\b", s)
+
+    if compact:
+        digits = compact.group(1)
+        period = compact.group(2)
+        if len(digits) == 3:
+            h, mn = int(digits[0]), int(digits[1:])
+        else:
+            h, mn = int(digits[:2]), int(digits[2:])
+    elif m:
+        h = int(m.group(1))
+        mn = int(m.group(2) or 0)
+        period = m.group(3)
+    else:
+        return None
+
+    if not (0 <= mn <= 59):
+        return None
+
+    # Apply AM/PM or daypart inference.
+    if period == "PM" and 1 <= h <= 11:
+        h += 12
+    elif period == "AM" and h == 12:
+        h = 0
+    elif not period and daypart_pm and 1 <= h <= 11:
+        h += 12
+    elif not period and daypart_am and h == 12:
+        h = 0
+
+    if 0 <= h <= 23:
+        return f"{h:02d}:{mn:02d}"
     return None
 
 def time_to_minutes(text) -> int | None:
-    """Convert any stored departure-time string to minutes-since-midnight for
-    safe numeric comparison. Handles both 24h ('16:00', '16.00') and legacy
-    12h ('04:00PM', '4pm') values so reminders never misfire on mixed formats."""
-    if not text:
-        return None
-    norm = parse_time_24hr(str(text))
+    """Convert any stored departure-time string to minutes-since-midnight.
+    Uses parse_time_24hr so reminder jobs are format-proof and compare only
+    numeric MVT minutes, not PostgreSQL text/time casts."""
+    norm = parse_time_24hr(str(text)) if text is not None else None
     if not norm:
-        # last-ditch: strip and try HH:MM only
-        import re as _re
-        m = _re.match(r"(\d{1,2})[:.](\d{2})", str(text).strip())
-        if m:
-            h, mn = int(m.group(1)), int(m.group(2))
-            if 0 <= h <= 23 and 0 <= mn <= 59:
-                return h * 60 + mn
         return None
     h, mn = norm.split(":")
     return int(h) * 60 + int(mn)
@@ -258,7 +300,12 @@ def parse_bulk_departures(text: str):
     import re
     results = []
     lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
-    time_pat = re.compile(r"^(\d{1,2}[:.]\d{2}\s*(?:AM|PM)?)", re.IGNORECASE)
+    time_pat = re.compile(
+        r"^((?:evening|afternoon|morning|night)\s+\d{1,2}(?:\s*[:;.\-hH]\s*\d{2})?\s*(?:AM|PM|A\.M\.|P\.M\.)?|"
+        r"\d{1,2}\s*[:;.\-hH]\s*\d{2}\s*(?:AM|PM|A\.M\.|P\.M\.|HRS?|HOURS?)?|"
+        r"\d{3,4}\s*(?:AM|PM|A\.M\.|P\.M\.|HRS?|HOURS?)?|"
+        r"\d{1,2}\s*(?:AM|PM|A\.M\.|P\.M\.|HRS?|HOURS?))",
+        re.IGNORECASE)
     to_pat   = re.compile(r"\bto\b", re.IGNORECASE)
 
     for line in lines:
@@ -267,7 +314,7 @@ def parse_bulk_departures(text: str):
         if not m:
             continue
         raw_time = m.group(1).strip()
-        time_str = parse_time_24hr(raw_time) or raw_time.upper().replace(".", ":")
+        time_str = parse_time_24hr(raw_time)
         rest = line[m.end():].strip()
         parts = [p.strip().title() for p in to_pat.split(rest) if p.strip()]
         if len(parts) >= 2:
@@ -329,7 +376,11 @@ def parse_operator_invoice_text(text: str) -> dict | None:
     currency = "MVR"
 
     # date + optional time can be on one line
-    time_re = re.compile(r"(\d{1,2}\s*[:;.]\s*\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))", re.I)
+    time_re = re.compile(
+        r"(\d{1,2}\s*[:;.\-hH]\s*\d{2}\s*(?:am|pm|a\.m\.|p\.m\.|hrs?|hours?)?|"
+        r"\d{3,4}\s*(?:am|pm|a\.m\.|p\.m\.|hrs?|hours?)?|"
+        r"(?:evening|afternoon|morning|night)\s+\d{1,2}(?:\s*[:;.\-hH]\s*\d{2})?\s*(?:am|pm)?|"
+        r"\d{1,2}\s*(?:am|pm|a\.m\.|p\.m\.))", re.I)
     date_re = re.compile(r"(\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}|\d{4}[/.\-]\d{1,2}[/.\-]\d{1,2})")
 
     for line in lines[1:]:
@@ -346,12 +397,12 @@ def parse_operator_invoice_text(text: str) -> dict | None:
             travel_date = _parse_invoice_date(dm.group(1))
             tm = time_re.search(line[dm.end():] or line)
             if tm:
-                departure_time = parse_time_24hr(tm.group(1).replace(";", ":"))
+                departure_time = parse_time_24hr(tm.group(1))
             continue
         # separate daypart/time line
         tm = time_re.search(line)
         if tm and not departure_time:
-            departure_time = parse_time_24hr(tm.group(1).replace(";", ":"))
+            departure_time = parse_time_24hr(tm.group(1))
             continue
         # return line
         if low.startswith("return"):
