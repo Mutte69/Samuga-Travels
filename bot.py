@@ -51,6 +51,7 @@ ADMIN_GROUP_ID   = int(os.environ.get("ADMIN_GROUP_ID",  "-1004397030483"))
 ADMIN_TEAM_GROUP_ID = int(os.environ.get("ADMIN_TEAM_GROUP_ID", str(ADMIN_GROUP_ID)))
 ADMIN_THREAD_ID  = int(os.environ.get("ADMIN_THREAD_ID", "2"))
 SUPPORT_THREAD_ID = int(os.environ.get("SUPPORT_THREAD_ID", "120"))
+ALERT_THREAD_ID = int(os.environ.get("ALERT_THREAD_ID", "121"))
 GENERAL_THREAD_ID= int(os.environ.get("GENERAL_THREAD_ID","1"))
 # Your personal Telegram ID — gets full admin access
 SUPER_ADMINS    = [int(x) for x in os.environ.get("SUPER_ADMINS", "").split(",") if x.strip().isdigit()]
@@ -2892,6 +2893,7 @@ def boat_request_deps():
         "is_admin": is_admin,
         "ADMIN_GROUP_ID": ADMIN_GROUP_ID,
         "SUPPORT_THREAD_ID": SUPPORT_THREAD_ID,
+        "ALERT_THREAD_ID": ALERT_THREAD_ID,
         "SUPER_ADMINS": SUPER_ADMINS,
         "WEBAPP_URL": WEBAPP_URL,
         "CX_IDLE": CX_IDLE,
