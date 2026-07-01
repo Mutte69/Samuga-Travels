@@ -69,6 +69,46 @@ else:
 # SamugaAI — Gemini free tier for customer/operator chat
 GEMINI_API_KEY   = os.environ.get("GEMINI_API_KEY", "")
 
+# ── PLACES / ROUTE SUGGESTIONS ───────────────────────────────────────────────
+COMMON_PLACES = [
+    ("Jetty No. 1, Male", "jetty", "Male", '["Male Jetty 1","Number 1 Jetty","Jetty 1"]', True),
+    ("Jetty No. 2, Male", "jetty", "Male", '["Male Jetty 2","Number 2 Jetty","Jetty 2"]', True),
+    ("Jetty No. 3, Male", "jetty", "Male", '["Male Jetty 3","Number 3 Jetty","Jetty 3"]', True),
+    ("Jetty No. 4, Male", "jetty", "Male", '["Male Jetty 4","Number 4 Jetty","Jetty 4"]', True),
+    ("Jetty No. 5, Male", "jetty", "Male", '["Male Jetty 5","Number 5 Jetty","Jetty 5"]', True),
+    ("Jetty No. 6, Male", "jetty", "Male", '["Male Jetty 6","Number 6 Jetty","Jetty 6"]', True),
+    ("Hulhumale Jetty", "jetty", "Hulhumale", '["Hulhumale Ferry Terminal","Hulhumale Terminal"]', True),
+    ("Airport Jetty", "jetty", "Airport", '["Velana Airport Jetty","VIA Jetty"]', True),
+    ("Villimale Ferry Terminal", "jetty", "Villimale", '["Villimale Jetty"]', True),
+    ("T-Jetty, Male", "jetty", "Male", '["T Jetty"]', True),
+    ("Maafushi", "island", "K. Atoll", '[]', True),
+    ("Gulhi", "island", "K. Atoll", '[]', True),
+    ("Guraidhoo", "island", "K. Atoll", '[]', True),
+    ("Thulusdhoo", "island", "K. Atoll", '[]', True),
+    ("Himmafushi", "island", "K. Atoll", '[]', True),
+    ("Huraa", "island", "K. Atoll", '[]', True),
+    ("Dhiffushi", "island", "K. Atoll", '[]', True),
+    ("Thoddoo", "island", "A.A. Atoll", '[]', True),
+    ("Rasdhoo", "island", "A.A. Atoll", '[]', True),
+    ("Ukulhas", "island", "A.A. Atoll", '[]', True),
+    ("Mathiveri", "island", "A.A. Atoll", '[]', True),
+    ("Bodufolhudhoo", "island", "A.A. Atoll", '[]', True),
+    ("Feridhoo", "island", "A.A. Atoll", '[]', True),
+    ("Himandhoo", "island", "A.A. Atoll", '[]', True),
+    ("Dhigurah", "island", "A.Dh. Atoll", '[]', True),
+    ("Dhangethi", "island", "A.Dh. Atoll", '[]', True),
+    ("Mahibadhoo", "island", "A.Dh. Atoll", '[]', True),
+    ("Omadhoo", "island", "A.Dh. Atoll", '[]', True),
+    ("Fulidhoo", "island", "V. Atoll", '[]', True),
+    ("Thinadhoo", "island", "V. Atoll", '[]', True),
+    ("Kaashidhoo", "island", "K. Atoll", '[]', True),
+    ("Gaafaru", "island", "K. Atoll", '[]', True),
+]
+
+def clean_place_name(name: str) -> str:
+    return " ".join(str(name or "").strip().split()).title()
+WEBAPP_URL       = os.environ.get("WEBAPP_URL", "")  # Optional Mini App URL for admin/operator web app
+
 # ── STATES ────────────────────────────────────────────────────────────────────
 OP_IDLE="op_idle"; OP_AWAIT_BUSINESS_NAME="op_await_business_name"
 OP_AWAIT_LOGO="op_await_logo"; OP_AWAIT_BOAT_NAME="op_await_boat_name"
@@ -649,6 +689,26 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS places (
+                id SERIAL PRIMARY KEY,
+                name TEXT UNIQUE NOT NULL,
+                type TEXT DEFAULT 'place',
+                atoll TEXT,
+                aliases TEXT DEFAULT '[]',
+                usage_count INTEGER DEFAULT 0,
+                is_verified BOOLEAN DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.executemany("""
+            INSERT INTO places (name, type, atoll, aliases, is_verified)
+            VALUES ($1,$2,$3,$4,$5)
+            ON CONFLICT (name) DO UPDATE SET
+                type=EXCLUDED.type, atoll=EXCLUDED.atoll,
+                aliases=EXCLUDED.aliases, is_verified=TRUE, updated_at=NOW()
+        """, COMMON_PLACES)
         # Insert defaults
         await conn.execute("""
             INSERT INTO settings (key, value) VALUES ('samuga_logo_url', '')
@@ -744,6 +804,20 @@ async def set_setting(key: str, value: str):
             INSERT INTO settings (key, value, updated_at) VALUES ($1,$2,NOW())
             ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()
         """, key, value)
+
+async def save_places_from_names(conn, *names: str):
+    """Save route/location names so customer/operator UIs can suggest them later."""
+    for raw in names:
+        name = clean_place_name(raw)
+        if not name or len(name) < 2:
+            continue
+        ptype = "jetty" if any(w in name.lower() for w in ["jetty", "terminal", "ferry"]) else "island"
+        await conn.execute("""
+            INSERT INTO places (name, type, usage_count, is_verified, updated_at)
+            VALUES ($1,$2,1,FALSE,NOW())
+            ON CONFLICT (name) DO UPDATE SET
+                usage_count=places.usage_count+1, updated_at=NOW()
+        """, name, ptype)
 
 async def safe_edit(query, text: str, parse_mode: str = "Markdown", reply_markup=None):
     """Edit either a caption message or a text message; fallback to reply if editing fails."""
@@ -1425,6 +1499,7 @@ async def create_text_invoice_booking(op: dict, parsed: dict, location: str):
             )
             WHERE id=$3
         """, parsed['route_from'], parsed['route_to'], op['id'])
+        await save_places_from_names(conn, parsed['route_from'], parsed['route_to'], return_time, location)
         bk = await conn.fetchrow("SELECT * FROM bookings WHERE booking_ref=$1", ref)
     return dict(bk), link
 
@@ -1725,6 +1800,73 @@ def back_main_kb(role="customer"):
 def invoice_help_kb():
     return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
 
+
+def invoice_location_kb():
+    """Quick locations for operator invoice creation. Operators can still type any custom location."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Jetty No. 1, Male", callback_data="invloc_Jetty No. 1, Male")],
+        [InlineKeyboardButton("Jetty No. 6, Male", callback_data="invloc_Jetty No. 6, Male")],
+        [InlineKeyboardButton("Hulhumale Jetty", callback_data="invloc_Hulhumale Jetty")],
+        [InlineKeyboardButton("Airport Jetty", callback_data="invloc_Airport Jetty")],
+        [InlineKeyboardButton("✍️ Other location", callback_data="invloc_other")],
+        [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+    ])
+
+async def send_invoice_location_prompt(msg, parsed_invoice: dict):
+    """Send parsed invoice summary + location buttons."""
+    return_line = f"\n🔁 Return: {parsed_invoice.get('return_to')}" if parsed_invoice.get('return_to') else ""
+    await msg.reply_text(
+        f"🧾 *Invoice details read*\n\n"
+        f"👤 Customer: *{parsed_invoice['customer_name']}*\n"
+        f"📅 Date: *{parsed_invoice['travel_date']}*\n"
+        f"🕐 Time: *{parsed_invoice['departure_time']}*\n"
+        f"📍 Route: *{parsed_invoice['route_from']} → {parsed_invoice['route_to']}*"
+        f"{return_line}\n"
+        f"💰 Total: *{parsed_invoice.get('currency','MVR')} {parsed_invoice['total_amount']}*\n\n"
+        f"📌 Choose the *departure location / jetty* below, or type any custom location.",
+        parse_mode="Markdown", reply_markup=invoice_location_kb())
+
+async def finish_text_invoice_from_location(msg, ctx, user_id: int, op: dict, parsed: dict, location: str):
+    """Create invoice safely from selected/typed location and send PDF + link."""
+    try:
+        bk, link = await create_text_invoice_booking(op, parsed, location.strip())
+        try:
+            pdf_bytes = await generate_invoice_pdf({**bk, "currency": parsed.get("currency","MVR")}, op, link)
+            pdf_buf = io.BytesIO(pdf_bytes); pdf_buf.name = f"invoice_{bk['booking_ref']}.pdf"
+            await msg.reply_document(
+                document=pdf_buf,
+                caption=(
+                    f"🧾 *Invoice Created*\n\n"
+                    f"Ref: `{bk['booking_ref']}`\n"
+                    f"Customer: *{bk['customer_name']}*\n"
+                    f"Route: {bk['inv_route_from']} → {bk['inv_route_to']}\n"
+                    f"Date: {bk['travel_date']} @ {bk['inv_departure_time']}\n"
+                    f"Location: *{bk.get('inv_location') or location}*\n"
+                    f"Total: *{parsed.get('currency','MVR')} {bk['total_amount']}*\n\n"
+                    f"Share this link with the customer:\n{link}"
+                ),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Open Invoice", url=link)],
+                                                   [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+            )
+        except Exception as e:
+            logger.error(f"Invoice PDF send failed: {e}", exc_info=True)
+            await msg.reply_text(
+                f"🧾 *Invoice Created*\n\nRef: `{bk['booking_ref']}`\nShare this link:\n{link}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Open Invoice", url=link)],
+                                                   [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+            )
+        await set_user_state(user_id, OP_IDLE, {}, role="operator")
+        return True
+    except Exception as e:
+        logger.error(f"Invoice creation failed: {e}", exc_info=True)
+        await msg.reply_text(
+            "⚠️ Invoice could not be created. Please try again or send /start.\n\n"
+            "If this keeps happening, contact @SamugaTravels.",
+            reply_markup=back_main_kb("operator"))
+        return False
+
 def invoice_help_text():
     return (
         "🧾 *Create Invoice by Text*\n\n"
@@ -1970,6 +2112,7 @@ async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("📢 Broadcast Message",  callback_data="adm_broadcast"),
          InlineKeyboardButton("📊 Revenue Report",     callback_data="adm_revenue")],
         [InlineKeyboardButton("📡 Daily Control Room",  callback_data="adm_control_room")],
+        ([InlineKeyboardButton("🖥️ Admin Mini App", url=WEBAPP_URL)] if WEBAPP_URL else []),
         [InlineKeyboardButton("🖼️ Upload Samuga Logo", callback_data="adm_upload_logo"),
          InlineKeyboardButton("⚙️ Settings",           callback_data="adm_settings")],
         [InlineKeyboardButton("🔍 Find Customer",      callback_data="adm_find_customer"),
@@ -2284,18 +2427,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if parsed_invoice:
                 await set_user_state(user.id, OP_AWAIT_INVOICE_LOCATION,
                                      {"invoice_parsed": parsed_invoice}, role="operator")
-                return_line = f"\n🔁 Return: {parsed_invoice.get('return_to')}" if parsed_invoice.get('return_to') else ""
-                await update.message.reply_text(
-                    f"🧾 *Invoice details read*\n\n"
-                    f"👤 Customer: *{parsed_invoice['customer_name']}*\n"
-                    f"📅 Date: *{parsed_invoice['travel_date']}*\n"
-                    f"🕐 Time: *{parsed_invoice['departure_time']}*\n"
-                    f"📍 Route: *{parsed_invoice['route_from']} → {parsed_invoice['route_to']}*"
-                    f"{return_line}\n"
-                    f"💰 Total: *{parsed_invoice.get('currency','MVR')} {parsed_invoice['total_amount']}*\n\n"
-                    f"📌 Now send the *departure location / jetty*.\n"
-                    f"Example: `Jetty No. 1, Male` or `Hulhumale Jetty`",
-                    parse_mode="Markdown", reply_markup=back_main_kb("operator"))
+                await send_invoice_location_prompt(update.message, parsed_invoice)
                 return
             elif state == OP_AWAIT_INVOICE_TEXT:
                 await update.message.reply_text(
@@ -2320,32 +2452,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⚠️ Invoice session expired. Please paste the invoice again.", reply_markup=back_main_kb("operator"))
             return
         location = text.strip()
-        bk, link = await create_text_invoice_booking(op, parsed, location)
-        try:
-            pdf_bytes = await generate_invoice_pdf({**bk, "currency": parsed.get("currency","MVR")}, op, link)
-            pdf_buf = io.BytesIO(pdf_bytes); pdf_buf.name = f"invoice_{bk['booking_ref']}.pdf"
-            await update.message.reply_document(
-                document=pdf_buf,
-                caption=(
-                    f"🧾 *Invoice Created*\n\n"
-                    f"Ref: `{bk['booking_ref']}`\n"
-                    f"Customer: *{bk['customer_name']}*\n"
-                    f"Route: {bk['inv_route_from']} → {bk['inv_route_to']}\n"
-                    f"Date: {bk['travel_date']} @ {bk['inv_departure_time']}\n"
-                    f"Total: *{parsed.get('currency','MVR')} {bk['total_amount']}*\n\n"
-                    f"Share this link with the customer:\n{link}"
-                ),
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Copy / Open Invoice", url=link)]])
-            )
-        except Exception as e:
-            logger.error(f"Invoice PDF send failed: {e}", exc_info=True)
-            await update.message.reply_text(
-                f"🧾 *Invoice Created*\n\nRef: `{bk['booking_ref']}`\nShare this link:\n{link}",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Open Invoice", url=link)]])
-            )
-        await set_user_state(user.id, OP_IDLE, {}, role="operator")
+        await finish_text_invoice_from_location(update.message, ctx, user.id, op, parsed, location)
         return
 
     # ── REFUND FLOW ──────────────────────────────────────────────────────────
@@ -3310,18 +3417,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             if parsed_invoice:
                 await set_user_state(user.id, OP_AWAIT_INVOICE_LOCATION,
                                      {"invoice_parsed": parsed_invoice}, role="operator")
-                return_line = f"\n🔁 Return: {parsed_invoice.get('return_to')}" if parsed_invoice.get('return_to') else ""
-                await update.message.reply_text(
-                    f"🧾 *Invoice details read*\n\n"
-                    f"👤 Customer: *{parsed_invoice['customer_name']}*\n"
-                    f"📅 Date: *{parsed_invoice['travel_date']}*\n"
-                    f"🕐 Time: *{parsed_invoice['departure_time']}*\n"
-                    f"📍 Route: *{parsed_invoice['route_from']} → {parsed_invoice['route_to']}*"
-                    f"{return_line}\n"
-                    f"💰 Total: *{parsed_invoice.get('currency','MVR')} {parsed_invoice['total_amount']}*\n\n"
-                    f"📌 Now send the *departure location / jetty*.\n"
-                    f"Example: `Jetty No. 1, Male` or `Hulhumale Jetty`",
-                    parse_mode="Markdown", reply_markup=back_main_kb("operator"))
+                await send_invoice_location_prompt(update.message, parsed_invoice)
                 return
 
         # Default — route search from text
@@ -3712,6 +3808,25 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         await set_user_state(user.id, OP_AWAIT_INVOICE_TEXT, {}, role="operator")
         await query.message.reply_text(invoice_help_text(), parse_mode="Markdown", reply_markup=invoice_help_kb())
+
+    elif data.startswith("invloc_"):
+        op = await get_operator(user.id)
+        if not op or op.get("status") != "approved":
+            await query.answer("Operator account required.", show_alert=True)
+            return
+        sd2 = await get_user_state(user.id)
+        parsed = (sd2.get("temp_data") or {}).get("invoice_parsed") or {}
+        if not parsed:
+            await query.message.reply_text("⚠️ Invoice session expired. Please paste the invoice again.", reply_markup=back_main_kb("operator"))
+            return
+        if data == "invloc_other":
+            await set_user_state(user.id, OP_AWAIT_INVOICE_LOCATION, {"invoice_parsed": parsed}, role="operator")
+            await query.message.reply_text(
+                "✍️ Send the custom departure location / jetty now.\n\nExample: `Jetty No. 6, Male`",
+                parse_mode="Markdown", reply_markup=back_main_kb("operator"))
+            return
+        location = data.replace("invloc_", "", 1)
+        await finish_text_invoice_from_location(query.message, ctx, user.id, op, parsed, location)
 
     elif data == "register_operator":
         await start_op_reg(update, ctx)
@@ -4615,6 +4730,49 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown")
             except Exception as e:
                 logger.error(f"Cancel notify error: {e}")
+
+    elif data.startswith("admin_delete_confirm_"):
+        if not await admin_check(query, ctx): return
+        op_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                op = await conn.fetchrow("SELECT business_name, telegram_id FROM operators WHERE id=$1", op_id)
+                sched_ids = await conn.fetch("SELECT id FROM schedules WHERE operator_id=$1", op_id)
+                ids = [r["id"] for r in sched_ids]
+                if ids:
+                    await conn.execute("DELETE FROM manifest_reminders WHERE schedule_id = ANY($1::int[])", ids)
+                    await conn.execute("DELETE FROM schedule_changes WHERE schedule_id = ANY($1::int[])", ids)
+                await conn.execute("DELETE FROM reviews WHERE operator_id=$1", op_id)
+                await conn.execute("DELETE FROM boat_locations WHERE operator_id=$1", op_id)
+                await conn.execute("DELETE FROM subscriptions WHERE operator_id=$1", op_id)
+                await conn.execute("DELETE FROM bookings WHERE operator_id=$1", op_id)
+                await conn.execute("DELETE FROM boats WHERE operator_id=$1", op_id)
+                await conn.execute("DELETE FROM schedules WHERE operator_id=$1", op_id)
+                await conn.execute("DELETE FROM operators WHERE id=$1", op_id)
+                if op and op["telegram_id"]:
+                    await conn.execute("DELETE FROM user_states WHERE telegram_id=$1", op["telegram_id"])
+        await query.message.reply_text(f"🗑️ Operator fully deleted: *{op['business_name'] if op else op_id}*", parse_mode="Markdown")
+
+    elif data.startswith("admin_delete_"):
+        if not await admin_check(query, ctx): return
+        op_id = int(data.split("_")[-1])
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            op = await conn.fetchrow("SELECT business_name FROM operators WHERE id=$1", op_id)
+            bcount = await conn.fetchval("SELECT COUNT(*) FROM bookings WHERE operator_id=$1", op_id)
+            scount = await conn.fetchval("SELECT COUNT(*) FROM schedules WHERE operator_id=$1", op_id)
+        name = op["business_name"] if op else str(op_id)
+        await query.message.reply_text(
+            f"⚠️ *Permanent Delete Operator*\n\n"
+            f"Operator: *{name}*\n"
+            f"Bookings to delete: *{bcount}*\nSchedules to delete: *{scount}*\n\n"
+            f"This is only safe for test/fake operators. Continue?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑️ Yes, permanently delete", callback_data=f"admin_delete_confirm_{op_id}")],
+                [InlineKeyboardButton("Cancel", callback_data="adm_operators")]
+            ]))
 
     # ── ADMIN PANEL CALLBACKS ──────────────────────────────────────────────────
     elif data == "adm_operators":
