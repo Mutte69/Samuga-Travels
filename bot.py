@@ -37,6 +37,7 @@ from reportlab.lib.enums import TA_CENTER
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import boat_requests
+import support_ai
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -49,6 +50,7 @@ ADMIN_GROUP_ID   = int(os.environ.get("ADMIN_GROUP_ID",  "-1004397030483"))
 # Team group used to show Admin Mini App button and verify Mini App admin access.
 ADMIN_TEAM_GROUP_ID = int(os.environ.get("ADMIN_TEAM_GROUP_ID", str(ADMIN_GROUP_ID)))
 ADMIN_THREAD_ID  = int(os.environ.get("ADMIN_THREAD_ID", "2"))
+SUPPORT_THREAD_ID = int(os.environ.get("SUPPORT_THREAD_ID", "120"))
 GENERAL_THREAD_ID= int(os.environ.get("GENERAL_THREAD_ID","1"))
 # Your personal Telegram ID — gets full admin access
 SUPER_ADMINS    = [int(x) for x in os.environ.get("SUPER_ADMINS", "").split(",") if x.strip().isdigit()]
@@ -2046,12 +2048,12 @@ def main_kb(role="customer"):
              InlineKeyboardButton("📅 Today's Schedule", callback_data="op_today")],
             [InlineKeyboardButton("📊 Monthly Report",   callback_data="op_monthly_report"),
              InlineKeyboardButton("✏️ Edit Info",        callback_data="op_edit")],
-            [InlineKeyboardButton("🤖 Ask SamugaAI",    callback_data="op_ai_chat")],
+            [InlineKeyboardButton("💬 Samuga Assist",    callback_data="support_start")],
         ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚢 Book a Trip",            callback_data="cx_search"),
          InlineKeyboardButton("📋 My Bookings",            callback_data="cx_my_bookings")],
-        [InlineKeyboardButton("🤖 Ask SamugaAI",          callback_data="cx_ai_chat")],
+        [InlineKeyboardButton("💬 Samuga Assist",          callback_data="support_start")],
         [InlineKeyboardButton("🤝 Register as Operator",   callback_data="register_operator")],
     ])
 
@@ -2889,6 +2891,9 @@ def boat_request_deps():
         "create_text_invoice_booking": create_text_invoice_booking,
         "is_admin": is_admin,
         "ADMIN_GROUP_ID": ADMIN_GROUP_ID,
+        "SUPPORT_THREAD_ID": SUPPORT_THREAD_ID,
+        "SUPER_ADMINS": SUPER_ADMINS,
+        "WEBAPP_URL": WEBAPP_URL,
         "CX_IDLE": CX_IDLE,
         "OP_IDLE": OP_IDLE,
     }
@@ -2900,6 +2905,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state= sd.get("state", CX_IDLE)
     temp = sd.get("temp_data", {}) or {}
     text = (update.message.text or "").strip()
+
+    # ── SAMUGA ASSIST / SUPPORT TICKETS ─────────────────────────────────────
+    if await support_ai.handle_support_message(update, ctx, boat_request_deps()):
+        return
 
     # ── OPERATOR INVOICE AUTO-DETECT ─────────────────────────────────────────
     # Operators may just paste invoice details without using /invoice.
@@ -4324,6 +4333,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     data = query.data
     sd   = await get_user_state(user.id)
     temp = sd.get("temp_data", {}) or {}
+
+    # Samuga Assist / support callbacks live in support_ai.py
+    if await support_ai.handle_support_callback(update, ctx, boat_request_deps()):
+        return
 
     # Boat request marketplace callbacks live in boat_requests.py
     if await boat_requests.handle_boat_request_callback(update, ctx, boat_request_deps()):
@@ -7017,6 +7030,7 @@ async def main():
     logger.info("🌊 Starting Samuga Travels Bot v1.2...")
     await init_db()
     await boat_requests.init_boat_request_db(get_pool)
+    await support_ai.init_support_db(get_pool)
     logger.info("✅ DB ready — building bot...")
 
     app = (
@@ -7029,13 +7043,19 @@ async def main():
         args = ctx.args or []
         if args and args[0].startswith("verify_"):
             await cmd_verify(update, ctx)
+        elif args and args[0] in ("support", "assist", "care"):
+            await support_ai.cmd_support(update, ctx, boat_request_deps())
         else:
             await cmd_start(update, ctx)
+    async def cmd_support_shortcut(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        await support_ai.cmd_support(update, ctx, boat_request_deps())
+
     app.add_handler(CommandHandler("start",  cmd_start_with_verify))
     app.add_handler(CommandHandler("cancel",    cmd_cancel))
     app.add_handler(CommandHandler("verify",    cmd_verify))
     app.add_handler(CommandHandler("register",  cmd_register))
     app.add_handler(CommandHandler("recommend", cmd_recommend))
+    app.add_handler(CommandHandler(["support", "assist", "care"], cmd_support_shortcut))
     app.add_handler(CommandHandler("admin",     cmd_admin))
     app.add_handler(CommandHandler("adminpanel", cmd_adminpanel))
     app.add_handler(CommandHandler("addadmin",   cmd_addadmin))
