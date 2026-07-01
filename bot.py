@@ -1472,10 +1472,25 @@ async def generate_invoice_pdf(invoice: dict, operator: dict, invoice_link: str)
     return buf.getvalue()
 
 async def create_text_invoice_booking(op: dict, parsed: dict, location: str):
-    """Create an operator invoice from parsed text and update route coverage."""
+    """Create an operator invoice from parsed text and update route coverage.
+
+    asyncpg needs a real datetime.date for DATE columns. The invoice parser
+    keeps travel_date as a display string like '2026-06-22', so normalize it
+    here before insert. This fixes the crash after selecting a jetty/location.
+    """
+    from datetime import date as _date
     ref = gen_ref()
     link = f"https://t.me/SamugaTravelsBot?start=inv_{ref}"
     return_time = parsed.get('return_to') or None
+    travel_date = parsed.get('travel_date')
+    if isinstance(travel_date, str):
+        try:
+            travel_date = _date.fromisoformat(travel_date.strip())
+        except Exception:
+            parsed_dt = _parse_invoice_date(travel_date)
+            if not parsed_dt:
+                raise ValueError(f"Invalid invoice travel_date: {travel_date}")
+            travel_date = parsed_dt
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -1487,7 +1502,7 @@ async def create_text_invoice_booking(op: dict, parsed: dict, location: str):
                inv_location, inv_trip_type)
             VALUES ($1,NULL,$2,'',$3,NULL,$4,$5,$6,'pending_payment',TRUE,$1,
                     $7,$8,$9,$10,$11,$12)
-        """, ref, parsed['customer_name'], op['id'], parsed['travel_date'],
+        """, ref, parsed['customer_name'], op['id'], travel_date,
             int(parsed.get('passenger_count') or 1), parsed['total_amount'],
             parsed['route_from'], parsed['route_to'], parsed['departure_time'],
             return_time, location, parsed.get('trip_type','oneway'))
