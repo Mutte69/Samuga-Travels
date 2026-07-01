@@ -199,7 +199,8 @@ Samuga Travels support rules:
 - If no boat is available: tell customer to use Request a Boat and wait for Samuga to contact operators.
 - If operator application is pending less than 24 hours: tell them it is under review.
 - If operator application is pending more than 24 hours: tell them to open Profile in Mini App and tap “Ping Samuga Travels”.
-- If user asks for a human, agent, staff, admin, or your answer is uncertain, clearly say Samuga Assist should connect them to the Samuga Travels team.
+- Do not show or suggest human support in normal successful answers.
+- Only if the user clearly asks for a human/agent/staff/admin OR you cannot answer safely from the database context, end your answer with exactly: HANDOVER_NEEDED
 - Keep answers short, warm, professional, and action-focused. Do not invent phone numbers, prices, routes, or policies.
 """.strip()
 
@@ -214,7 +215,9 @@ Database context JSON:
 User message:
 {user_text}
 
-Write the best support reply now. If the user needs a human or you are not sure, say that Samuga Assist should connect them to the Samuga Travels team."""
+Write the best support reply now.
+If you can answer/help, answer directly and do not mention human support.
+If the user clearly asks for a human or you cannot answer safely, end the reply with exactly: HANDOVER_NEEDED"""
 
 
 def _call_gemini_sync(prompt: str) -> str | None:
@@ -505,10 +508,11 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                 "I can help with bookings, payments, tickets, boat requests, invoices, and operator accounts.\n\n"
                 "Smart support is not active right now. Please choose a support category, or write that you want a human agent."
             )
-        needs_human_button = bool(re.search(r"human|agent|admin|staff|team|މީހ|އެހީ", ans, re.I))
+        needs_human_button = bool(re.search(r"HANDOVER_NEEDED|I\s*(can'?t|cannot)\s+help|not\s+sure|unsure", ans, re.I))
+        ans = re.sub(r"\s*HANDOVER_NEEDED\s*", "", ans, flags=re.I).strip()
         rows = []
         if needs_human_button:
-            rows.append([InlineKeyboardButton("Talk to Human", callback_data="support_human")])
+            rows.append([InlineKeyboardButton("Contact Samuga Team", callback_data="support_human")])
         rows.append([InlineKeyboardButton("Ask another question", callback_data="support_ai_chat")])
         rows.append([InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
         await update.message.reply_text(ans[:3900], reply_markup=InlineKeyboardMarkup(rows))
@@ -548,7 +552,7 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         await ctx.bot.send_message(
             target,
             f"💬 Samuga Travels Support\n\nTicket: {ticket_ref}\n\n{text}\n\nReply here if you need more help.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Talk to Human", callback_data="support_human")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Contact Samuga Team", callback_data="support_human")]]),
         )
         await deps["set_user_state"](user.id, deps["CX_IDLE"], {}, role="admin")
         await update.message.reply_text(f"✅ Reply sent to user for {ticket_ref}.")
