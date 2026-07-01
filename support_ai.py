@@ -6,12 +6,21 @@ Keeps support logic separate from bot.py.
 from __future__ import annotations
 
 from datetime import datetime
+import os
+import json
+import asyncio
 import re
+import requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 SUPPORT_AWAIT_ISSUE = "support_await_issue"
 SUPPORT_ADMIN_REPLY = "support_admin_reply"
+SUPPORT_AI_CHAT = "support_ai_chat"
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-1.5-flash").strip()
+SUPPORT_AI_ENABLED = os.environ.get("SUPPORT_AI_ENABLED", "true").lower() not in ("0", "false", "no", "off")
 
 
 def _ticket_ref(ticket_id: int) -> str:
@@ -32,6 +41,7 @@ def _support_kb() -> InlineKeyboardMarkup:
          InlineKeyboardButton("🎫 Ticket Issue", callback_data="support_cat_ticket")],
         [InlineKeyboardButton("🚤 Boat Request", callback_data="support_cat_boat_request"),
          InlineKeyboardButton("🧾 Invoice Help", callback_data="support_cat_invoice")],
+        [InlineKeyboardButton("🤖 Ask Samuga Assist", callback_data="support_ai_chat")],
         [InlineKeyboardButton("🙋 Talk to Human", callback_data="support_human")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
     ])
@@ -71,6 +81,171 @@ def _answer_for(category: str, role: str) -> str:
         ),
     }
     return "🤖 Samuga Assist\n\n" + answers.get(category, answers["customer"])
+
+
+def _safe_money(v):
+    try:
+        return float(v) if v is not None else None
+    except Exception:
+        return None
+
+
+def _clean_record(d: dict, blocked_keys: set[str]) -> dict:
+    out = {}
+    for k, v in dict(d or {}).items():
+        if k in blocked_keys:
+            continue
+        if isinstance(v, datetime):
+            out[k] = v.isoformat()
+        elif hasattr(v, "isoformat"):
+            try:
+                out[k] = v.isoformat()
+            except Exception:
+                out[k] = str(v)
+        elif isinstance(v, (int, float, str, bool)) or v is None:
+            out[k] = v
+        else:
+            out[k] = str(v)
+    return out
+
+
+async def _table_exists(conn, table_name: str) -> bool:
+    return bool(await conn.fetchval("SELECT to_regclass($1)", table_name))
+
+
+async def _support_db_context(deps: dict, telegram_id: int) -> dict:
+    """Build a safe, read-only support context for Gemini.
+    Never expose Samuga margin/operator cost to customers/operators.
+    """
+    ctx = {"telegram_id": telegram_id, "operator": None, "recent_bookings": [], "boat_requests": [], "support_tickets": []}
+    blocked = {
+        "samuga_margin", "operator_cost", "accepted_offer_id", "assigned_admin_id",
+        "payment_slip_url", "owner_id_photo_url", "logo_url",
+    }
+    pool = await deps["get_pool"]()
+    async with pool.acquire() as conn:
+        try:
+            op = await conn.fetchrow("SELECT * FROM operators WHERE telegram_id=$1 ORDER BY id DESC LIMIT 1", telegram_id)
+            if op:
+                op_d = _clean_record(dict(op), blocked)
+                # Bank/account details should not be echoed freely by AI unless payment flow explicitly shows them.
+                for bank_key in ("bml_account", "payment_accounts"):
+                    if bank_key in op_d:
+                        op_d[bank_key] = "saved" if op_d.get(bank_key) else "not saved"
+                ctx["operator"] = op_d
+        except Exception as e:
+            ctx["operator_error"] = str(e)[:160]
+
+        try:
+            rows = await conn.fetch("""
+                SELECT b.*, o.business_name AS operator_business_name, o.boat_name AS operator_boat_name
+                FROM bookings b
+                LEFT JOIN operators o ON o.id=b.operator_id
+                WHERE b.customer_telegram_id=$1 OR o.telegram_id=$1
+                ORDER BY b.created_at DESC
+                LIMIT 5
+            """, telegram_id)
+            for r in rows:
+                d = _clean_record(dict(r), blocked)
+                ctx["recent_bookings"].append(d)
+        except Exception as e:
+            ctx["bookings_error"] = str(e)[:160]
+
+        try:
+            if await _table_exists(conn, "boat_requests"):
+                rows = await conn.fetch("""
+                    SELECT br.*, o.business_name AS assigned_operator_name
+                    FROM boat_requests br
+                    LEFT JOIN operators o ON o.id=br.assigned_operator_id
+                    WHERE br.customer_telegram_id=$1
+                       OR br.assigned_operator_id IN (SELECT id FROM operators WHERE telegram_id=$1)
+                    ORDER BY br.created_at DESC
+                    LIMIT 5
+                """, telegram_id)
+                for r in rows:
+                    ctx["boat_requests"].append(_clean_record(dict(r), blocked))
+        except Exception as e:
+            ctx["boat_requests_error"] = str(e)[:160]
+
+        try:
+            if await _table_exists(conn, "support_tickets"):
+                rows = await conn.fetch("""
+                    SELECT ticket_ref, user_type, booking_ref, category, issue_text, status, created_at, updated_at, resolved_at
+                    FROM support_tickets
+                    WHERE user_telegram_id=$1
+                    ORDER BY created_at DESC
+                    LIMIT 3
+                """, telegram_id)
+                for r in rows:
+                    ctx["support_tickets"].append(_clean_record(dict(r), blocked))
+        except Exception as e:
+            ctx["support_tickets_error"] = str(e)[:160]
+    return ctx
+
+
+def _rulebook() -> str:
+    return """
+Samuga Travels support rules:
+- You are Samuga Assist, the official support assistant for Samuga Travels.
+- Help only with Samuga Travels bookings, payments, tickets, invoices, operator accounts, schedules, boat requests, boarding, and app usage.
+- Reply in the same language as the user when possible. If the user writes Dhivehi, reply in simple Dhivehi. If mixed Dhivehi/English, reply mixed/simple.
+- Use the database context as truth. Do not claim payment is confirmed unless status shows confirmed/paid or the context clearly says so.
+- Never reveal Samuga margin, operator cost, internal admin notes, hidden IDs, or private URLs.
+- For Samuga Managed Payment, customer pays Samuga Travels and operator gets customer details after admin confirms payment.
+- For Operator Direct Payment, customer pays assigned operator and operator confirms the slip.
+- If payment is pending: explain slip may be missing or under review.
+- If wrong bank/account transfer: Samuga Travels and operator cannot refund; user must contact their bank.
+- If no boat is available: tell customer to use Request a Boat and wait for Samuga to contact operators.
+- If operator application is pending less than 24 hours: tell them it is under review.
+- If operator application is pending more than 24 hours: tell them to open Profile in Mini App and tap “Ping Samuga Travels”.
+- If user asks for a human, agent, staff, admin, or your answer is uncertain, tell them to tap “Talk to Human”.
+- Keep answers short, warm, professional, and action-focused. Do not invent phone numbers, prices, routes, or policies.
+""".strip()
+
+
+def _gemini_prompt(user_text: str, role: str, db_context: dict) -> str:
+    return f"""{_rulebook()}
+
+User role: {role}
+Database context JSON:
+{json.dumps(db_context, ensure_ascii=False, default=str)[:9000]}
+
+User message:
+{user_text}
+
+Write the best support reply now. If the user needs a human, say that clearly and tell them to tap Talk to Human."""
+
+
+def _call_gemini_sync(prompt: str) -> str | None:
+    if not (SUPPORT_AI_ENABLED and GEMINI_API_KEY):
+        return None
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.35, "topP": 0.9, "maxOutputTokens": 360},
+    }
+    r = requests.post(url, json=payload, timeout=18)
+    if r.status_code >= 400:
+        return None
+    data = r.json()
+    try:
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception:
+        return None
+
+
+async def _ask_gemini(user_text: str, role: str, db_context: dict) -> str | None:
+    prompt = _gemini_prompt(user_text, role, db_context)
+    try:
+        return await asyncio.to_thread(_call_gemini_sync, prompt)
+    except Exception:
+        return None
+
+
+def _looks_like_human_request(text: str) -> bool:
+    t = (text or "").lower()
+    keys = ["human", "agent", "staff", "admin", "person", "call me", "talk to", "މީހ", "އެޖެންޓ", "އެހީ"]
+    return any(k in t for k in keys)
 
 
 async def init_support_db(get_pool):
@@ -215,6 +390,23 @@ async def handle_support_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         )
         return True
 
+    if data == "support_ai_chat":
+        op = await deps["get_operator"](user.id)
+        role = "operator" if (op and op.get("status") == "approved") else "customer"
+        await deps["set_user_state"](user.id, SUPPORT_AI_CHAT, {}, role=role)
+        status_line = "Gemini smart answers are active." if GEMINI_API_KEY else "Smart AI key is not set yet, but I can still guide you with support rules."
+        await q.message.reply_text(
+            "🤖 Ask Samuga Assist\n\n"
+            f"{status_line}\n\n"
+            "Send your question in English, Dhivehi, or mixed Dhivehi-English.\n"
+            "Example: I uploaded payment but no ticket yet.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🙋 Talk to Human", callback_data="support_human")],
+                [InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+            ]),
+        )
+        return True
+
     if data == "support_human":
         op = await deps["get_operator"](user.id)
         role = "operator" if (op and op.get("status") == "approved") else "customer"
@@ -270,6 +462,38 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     sd = await deps["get_user_state"](user.id)
     state = sd.get("state")
     text = (update.message.text or "").strip() if update.message else ""
+
+    if state == SUPPORT_AI_CHAT:
+        if not text:
+            return True
+        if text.lower() in ("cancel", "/cancel", "0", "menu"):
+            op = await deps["get_operator"](user.id)
+            role = "operator" if (op and op.get("status") == "approved") else "customer"
+            await deps["set_user_state"](user.id, deps["OP_IDLE"] if role == "operator" else deps["CX_IDLE"], {}, role=role)
+            await update.message.reply_text("Samuga Assist closed.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]))
+            return True
+        if _looks_like_human_request(text):
+            await _create_support_ticket(update, ctx, deps, text, "human")
+            return True
+        op = await deps["get_operator"](user.id)
+        role = "operator" if (op and op.get("status") == "approved") else "customer"
+        await update.message.reply_text("🤖 Checking your Samuga Travels details...")
+        dbctx = await _support_db_context(deps, user.id)
+        ans = await _ask_gemini(text, role, dbctx)
+        if not ans:
+            ans = (
+                "🤖 Samuga Assist\n\n"
+                "I can help with bookings, payments, tickets, boat requests, invoices, and operator accounts.\n\n"
+                "Gemini smart answers are not active right now, so please choose a support category or tap Talk to Human."
+            )
+        await update.message.reply_text(
+            ans[:3900],
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🙋 Talk to Human", callback_data="support_human")],
+                [InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+            ]),
+        )
+        return True
 
     if state == SUPPORT_AWAIT_ISSUE:
         if not text:
