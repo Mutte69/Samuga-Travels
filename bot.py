@@ -2063,17 +2063,15 @@ async def finish_text_invoice_from_location(msg, ctx, user_id: int, op: dict, pa
                     f"Location: {bk.get('inv_location') or location}\n"
                     f"Total: {parsed.get('currency','MVR')} {bk['total_amount']}\n\n"
                     f"Customer payment link:\n{link}\n\n"
-                    f"Copy this link and send it to the customer. The button below opens the same link."
+                    f"Copy this link and send it to the customer."
                 ),
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Copy / Share Customer Link", url=link)],
-                                                   [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
             )
         except Exception as e:
             logger.error(f"Invoice PDF send failed: {e}", exc_info=True)
             await msg.reply_text(
-                f"🧾 Invoice Created\n\nRef: {bk['booking_ref']}\nTap Open Invoice below and share it with the customer.",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Open Invoice", url=link)],
-                                                   [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+                f"🧾 Invoice Created\n\nRef: {bk['booking_ref']}\n\nCustomer payment link:\n{link}\n\nCopy this link and send it to the customer.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
             )
         await set_user_state(user_id, OP_IDLE, {}, role="operator")
         return True
