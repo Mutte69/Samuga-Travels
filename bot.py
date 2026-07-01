@@ -1929,27 +1929,28 @@ async def finish_text_invoice_from_location(msg, ctx, user_id: int, op: dict, pa
         try:
             pdf_bytes = await generate_invoice_pdf({**bk, "currency": parsed.get("currency","MVR")}, op, link)
             pdf_buf = io.BytesIO(pdf_bytes); pdf_buf.name = f"invoice_{bk['booking_ref']}.pdf"
+            # IMPORTANT: keep this caption plain text. The invoice deep-link contains
+            # an underscore (inv_...), and Telegram Markdown can crash with
+            # "can't find end of the entity" if a raw URL is sent with parse_mode.
             await msg.reply_document(
                 document=pdf_buf,
                 caption=(
-                    f"🧾 *Invoice Created*\n\n"
-                    f"Ref: `{bk['booking_ref']}`\n"
-                    f"Customer: *{bk['customer_name']}*\n"
+                    f"🧾 Invoice Created\n\n"
+                    f"Ref: {bk['booking_ref']}\n"
+                    f"Customer: {bk['customer_name']}\n"
                     f"Route: {bk['inv_route_from']} → {bk['inv_route_to']}\n"
                     f"Date: {bk['travel_date']} @ {bk['inv_departure_time']}\n"
-                    f"Location: *{bk.get('inv_location') or location}*\n"
-                    f"Total: *{parsed.get('currency','MVR')} {bk['total_amount']}*\n\n"
-                    f"Share this link with the customer:\n{link}"
+                    f"Location: {bk.get('inv_location') or location}\n"
+                    f"Total: {parsed.get('currency','MVR')} {bk['total_amount']}\n\n"
+                    f"Tap Open Invoice below and share it with the customer."
                 ),
-                parse_mode="Markdown",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Open Invoice", url=link)],
                                                    [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
             )
         except Exception as e:
             logger.error(f"Invoice PDF send failed: {e}", exc_info=True)
             await msg.reply_text(
-                f"🧾 *Invoice Created*\n\nRef: `{bk['booking_ref']}`\nShare this link:\n{link}",
-                parse_mode="Markdown",
+                f"🧾 Invoice Created\n\nRef: {bk['booking_ref']}\nTap Open Invoice below and share it with the customer.",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Open Invoice", url=link)],
                                                    [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
             )
@@ -1959,17 +1960,18 @@ async def finish_text_invoice_from_location(msg, ctx, user_id: int, op: dict, pa
         err_text = str(e)
         logger.error(f"Invoice creation failed: {err_text}", exc_info=True)
         try:
+            # Plain text admin alert so Telegram Markdown cannot break on underscores,
+            # bank refs, raw URLs, or Python error messages.
             await ctx.bot.send_message(
                 ADMIN_GROUP_ID,
-                f"🚨 *Invoice Creation Failed*\n\n"
-                f"Operator: `{user_id}`\n"
-                f"Business: *{op.get('business_name','N/A')}*\n"
-                f"Customer: *{parsed.get('customer_name','N/A')}*\n"
+                f"🚨 Invoice Creation Failed\n\n"
+                f"Operator: {user_id}\n"
+                f"Business: {op.get('business_name','N/A')}\n"
+                f"Customer: {parsed.get('customer_name','N/A')}\n"
                 f"Route: {parsed.get('route_from','')} → {parsed.get('route_to','')}\n"
                 f"Date: {parsed.get('travel_date','')} @ {parsed.get('departure_time','')}\n"
                 f"Location: {location}\n\n"
-                f"Error: `{err_text[:700]}`",
-                parse_mode="Markdown",
+                f"Error: {err_text[:700]}",
                 message_thread_id=ADMIN_THREAD_ID)
         except Exception:
             pass
