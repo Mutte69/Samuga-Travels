@@ -1505,45 +1505,153 @@ async def upload_image(file_bytes: bytes, folder: str, filename: str) -> str:
 
 
 async def generate_invoice_pdf(invoice: dict, operator: dict, invoice_link: str) -> bytes:
-    """Simple PDF invoice for operator-created phone/private-hire bookings."""
+    """Professional PDF invoice for operator-created phone/private-hire bookings.
+
+    Important split:
+    - Invoice display keeps the full customer trip context, including return line.
+    - Database/search still keeps clean route_from/route_to separately so customers can discover operators.
+    """
     from reportlab.lib.colors import HexColor
-    from reportlab.platypus import HRFlowable
+    from reportlab.platypus import HRFlowable, KeepInFrame
+    from reportlab.lib.utils import ImageReader
+    from xml.sax.saxutils import escape as _xml_escape
+
+    def _esc(v):
+        return _xml_escape(str(v or ""))
+
+    async def _url_image(url: str, max_w_mm: float, max_h_mm: float):
+        """Fetch remote image and return ReportLab image preserving aspect ratio."""
+        if not url:
+            return None
+        try:
+            resp = requests.get(url, timeout=6)
+            resp.raise_for_status()
+            raw = io.BytesIO(resp.content)
+            from PIL import Image as PILImage
+            img = PILImage.open(io.BytesIO(resp.content))
+            w, h = img.size
+            max_w = max_w_mm * mm
+            max_h = max_h_mm * mm
+            ratio = min(max_w / w, max_h / h)
+            iw, ih = w * ratio, h * ratio
+            raw.seek(0)
+            rl_img = RLImage(raw, width=iw, height=ih)
+            rl_img.hAlign = 'CENTER'
+            return rl_img
+        except Exception as e:
+            logger.error(f"Invoice logo load failed: {e}")
+            return None
+
     buf = io.BytesIO()
-    ST_NAVY = HexColor('#0D2137'); ST_BLUE = HexColor('#1B6CA8')
-    ST_LIGHT = HexColor('#E8F4FD'); ST_TEXT = HexColor('#1A2733')
-    ST_MUTED = HexColor('#6B8A9E'); ST_ACCENT = HexColor('#00B4D8')
-    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=15*mm, leftMargin=15*mm,
-                            topMargin=15*mm, bottomMargin=15*mm)
+    ST_NAVY = HexColor('#0D2137')
+    ST_BLUE = HexColor('#1B6CA8')
+    ST_LIGHT = HexColor('#E8F4FD')
+    ST_TEXT = HexColor('#1A2733')
+    ST_MUTED = HexColor('#6B8A9E')
+    ST_ACCENT = HexColor('#00B4D8')
+    ST_WHITE = HexColor('#FFFFFF')
+    ST_GRAY = HexColor('#F5F8FA')
+
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        rightMargin=14*mm, leftMargin=14*mm,
+        topMargin=13*mm, bottomMargin=13*mm
+    )
     story = []
+
+    # ── Header: Samuga logo left, operator identity centered ────────────────
+    samuga_logo_url = await get_setting('samuga_logo_url', '')
+    samuga_logo = await _url_image(samuga_logo_url, 28, 16)
+    op_logo = await _url_image(operator.get('logo_url', ''), 30, 22)
+
+    brand_style = ParagraphStyle('brand', fontName='Helvetica-Bold', fontSize=9, textColor=ST_BLUE, alignment=0)
+    small_muted = ParagraphStyle('small_muted', fontName='Helvetica', fontSize=7.5, textColor=ST_MUTED, alignment=1, leading=9)
+    op_name_style = ParagraphStyle('op_name', fontName='Helvetica-Bold', fontSize=12, textColor=ST_NAVY, alignment=1, leading=14)
+    right_style = ParagraphStyle('right_style', fontName='Helvetica', fontSize=7.5, textColor=ST_MUTED, alignment=2, leading=9)
+
+    left_items = [samuga_logo] if samuga_logo else [Paragraph('<b>Samuga Travels</b>', brand_style)]
+    center_items = []
+    if op_logo:
+        center_items.append(op_logo)
+        center_items.append(Spacer(1, 1.2*mm))
+    center_items.extend([
+        Paragraph(f"<b>{_esc(operator.get('business_name','Operator'))}</b>", op_name_style),
+        Paragraph(
+            f"Contact: {_esc(operator.get('owner_contact','N/A'))}<br/>"
+            f"Boat: {_esc(operator.get('boat_name','N/A'))}",
+            small_muted
+        )
+    ])
+    right_items = [Paragraph(f"Invoice<br/><b>{_esc(invoice.get('booking_ref',''))}</b>", right_style)]
+
+    header = Table([[KeepInFrame(42*mm, 22*mm, left_items, hAlign='LEFT'),
+                     KeepInFrame(88*mm, 30*mm, center_items, hAlign='CENTER'),
+                     KeepInFrame(42*mm, 22*mm, right_items, hAlign='RIGHT')]],
+                   colWidths=[43*mm, 89*mm, 43*mm])
+    header.setStyle(TableStyle([
+        ('VALIGN', (0,0), (-1,-1), 'MIDDLE'),
+        ('LEFTPADDING', (0,0), (-1,-1), 0),
+        ('RIGHTPADDING', (0,0), (-1,-1), 0),
+        ('TOPPADDING', (0,0), (-1,-1), 0),
+        ('BOTTOMPADDING', (0,0), (-1,-1), 0),
+    ]))
+    story.append(header)
+    story.append(Spacer(1, 3*mm))
+
+    # ── Title band ───────────────────────────────────────────────────────────
     title = Table([[f"SAMUGA TRAVELS INVOICE · {invoice['booking_ref']}"]], colWidths=[175*mm])
     title.setStyle(TableStyle([
-        ('BACKGROUND',(0,0),(-1,-1),ST_NAVY),('TEXTCOLOR',(0,0),(-1,-1),colors.white),
-        ('FONTNAME',(0,0),(-1,-1),'Helvetica-Bold'),('FONTSIZE',(0,0),(-1,-1),13),
-        ('ALIGN',(0,0),(-1,-1),'CENTER'),('PADDING',(0,0),(-1,-1),10)
+        ('BACKGROUND',(0,0),(-1,-1),ST_NAVY),
+        ('TEXTCOLOR',(0,0),(-1,-1),ST_WHITE),
+        ('FONTNAME',(0,0),(-1,-1),'Helvetica-Bold'),
+        ('FONTSIZE',(0,0),(-1,-1),13),
+        ('ALIGN',(0,0),(-1,-1),'CENTER'),
+        ('PADDING',(0,0),(-1,-1),9)
     ]))
-    story.append(title); story.append(Spacer(1,4*mm))
-    pstyle = ParagraphStyle('iv', fontName='Helvetica', fontSize=10, textColor=ST_TEXT)
-    hstyle = ParagraphStyle('ih', fontName='Helvetica-Bold', fontSize=9, textColor=ST_MUTED)
+    story.append(title)
+    story.append(Spacer(1,4*mm))
+
+    pstyle = ParagraphStyle('iv', fontName='Helvetica', fontSize=10.2, textColor=ST_TEXT, leading=13)
+    hstyle = ParagraphStyle('ih', fontName='Helvetica-Bold', fontSize=8.8, textColor=ST_MUTED, leading=11)
+    total_style = ParagraphStyle('total', fontName='Helvetica-Bold', fontSize=14, textColor=ST_BLUE, leading=16)
+
+    route_from = invoice.get('inv_route_from') or ''
+    route_to = invoice.get('inv_route_to') or ''
+    return_to = invoice.get('inv_return_time') or ''
+    full_route = f"{_esc(route_from)} → {_esc(route_to)}"
+    if return_to:
+        full_route += f"<br/><font color='#6B8A9E'>Return: {_esc(return_to)}</font>"
+
     rows = [
-        [Paragraph('CUSTOMER', hstyle), Paragraph(invoice.get('customer_name',''), pstyle)],
-        [Paragraph('OPERATOR', hstyle), Paragraph(operator.get('business_name',''), pstyle)],
-        [Paragraph('ROUTE', hstyle), Paragraph(f"{invoice.get('inv_route_from')} → {invoice.get('inv_route_to')}", pstyle)],
-        [Paragraph('DATE / TIME', hstyle), Paragraph(f"{invoice.get('travel_date')} @ {invoice.get('inv_departure_time')}", pstyle)],
-        [Paragraph('RETURN', hstyle), Paragraph(invoice.get('inv_return_time') or 'N/A', pstyle)],
-        [Paragraph('LOCATION', hstyle), Paragraph(invoice.get('inv_location') or 'TBA', pstyle)],
-        [Paragraph('TOTAL', hstyle), Paragraph(f"{invoice.get('currency','MVR')} {invoice.get('total_amount')}", ParagraphStyle('total', fontName='Helvetica-Bold', fontSize=12, textColor=ST_BLUE))],
+        [Paragraph('CUSTOMER', hstyle), Paragraph(_esc(invoice.get('customer_name','')), pstyle)],
+        [Paragraph('OPERATOR', hstyle), Paragraph(_esc(operator.get('business_name','')), pstyle)],
+        [Paragraph('TRIP / ROUTE', hstyle), Paragraph(full_route, pstyle)],
+        [Paragraph('DATE / TIME', hstyle), Paragraph(f"{_esc(invoice.get('travel_date'))} @ {_esc(invoice.get('inv_departure_time'))}", pstyle)],
+        [Paragraph('PICKUP / JETTY', hstyle), Paragraph(_esc(invoice.get('inv_location') or 'TBA'), pstyle)],
+        [Paragraph('TOTAL', hstyle), Paragraph(f"{_esc(invoice.get('currency','MVR'))} {float(invoice.get('total_amount') or 0):,.2f}", total_style)],
     ]
     t = Table(rows, colWidths=[42*mm,133*mm])
     t.setStyle(TableStyle([
-        ('BACKGROUND',(0,0),(-1,-1),ST_LIGHT),('BOX',(0,0),(-1,-1),1,ST_ACCENT),
-        ('INNERGRID',(0,0),(-1,-1),0.3,HexColor('#D0E8F5')),('PADDING',(0,0),(-1,-1),8),
+        ('BACKGROUND',(0,0),(-1,-1),ST_LIGHT),
+        ('BOX',(0,0),(-1,-1),1,ST_ACCENT),
+        ('INNERGRID',(0,0),(-1,-1),0.3,HexColor('#D0E8F5')),
+        ('PADDING',(0,0),(-1,-1),8),
         ('VALIGN',(0,0),(-1,-1),'MIDDLE')
     ]))
-    story.append(t); story.append(Spacer(1,5*mm))
+    story.append(t)
+    story.append(Spacer(1,5*mm))
+
     story.append(Paragraph('<b>Payment / booking link:</b>', hstyle))
-    story.append(Paragraph(invoice_link, ParagraphStyle('link', fontName='Helvetica', fontSize=8, textColor=ST_BLUE)))
-    story.append(Spacer(1,4*mm)); story.append(HRFlowable(width='100%', thickness=1, color=ST_ACCENT))
-    story.append(Paragraph('Customer must double-check account number and account name before transfer. If money is sent to a wrong bank/account, Samuga Travels and the operator cannot refund it; customer must contact their bank.', ParagraphStyle('note', fontName='Helvetica', fontSize=8, textColor=ST_MUTED, alignment=TA_CENTER, spaceBefore=4)))
+    story.append(Paragraph(_esc(invoice_link), ParagraphStyle('link', fontName='Helvetica', fontSize=8.2, textColor=ST_BLUE, leading=10)))
+    story.append(Spacer(1,4*mm))
+    story.append(HRFlowable(width='100%', thickness=1, color=ST_ACCENT))
+    story.append(Paragraph(
+        'Customer must double-check account number and account name before transfer. '
+        'If money is sent to a wrong bank/account, Samuga Travels and the operator cannot refund it; '
+        'customer must contact their bank.',
+        ParagraphStyle('note', fontName='Helvetica', fontSize=8, textColor=ST_MUTED,
+                       alignment=TA_CENTER, leading=10, spaceBefore=4)
+    ))
     doc.build(story)
     return buf.getvalue()
 
