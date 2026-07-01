@@ -151,6 +151,7 @@ OP_TRACKING_ACTIVE="op_tracking_active"
 _ai_usage: dict = {}  # {user_id: {"count": int, "date": str}}
 ADMIN_AWAIT_LOGO="admin_await_logo"
 ADMIN_AWAIT_REVIEW_TEXT="admin_await_review_text"
+ADMIN_AWAIT_TEMPLATE_TEXT="admin_await_template_text"
 # Subscription states
 OP_AWAIT_SUB_SLIP="op_await_sub_slip"
 OP_AWAIT_INVOICE_LOCATION="op_await_invoice_location"
@@ -726,6 +727,38 @@ async def init_db():
             INSERT INTO settings (key, value) VALUES ('commission_rate', '0')
             ON CONFLICT (key) DO NOTHING
         """)
+        await conn.execute("""
+            INSERT INTO settings (key, value) VALUES ('operator_approved_template', $$🎉 *Congratulations! You're approved!*
+
+*{business_name}* is now live on Samuga Travels.
+
+🎁 *Free Trial: 2 Months*
+Your free trial runs until *{trial_end}* — no payment needed now.
+
+✅ *How to manage your account*
+
+You can use Samuga Travels in two ways:
+
+1. *Telegram text bot*
+Use /start to add schedules, check bookings, create invoices, manage passengers, and receive booking alerts.
+
+2. *Mini App dashboard*
+Tap *Open App* or open your profile to view the full dashboard, bookings, reports, passenger lists, and boarding tools.
+
+📌 Start here:
+• Add your schedules
+• Check pending bookings
+• Confirm payments only after checking your bank/account
+• Use Today's Schedule for passenger boarding
+• Scan ticket QR or manually mark passengers as boarded
+• Check Monthly Report for earnings
+
+After the free trial, a small monthly fee of *MVR {monthly_fee}* keeps you listed.
+Need help? Contact {support_username}
+
+Use /start or tap *Open App* to begin. 🌊$$)
+            ON CONFLICT (key) DO NOTHING
+        """)
         # Subscriptions table
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions (
@@ -804,6 +837,49 @@ async def set_setting(key: str, value: str):
             INSERT INTO settings (key, value, updated_at) VALUES ($1,$2,NOW())
             ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()
         """, key, value)
+
+
+def render_message_template(template: str, values: dict) -> str:
+    """Safe placeholder replacement for admin-editable messages."""
+    text = template or ""
+    for k, v in (values or {}).items():
+        text = text.replace("{" + str(k) + "}", str(v))
+    return text
+
+async def get_message_template(key: str, default: str = "") -> str:
+    val = await get_setting(key, default)
+    return val or default
+
+async def set_message_template(key: str, value: str):
+    await set_setting(key, value)
+
+async def ensure_invoice_schema(conn):
+    """Make invoice creation safe on older Railway/Postgres DBs."""
+    await conn.execute("ALTER TABLE bookings ALTER COLUMN customer_telegram_id DROP NOT NULL")
+    await conn.execute("ALTER TABLE bookings ALTER COLUMN schedule_id DROP NOT NULL")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS invoice_code TEXT")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS is_operator_invoice BOOLEAN DEFAULT FALSE")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS customer_phone TEXT")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_route_from TEXT")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_route_to TEXT")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_departure_time TEXT")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_return_time TEXT")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_location TEXT")
+    await conn.execute("ALTER TABLE bookings ADD COLUMN IF NOT EXISTS inv_trip_type TEXT DEFAULT 'oneway'")
+    await conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bookings_invoice_code ON bookings(invoice_code) WHERE invoice_code IS NOT NULL")
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS places (
+            id SERIAL PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            type TEXT DEFAULT 'place',
+            atoll TEXT,
+            aliases TEXT DEFAULT '[]',
+            usage_count INTEGER DEFAULT 0,
+            is_verified BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
 
 async def save_places_from_names(conn, *names: str):
     """Save route/location names so customer/operator UIs can suggest them later."""
@@ -1493,29 +1569,34 @@ async def create_text_invoice_booking(op: dict, parsed: dict, location: str):
             travel_date = parsed_dt
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO bookings
-              (booking_ref, customer_telegram_id, customer_name, customer_phone,
-               operator_id, schedule_id, travel_date, passenger_count, total_amount,
-               status, is_operator_invoice, invoice_code,
-               inv_route_from, inv_route_to, inv_departure_time, inv_return_time,
-               inv_location, inv_trip_type)
-            VALUES ($1,0,$2,'',$3,NULL,$4,$5,$6,'pending_payment',TRUE,$1,
-                    $7,$8,$9,$10,$11,$12)
-        """, ref, parsed['customer_name'], op['id'], travel_date,
-            int(parsed.get('passenger_count') or 1), parsed['total_amount'],
-            parsed['route_from'], parsed['route_to'], parsed['departure_time'],
-            return_time, location, parsed.get('trip_type','oneway'))
-        # Add invoice route words to operator coverage so we can later use them in search/profile.
-        await conn.execute("""
-            UPDATE operators
-            SET routes = (
-                SELECT ARRAY(SELECT DISTINCT unnest(COALESCE(routes, ARRAY[]::TEXT[]) || ARRAY[$1,$2]))
-            )
-            WHERE id=$3
-        """, parsed['route_from'], parsed['route_to'], op['id'])
-        await save_places_from_names(conn, parsed['route_from'], parsed['route_to'], return_time, location)
-        bk = await conn.fetchrow("SELECT * FROM bookings WHERE booking_ref=$1", ref)
+        async with conn.transaction():
+            await ensure_invoice_schema(conn)
+            await conn.execute("""
+                INSERT INTO bookings
+                  (booking_ref, customer_telegram_id, customer_name, customer_phone,
+                   operator_id, schedule_id, travel_date, passenger_count, total_amount,
+                   status, is_operator_invoice, invoice_code,
+                   inv_route_from, inv_route_to, inv_departure_time, inv_return_time,
+                   inv_location, inv_trip_type)
+                VALUES ($1,0,$2,'',$3,NULL,$4,$5,$6,'pending_payment',TRUE,$1,
+                        $7,$8,$9,$10,$11,$12)
+            """, ref, parsed['customer_name'], op['id'], travel_date,
+                int(parsed.get('passenger_count') or 1), parsed['total_amount'],
+                parsed['route_from'], parsed['route_to'], parsed.get('departure_time') or 'TBA',
+                return_time, location, parsed.get('trip_type','oneway'))
+            # Add invoice route words to operator coverage so we can later use them in search/profile.
+            await conn.execute("""
+                UPDATE operators
+                SET routes = (
+                    SELECT ARRAY(SELECT DISTINCT unnest(COALESCE(routes, ARRAY[]::TEXT[]) || ARRAY[$1,$2]))
+                )
+                WHERE id=$3
+            """, parsed['route_from'], parsed['route_to'], op['id'])
+            try:
+                await save_places_from_names(conn, parsed['route_from'], parsed['route_to'], return_time, location)
+            except Exception as pe:
+                logger.error(f"Places save failed during invoice creation: {pe}")
+            bk = await conn.fetchrow("SELECT * FROM bookings WHERE booking_ref=$1", ref)
     return dict(bk), link
 
 # ── PDF TICKET ────────────────────────────────────────────────────────────────
@@ -1875,16 +1956,31 @@ async def finish_text_invoice_from_location(msg, ctx, user_id: int, op: dict, pa
         await set_user_state(user_id, OP_IDLE, {}, role="operator")
         return True
     except Exception as e:
-        logger.error(f"Invoice creation failed: {e}", exc_info=True)
-        # Do not leave the operator stuck in invoice-location state after a failure.
-        # They can paste the invoice again and the auto-detect flow will restart cleanly.
+        err_text = str(e)
+        logger.error(f"Invoice creation failed: {err_text}", exc_info=True)
+        try:
+            await ctx.bot.send_message(
+                ADMIN_GROUP_ID,
+                f"🚨 *Invoice Creation Failed*\n\n"
+                f"Operator: `{user_id}`\n"
+                f"Business: *{op.get('business_name','N/A')}*\n"
+                f"Customer: *{parsed.get('customer_name','N/A')}*\n"
+                f"Route: {parsed.get('route_from','')} → {parsed.get('route_to','')}\n"
+                f"Date: {parsed.get('travel_date','')} @ {parsed.get('departure_time','')}\n"
+                f"Location: {location}\n\n"
+                f"Error: `{err_text[:700]}`",
+                parse_mode="Markdown",
+                message_thread_id=ADMIN_THREAD_ID)
+        except Exception:
+            pass
         try:
             await set_user_state(user_id, OP_IDLE, {}, role="operator")
         except Exception:
             pass
         await msg.reply_text(
-            "⚠️ Invoice could not be created. Please try again or send /start.\n\n"
-            "If this keeps happening, contact @SamugaTravels.",
+            "⚠️ Invoice could not be created. I sent the error to Samuga admin.\n\n"
+            "Please tap *Create Invoice* or paste the invoice again after admin checks it.",
+            parse_mode="Markdown",
             reply_markup=back_main_kb("operator"))
         return False
 
@@ -2597,6 +2693,24 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ *Payment accounts saved!*\n\n{lines_out}\n\n"
             f"Operators will see these when paying their subscription.",
             parse_mode="Markdown")
+        return
+
+    elif state == ADMIN_AWAIT_TEMPLATE_TEXT:
+        if not is_admin(user.id, update.effective_chat.id):
+            await update.message.reply_text("⛔ Admin only.")
+            return
+        if is_cancel(text):
+            await set_user_state(user.id, CX_IDLE, {})
+            await update.message.reply_text("❌ Template edit cancelled.")
+            return
+        key = (temp or {}).get("template_key", "operator_approved_template")
+        await set_message_template(key, text)
+        await set_user_state(user.id, CX_IDLE, {})
+        await update.message.reply_text(
+            "✅ *Message template saved!*\n\nIt will be used for future auto messages.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⚙️ Back to Templates", callback_data="adm_templates")]])
+        )
         return
 
     elif state == ADMIN_AWAIT_BROADCAST:
@@ -4396,22 +4510,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await create_trial(op_id)
             from datetime import timedelta
             trial_end = (datetime.now() + timedelta(days=60)).strftime("%d %b %Y")
-            await ctx.bot.send_message(row["telegram_id"],
-                f"🎉 *Congratulations! You're approved!*\n\n"
-                f"*{row['business_name']}* is now live on Samuga Travels!\n\n"
-                f"🎁 *Free Trial: 2 Months*\n"
-                f"Your free trial runs until *{trial_end}* — no payment needed now.\n\n"
-                f"✅ *Welcome to Samuga Travels Operator Panel*\n\n"
-                f"1. Add your schedules\n"
-                f"2. Check pending bookings\n"
-                f"3. Confirm payment only after checking your bank/account\n"
-                f"4. Use Today's Schedule for passengers\n"
-                f"5. Scan ticket QR or mark boarded\n"
-                f"6. Check Monthly Report for earnings\n\n"
-                f"After the free trial, a small monthly fee of *MVR 500* keeps you listed.\n"
-                f"Need help? Contact @SamugaTravels\n\n"
-                f"Use /start to add your schedules and start receiving bookings! 🌊",
-                parse_mode="Markdown")
+            monthly_fee = await get_setting("subscription_fee", "500")
+            tpl_default = await get_message_template("operator_approved_template")
+            approved_msg = render_message_template(tpl_default, {
+                "business_name": row["business_name"],
+                "trial_end": trial_end,
+                "monthly_fee": monthly_fee,
+                "support_username": "@SamugaTravels",
+            })
+            await ctx.bot.send_message(row["telegram_id"], approved_msg, parse_mode="Markdown")
             await query.edit_message_text(
                 f"✅ Operator *{row['business_name']}* approved! 2-month trial started.",
                 parse_mode="Markdown")
@@ -4987,9 +5094,38 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await query.message.reply_text(msg, parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🖼️ Update Logo", callback_data="adm_upload_logo")],
+                [InlineKeyboardButton("📝 Message Templates", callback_data="adm_templates")],
                 [InlineKeyboardButton("💳 Subscriptions", callback_data="adm_subscriptions")],
                 [InlineKeyboardButton("🔙 Back to Admin", callback_data="adm_back")]
             ]))
+
+    elif data == "adm_templates":
+        if not await admin_check(query, ctx): return
+        tpl = await get_message_template("operator_approved_template")
+        preview = tpl[:1200] + ("..." if len(tpl) > 1200 else "")
+        await query.message.reply_text(
+            "📝 *Message Templates*\n\n"
+            "These auto messages can be edited without changing code.\n\n"
+            "Current *Operator Approved* template preview:\n\n"
+            f"{preview}\n\n"
+            "Placeholders supported:\n"
+            "`{business_name}` `{trial_end}` `{monthly_fee}` `{support_username}`",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✏️ Edit Operator Approved", callback_data="adm_edit_tpl_operator_approved")],
+                [InlineKeyboardButton("🔙 Back to Settings", callback_data="adm_settings")]
+            ]))
+
+    elif data == "adm_edit_tpl_operator_approved":
+        if not await admin_check(query, ctx): return
+        await set_user_state(user.id, ADMIN_AWAIT_TEMPLATE_TEXT,
+                             {"template_key": "operator_approved_template"})
+        await query.message.reply_text(
+            "✏️ *Edit Operator Approved Message*\n\n"
+            "Send the full new message now. You can use:\n"
+            "`{business_name}` `{trial_end}` `{monthly_fee}` `{support_username}`\n\n"
+            "Type `cancel` to abort.",
+            parse_mode="Markdown")
 
     elif data == "adm_subscriptions":
         if not await admin_check(query, ctx): return
