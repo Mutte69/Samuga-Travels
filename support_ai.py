@@ -189,7 +189,7 @@ def _rulebook() -> str:
 Samuga Travels support rules:
 - You are Samuga Assist, the official support assistant for Samuga Travels.
 - Help only with Samuga Travels bookings, payments, tickets, invoices, operator accounts, schedules, boat requests, boarding, and app usage.
-- Reply in the same language as the user when possible. If the user writes Dhivehi, reply in simple Dhivehi. If mixed Dhivehi/English, reply mixed/simple.
+- IMPORTANT LANGUAGE RULE: If the user writes in English, reply ONLY in English. Do not use Romanized Dhivehi words like ge, ah, kurey, kurevey, vaane, mi, thima. If the user writes in Thaana script, reply in simple Thaana Dhivehi. If the user writes Latin-Dhivehi mixed with English, prefer clear English unless the user asks for Dhivehi.
 - Use the database context as truth. Do not claim payment is confirmed unless status shows confirmed/paid or the context clearly says so.
 - Never reveal Samuga margin, operator cost, internal admin notes, hidden IDs, or private URLs.
 - For Samuga Managed Payment, customer pays Samuga Travels and operator gets customer details after admin confirms payment.
@@ -197,6 +197,8 @@ Samuga Travels support rules:
 - If payment is pending: explain slip may be missing or under review.
 - If wrong bank/account transfer: Samuga Travels and operator cannot refund; user must contact their bank.
 - If no boat is available: tell customer to use Request a Boat and wait for Samuga to contact operators.
+- For approved operators asking how to add routes/schedules: tell them to open Operator Dashboard or Telegram operator menu and use Add Schedule/Create Schedule/Route tools. If that button is missing, offer human support.
+- For operator profile route coverage questions: tell them routes come from schedules and invoices; new invoice/route details may be saved for future search suggestions. If they need admin to enable/edit coverage, offer human support.
 - If operator application is pending less than 24 hours: tell them it is under review.
 - If operator application is pending more than 24 hours: tell them to open Profile in Mini App and tap “Ping Samuga Travels”.
 - Do not show or suggest human support in normal successful answers.
@@ -250,6 +252,35 @@ def _looks_like_human_request(text: str) -> bool:
     t = (text or "").lower()
     keys = ["human", "agent", "staff", "admin", "person", "call me", "talk to", "މީހ", "އެޖެންޓ", "އެހީ"]
     return any(k in t for k in keys)
+
+def _ai_answer_is_weak(user_text: str, answer: str) -> bool:
+    a = (answer or "").strip()
+    u = (user_text or "").strip()
+    if not a or len(a) < 35:
+        return True
+    englishish = bool(re.search(r"[a-zA-Z]", u)) and not re.search(r"[ހ-޿]", u)
+    if englishish:
+        if re.search(r"[ހ-޿]", a):
+            return True
+        if re.search(r"\b(ge|ah|eh|koh|kur|kure|kurey|kurevey|vaane|vanee|thima|loabin|mi)\b", a.lower()):
+            return True
+    weak_phrases = [
+        "could you please tell me what you are referring to",
+        "please confirm your operator account",
+        "please log in to your samuga",
+        "i'm not sure", "not fully sure", "cannot answer", "can't answer"
+    ]
+    return any(p in a.lower() for p in weak_phrases)
+
+
+async def _send_alert(ctx: ContextTypes.DEFAULT_TYPE, deps: dict, where: str, details: str, user_id: int | None = None):
+    try:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        uid = f"\nUser ID: {user_id}" if user_id else ""
+        text = f"🚨 Samuga Travels Alert\n\nWhere: {where}{uid}\nTime: {ts}\n\n{str(details)[:1200]}"
+        await ctx.bot.send_message(deps["ADMIN_GROUP_ID"], text, message_thread_id=deps.get("ALERT_THREAD_ID"))
+    except Exception:
+        pass
 
 
 async def init_support_db(get_pool):
@@ -501,15 +532,20 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         role = "operator" if (op and op.get("status") == "approved") else "customer"
         await update.message.reply_text("Checking your Samuga Travels details...")
         dbctx = await _support_db_context(deps, user.id)
-        ans = await _ask_gemini(text, role, dbctx)
+        try:
+            ans = await _ask_gemini(text, role, dbctx)
+        except Exception as e:
+            await _send_alert(ctx, deps, "Telegram Samuga Assist Gemini", str(e), user.id)
+            ans = None
         if not ans:
-            ans = (
-                "Samuga Assist\n\n"
-                "I can help with bookings, payments, tickets, boat requests, invoices, and operator accounts.\n\n"
-                "Smart support is not active right now. Please choose a support category, or write that you want a human agent."
-            )
+            await _send_alert(ctx, deps, "Telegram Samuga Assist", "Gemini returned no answer", user.id)
+            ans = "I’m having trouble answering this safely. Would you like me to connect you with Samuga Travels support? HANDOVER_NEEDED"
         needs_human_button = bool(re.search(r"HANDOVER_NEEDED|I\s*(can'?t|cannot)\s+help|not\s+sure|unsure", ans, re.I))
         ans = re.sub(r"\s*HANDOVER_NEEDED\s*", "", ans, flags=re.I).strip()
+        if _ai_answer_is_weak(text, ans):
+            await _send_alert(ctx, deps, "Weak Telegram Samuga Assist answer", f"Question: {text}\n\nAnswer: {ans[:700]}", user.id)
+            needs_human_button = True
+            ans = "I’m not fully sure about this. Would you like me to connect you with Samuga Travels support?"
         rows = []
         if needs_human_button:
             rows.append([InlineKeyboardButton("Contact Samuga Team", callback_data="support_human")])
