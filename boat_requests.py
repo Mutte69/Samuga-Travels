@@ -504,7 +504,7 @@ async def handle_boat_request_message(update: Update, ctx: ContextTypes.DEFAULT_
             await deps["set_user_state"](user.id, deps.get("CX_IDLE", "cx_idle"), {})
             return True
         if not price or price <= 0:
-            await update.message.reply_text("⚠️ Send the trip price. Example: 7500 MVR")
+            await update.message.reply_text("⚠️ Send the customer price for this trip. Example: 7500 MVR")
             return True
         pool = await deps["get_pool"]()
         async with pool.acquire() as conn:
@@ -708,7 +708,9 @@ async def handle_boat_request_callback(update: Update, ctx: ContextTypes.DEFAULT
             return True
         await deps["set_user_state"](user.id, ADMIN_AWAIT_BR_MANUAL_PRICE, {"boat_request_id": request_id, "operator_id": operator_id})
         await query.message.reply_text(
-            f"💰 Send the price for {op['business_name']}.\n\nExample: 7500 MVR",
+            "💰 Send the customer price for this trip.\n\n"
+            "This is the price customer will see on the invoice.\n\n"
+            "Example: 7500 MVR",
             reply_markup=_main_menu_kb()
         )
         return True
