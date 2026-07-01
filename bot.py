@@ -1500,7 +1500,7 @@ async def create_text_invoice_booking(op: dict, parsed: dict, location: str):
                status, is_operator_invoice, invoice_code,
                inv_route_from, inv_route_to, inv_departure_time, inv_return_time,
                inv_location, inv_trip_type)
-            VALUES ($1,NULL,$2,'',$3,NULL,$4,$5,$6,'pending_payment',TRUE,$1,
+            VALUES ($1,0,$2,'',$3,NULL,$4,$5,$6,'pending_payment',TRUE,$1,
                     $7,$8,$9,$10,$11,$12)
         """, ref, parsed['customer_name'], op['id'], travel_date,
             int(parsed.get('passenger_count') or 1), parsed['total_amount'],
@@ -1876,6 +1876,12 @@ async def finish_text_invoice_from_location(msg, ctx, user_id: int, op: dict, pa
         return True
     except Exception as e:
         logger.error(f"Invoice creation failed: {e}", exc_info=True)
+        # Do not leave the operator stuck in invoice-location state after a failure.
+        # They can paste the invoice again and the auto-detect flow will restart cleanly.
+        try:
+            await set_user_state(user_id, OP_IDLE, {}, role="operator")
+        except Exception:
+            pass
         await msg.reply_text(
             "⚠️ Invoice could not be created. Please try again or send /start.\n\n"
             "If this keeps happening, contact @SamugaTravels.",
@@ -2461,12 +2467,29 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not op or op.get("status") != "approved":
             await update.message.reply_text("⚠️ Operator account required.")
             return
+
+        # If the operator pastes a full invoice again while the bot is waiting
+        # for a jetty/location, treat it as a NEW invoice instead of using it
+        # as the location. This prevents the repeating crash/error loop.
+        if len(text.splitlines()) >= 3:
+            new_invoice = parse_operator_invoice_text(text)
+            if new_invoice:
+                await set_user_state(user.id, OP_AWAIT_INVOICE_LOCATION,
+                                     {"invoice_parsed": new_invoice}, role="operator")
+                await send_invoice_location_prompt(update.message, new_invoice)
+                return
+
         parsed = (temp or {}).get("invoice_parsed") or {}
         if not parsed:
             await set_user_state(user.id, OP_IDLE, {}, role="operator")
             await update.message.reply_text("⚠️ Invoice session expired. Please paste the invoice again.", reply_markup=back_main_kb("operator"))
             return
         location = text.strip()
+        if not location or len(location) > 120 or "\n" in location:
+            await update.message.reply_text(
+                "⚠️ Please send only the departure location / jetty.\n\nExample: `Jetty No. 1, Male`",
+                parse_mode="Markdown", reply_markup=invoice_location_kb())
+            return
         await finish_text_invoice_from_location(update.message, ctx, user.id, op, parsed, location)
         return
 
