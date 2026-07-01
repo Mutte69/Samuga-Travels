@@ -5604,22 +5604,30 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                        COALESCE(s.route_to, b.inv_route_to) as route_to,
                        COALESCE(s.departure_time, b.inv_departure_time) as departure_time
                 FROM bookings b LEFT JOIN schedules s ON b.schedule_id=s.id
-                WHERE b.operator_id=$1 AND b.status='pending_confirmation'
+                WHERE b.operator_id=$1 AND b.status IN ('pending_payment','pending_confirmation')
                 ORDER BY b.created_at DESC LIMIT 10
             """, op["id"])
         if not rows:
             await query.message.reply_text("📦 No pending bookings.")
             return
         for b in rows:
+            status_label = (b['status'] or '').replace('_', ' ')
+            buttons = []
+            if b['status'] == 'pending_confirmation':
+                buttons.append([InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{b['id']}")])
+                buttons.append([InlineKeyboardButton("❌ Not Received / Wrong Transfer", callback_data=f"not_received_{b['id']}")])
+            else:
+                buttons.append([InlineKeyboardButton("🔔 Ping Customer", callback_data=f"op_ping_customer_{b['id']}")])
+                buttons.append([InlineKeyboardButton("❌ Cancel Unpaid Booking", callback_data=f"op_cancel_pending_{b['id']}")])
             await query.message.reply_text(
                 f"📦 *Pending Booking*\n\n🔖 `{b['booking_ref']}`\n"
                 f"📍 {b['route_from']} → {b['route_to']}\n"
                 f"📅 {b['travel_date']} @ {b['departure_time']}\n"
-                f"👥 {b['passenger_count']} passengers | 💰 MVR {b['total_amount']}",
+                f"👥 {b['passenger_count']} passengers | 💰 MVR {b['total_amount']}\n"
+                f"📌 Status: *{status_label}*",
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{b['id']}")
-                ]]))
+                reply_markup=InlineKeyboardMarkup(buttons))
+
 
 
 
@@ -5921,6 +5929,70 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"If the payment is still wrong, keep it not confirmed.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(operator_buttons))
+
+    elif data.startswith("op_ping_customer_"):
+        booking_id = int(data.split("_")[-1])
+        op = await get_operator(user.id)
+        if not op:
+            await query.answer("Operator profile not found.", show_alert=True)
+            return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            bk = await conn.fetchrow("""
+                SELECT b.*, COALESCE(s.route_from, b.inv_route_from) as route_from,
+                       COALESCE(s.route_to, b.inv_route_to) as route_to,
+                       COALESCE(s.departure_time, b.inv_departure_time) as departure_time
+                FROM bookings b LEFT JOIN schedules s ON b.schedule_id=s.id
+                WHERE b.id=$1 AND b.operator_id=$2
+            """, booking_id, op["id"])
+        if not bk:
+            await query.answer("Booking not found.", show_alert=True)
+            return
+        if bk["status"] not in ("pending_payment", "pending_confirmation"):
+            await query.answer("This booking is not pending.", show_alert=True)
+            return
+        if not bk.get("customer_telegram_id"):
+            await query.answer("Customer has not opened the bot/payment link yet.", show_alert=True)
+            return
+        try:
+            await ctx.bot.send_message(
+                int(bk["customer_telegram_id"]),
+                f"⏳ Payment reminder\n\n"
+                f"Your booking {bk['booking_ref']} is still waiting for payment/slip upload.\n\n"
+                f"Route: {bk['route_from']} → {bk['route_to']}\n"
+                f"Date: {bk['travel_date']} @ {bk['departure_time']}\n"
+                f"Amount: MVR {bk['total_amount']}\n\n"
+                f"Please complete payment and upload your slip."
+            )
+            await query.answer("Customer ping sent.", show_alert=True)
+        except Exception as e:
+            logger.error(f"Operator ping customer failed: {e}")
+            await query.answer("Could not send ping.", show_alert=True)
+
+    elif data.startswith("op_cancel_pending_"):
+        booking_id = int(data.split("_")[-1])
+        op = await get_operator(user.id)
+        if not op:
+            await query.answer("Operator profile not found.", show_alert=True)
+            return
+        pool = await get_pool()
+        async with pool.acquire() as conn:
+            bk = await conn.fetchrow("SELECT id, booking_ref, status, operator_id FROM bookings WHERE id=$1", booking_id)
+        if not bk or bk["operator_id"] != op["id"]:
+            await query.answer("Booking not found.", show_alert=True)
+            return
+        if bk["status"] not in ("pending_payment", "pending_confirmation"):
+            await query.answer("Only pending bookings can be cancelled here.", show_alert=True)
+            return
+        result, msg_code = await cancel_booking(booking_id, f"operator_{user.id}", "Cancelled by operator from Telegram button")
+        if not result:
+            await query.answer(msg_code, show_alert=True)
+            return
+        await safe_edit(
+            query,
+            f"❌ *Booking Cancelled*\n\nBooking `{bk['booking_ref']}` has been cancelled.",
+            parse_mode="Markdown"
+        )
 
     elif data.startswith("reject_booking_"):
         booking_id = int(data.split("_")[-1])
