@@ -46,6 +46,8 @@ BOT_TOKEN        = os.environ.get("BOT_TOKEN", "")
 if not BOT_TOKEN: raise RuntimeError("BOT_TOKEN env var not set!")
 DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 ADMIN_GROUP_ID   = int(os.environ.get("ADMIN_GROUP_ID",  "-1004397030483"))
+# Team group used to show Admin Mini App button and verify Mini App admin access.
+ADMIN_TEAM_GROUP_ID = int(os.environ.get("ADMIN_TEAM_GROUP_ID", str(ADMIN_GROUP_ID)))
 ADMIN_THREAD_ID  = int(os.environ.get("ADMIN_THREAD_ID", "2"))
 GENERAL_THREAD_ID= int(os.environ.get("GENERAL_THREAD_ID","1"))
 # Your personal Telegram ID — gets full admin access
@@ -697,6 +699,26 @@ async def init_db():
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         """)
+        # Mini App admin access control. Admin panel requires this table + team group membership.
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS admin_users (
+                id SERIAL PRIMARY KEY,
+                telegram_id BIGINT UNIQUE NOT NULL,
+                full_name TEXT,
+                username TEXT,
+                role TEXT DEFAULT 'admin',
+                added_by BIGINT,
+                is_active BOOLEAN DEFAULT TRUE,
+                created_at TIMESTAMP DEFAULT NOW(),
+                updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        for _super_admin_id in SUPER_ADMINS:
+            await conn.execute("""
+                INSERT INTO admin_users (telegram_id, full_name, role, added_by, is_active)
+                VALUES ($1, 'Super Admin', 'owner', $1, TRUE)
+                ON CONFLICT (telegram_id) DO UPDATE SET role='owner', is_active=TRUE, updated_at=NOW()
+            """, _super_admin_id)
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS places (
                 id SERIAL PRIMARY KEY,
@@ -2354,6 +2376,138 @@ async def cmd_recommend(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── ADMIN COMMANDS ────────────────────────────────────────────────────────────
 def is_admin(user_id: int, chat_id: int) -> bool:
     return user_id in SUPER_ADMINS or chat_id == ADMIN_GROUP_ID
+
+async def ensure_admin_users_table(conn):
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS admin_users (
+            id SERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE NOT NULL,
+            full_name TEXT,
+            username TEXT,
+            role TEXT DEFAULT 'admin',
+            added_by BIGINT,
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    for _super_admin_id in SUPER_ADMINS:
+        await conn.execute("""
+            INSERT INTO admin_users (telegram_id, full_name, role, added_by, is_active)
+            VALUES ($1, 'Super Admin', 'owner', $1, TRUE)
+            ON CONFLICT (telegram_id) DO UPDATE SET role='owner', is_active=TRUE, updated_at=NOW()
+        """, _super_admin_id)
+
+async def _is_in_team_group(ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> bool:
+    if user_id in SUPER_ADMINS:
+        return True
+    try:
+        member = await ctx.bot.get_chat_member(ADMIN_TEAM_GROUP_ID, user_id)
+        return member.status in ("creator", "administrator", "member") or (member.status == "restricted" and getattr(member, "is_member", False))
+    except Exception as e:
+        logger.warning(f"Team group membership check failed for {user_id}: {e}")
+        return False
+
+async def _resolve_target_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.reply_to_message and update.message.reply_to_message.from_user:
+        return update.message.reply_to_message.from_user
+    if ctx.args:
+        try:
+            tid = int(ctx.args[0])
+            class _U: pass
+            u = _U(); u.id = tid; u.username = None; u.full_name = str(tid)
+            return u
+        except Exception:
+            return None
+    return None
+
+async def cmd_adminpanel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Post Mini App admin panel button inside the Samuga Travels team group."""
+    chat_id = update.effective_chat.id if update.effective_chat else 0
+    if chat_id not in (ADMIN_GROUP_ID, ADMIN_TEAM_GROUP_ID) and update.effective_user.id not in SUPER_ADMINS:
+        await update.message.reply_text("⛔ Use this inside the Samuga Travels team group.")
+        return
+    if not WEBAPP_URL:
+        await update.message.reply_text("⚠️ WEBAPP_URL is not set in Railway.")
+        return
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛠 Open Admin Panel", url=WEBAPP_URL)]])
+    await update.message.reply_text(
+        "🛠 *Samuga Travels Admin Panel*\n\n"
+        "Manage bookings, operators, boat requests, payments and reports.\n\n"
+        "Only approved team admins can open the admin panel.",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+async def cmd_addadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Owner command: reply /addadmin or /addadmin <telegram_id>."""
+    user = update.effective_user
+    if user.id not in SUPER_ADMINS:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+    target = await _resolve_target_user(update, ctx)
+    if not target:
+        await update.message.reply_text("Reply to a team member with /addadmin, or use /addadmin <telegram_id>.")
+        return
+    if not await _is_in_team_group(ctx, int(target.id)):
+        await update.message.reply_text("⚠️ That user is not inside the Samuga Travels team group. Add them to the group first.")
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await ensure_admin_users_table(conn)
+        await conn.execute("""
+            INSERT INTO admin_users (telegram_id, full_name, username, role, added_by, is_active, updated_at)
+            VALUES ($1,$2,$3,'admin',$4,TRUE,NOW())
+            ON CONFLICT (telegram_id) DO UPDATE SET
+                full_name=EXCLUDED.full_name,
+                username=EXCLUDED.username,
+                role=CASE WHEN admin_users.role='owner' THEN 'owner' ELSE 'admin' END,
+                added_by=EXCLUDED.added_by,
+                is_active=TRUE,
+                updated_at=NOW()
+        """, int(target.id), getattr(target, 'full_name', str(target.id)) or str(target.id), getattr(target, 'username', None), user.id)
+    await update.message.reply_text(f"✅ Added Mini App admin access for {getattr(target, 'full_name', target.id)} ({target.id}).")
+
+async def cmd_removeadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in SUPER_ADMINS:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+    target = await _resolve_target_user(update, ctx)
+    if not target:
+        await update.message.reply_text("Reply to an admin with /removeadmin, or use /removeadmin <telegram_id>.")
+        return
+    if int(target.id) in SUPER_ADMINS:
+        await update.message.reply_text("⚠️ Cannot remove owner/super admin from here. Update SUPER_ADMINS in Railway if needed.")
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await ensure_admin_users_table(conn)
+        await conn.execute("UPDATE admin_users SET is_active=FALSE, updated_at=NOW() WHERE telegram_id=$1", int(target.id))
+    await update.message.reply_text(f"✅ Removed Mini App admin access for {getattr(target, 'full_name', target.id)} ({target.id}).")
+
+async def cmd_listadmins(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in SUPER_ADMINS:
+        await update.message.reply_text("⛔ Owner only.")
+        return
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await ensure_admin_users_table(conn)
+        rows = await conn.fetch("""
+            SELECT telegram_id, full_name, username, role, is_active
+            FROM admin_users
+            WHERE is_active=TRUE
+            ORDER BY role DESC, created_at ASC
+        """)
+    if not rows:
+        await update.message.reply_text("No Mini App admins added yet.")
+        return
+    lines = ["👥 *Mini App Admins*\n"]
+    for r in rows:
+        uname = f"@{r['username']}" if r['username'] else ""
+        lines.append(f"• `{r['telegram_id']}` — {r['full_name'] or ''} {uname} · {r['role']}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Main admin dashboard — /admin"""
@@ -6841,6 +6995,10 @@ async def main():
     app.add_handler(CommandHandler("register",  cmd_register))
     app.add_handler(CommandHandler("recommend", cmd_recommend))
     app.add_handler(CommandHandler("admin",     cmd_admin))
+    app.add_handler(CommandHandler("adminpanel", cmd_adminpanel))
+    app.add_handler(CommandHandler("addadmin",   cmd_addadmin))
+    app.add_handler(CommandHandler("removeadmin",cmd_removeadmin))
+    app.add_handler(CommandHandler("listadmins", cmd_listadmins))
     app.add_handler(CommandHandler("ops",       cmd_ops))
     app.add_handler(CommandHandler("urgent",       cmd_urgent))
     app.add_handler(CommandHandler("deletemydata", cmd_delete_my_data))
