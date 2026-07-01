@@ -114,6 +114,7 @@ ADMIN_AWAIT_REVIEW_TEXT="admin_await_review_text"
 # Subscription states
 OP_AWAIT_SUB_SLIP="op_await_sub_slip"
 OP_AWAIT_INVOICE_LOCATION="op_await_invoice_location"
+OP_AWAIT_INVOICE_TEXT="op_await_invoice_text"
 
 # ── SMART INPUT HELPERS ──────────────────────────────────────────────────────
 def normalize_input(text: str) -> str:
@@ -1643,13 +1644,14 @@ def main_kb(role="customer"):
     if role == "operator":
         return InlineKeyboardMarkup([
             [InlineKeyboardButton("📋 My Profile",       callback_data="op_profile"),
-             InlineKeyboardButton("🗓️ Add Schedule",     callback_data="op_schedules")],
-            [InlineKeyboardButton("🚤 My Fleet",         callback_data="op_fleet"),
-             InlineKeyboardButton("📦 Pending Bookings", callback_data="op_bookings")],
-            [InlineKeyboardButton("📅 Today's Schedule", callback_data="op_today"),
-             InlineKeyboardButton("📊 Monthly Report",   callback_data="op_monthly_report")],
-            [InlineKeyboardButton("✏️ Edit Info",        callback_data="op_edit"),
-             InlineKeyboardButton("🤖 Ask SamugaAI",    callback_data="op_ai_chat")],
+             InlineKeyboardButton("🧾 Create Invoice",   callback_data="op_create_invoice")],
+            [InlineKeyboardButton("🗓️ Add Schedule",     callback_data="op_schedules"),
+             InlineKeyboardButton("🚤 My Fleet",         callback_data="op_fleet")],
+            [InlineKeyboardButton("📦 Pending Bookings", callback_data="op_bookings"),
+             InlineKeyboardButton("📅 Today's Schedule", callback_data="op_today")],
+            [InlineKeyboardButton("📊 Monthly Report",   callback_data="op_monthly_report"),
+             InlineKeyboardButton("✏️ Edit Info",        callback_data="op_edit")],
+            [InlineKeyboardButton("🤖 Ask SamugaAI",    callback_data="op_ai_chat")],
         ])
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🚢 Book a Trip",            callback_data="cx_search"),
@@ -1663,6 +1665,27 @@ def boat_type_kb():
         [InlineKeyboardButton("⛴️ Ferry Service",  callback_data="type_ferry")],
         [InlineKeyboardButton("🛥️ Private Hire",   callback_data="type_private")],
     ])
+
+
+def back_main_kb(role="customer"):
+    """Small universal back-to-menu button for messages that need an escape hatch."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+
+def invoice_help_kb():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+
+def invoice_help_text():
+    return (
+        "🧾 *Create Invoice by Text*\n\n"
+        "Paste invoice details in a simple format. Example:\n\n"
+        "`Customer Name\n"
+        "30/07/26 15:00\n"
+        "Hulhumale Jetty to Sandbank\n"
+        "Return Hulhumale Jetty\n"
+        "7500 MVR`\n\n"
+        "You can use `RF`, `MVR`, `USD`, or leave currency blank — blank means MVR.\n"
+        "After that I will ask for departure location/jetty and create the PDF invoice + payment link."
+    )
 
 # ── COMMANDS ──────────────────────────────────────────────────────────────────
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2195,6 +2218,41 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     temp = sd.get("temp_data", {}) or {}
     text = (update.message.text or "").strip()
 
+    # ── OPERATOR INVOICE AUTO-DETECT ─────────────────────────────────────────
+    # Operators may just paste invoice details without using /invoice.
+    # If the text looks like an invoice, switch into invoice flow even if they
+    # were accidentally inside schedule setup.
+    op_for_invoice = await get_operator(user.id)
+    if op_for_invoice and op_for_invoice.get("status") == "approved" and state != OP_AWAIT_INVOICE_LOCATION:
+        invoice_like = state == OP_AWAIT_INVOICE_TEXT or len(text.splitlines()) >= 3
+        protected_states = [CX_AI_CHAT, OP_AI_CHAT, ADMIN_AWAIT_BROADCAST, ADMIN_AWAIT_REVIEW_TEXT,
+                            OP_AWAIT_SUB_SLIP, OP_AWAIT_REFUND_SLIP, CX_AWAIT_REFUND_ACCOUNT,
+                            CX_AWAIT_PAYMENT_SLIP, CX_AWAIT_INVOICE_SLIP]
+        if invoice_like and state not in protected_states:
+            parsed_invoice = parse_operator_invoice_text(text)
+            if parsed_invoice:
+                await set_user_state(user.id, OP_AWAIT_INVOICE_LOCATION,
+                                     {"invoice_parsed": parsed_invoice}, role="operator")
+                return_line = f"\n🔁 Return: {parsed_invoice.get('return_to')}" if parsed_invoice.get('return_to') else ""
+                await update.message.reply_text(
+                    f"🧾 *Invoice details read*\n\n"
+                    f"👤 Customer: *{parsed_invoice['customer_name']}*\n"
+                    f"📅 Date: *{parsed_invoice['travel_date']}*\n"
+                    f"🕐 Time: *{parsed_invoice['departure_time']}*\n"
+                    f"📍 Route: *{parsed_invoice['route_from']} → {parsed_invoice['route_to']}*"
+                    f"{return_line}\n"
+                    f"💰 Total: *{parsed_invoice.get('currency','MVR')} {parsed_invoice['total_amount']}*\n\n"
+                    f"📌 Now send the *departure location / jetty*.\n"
+                    f"Example: `Jetty No. 1, Male` or `Hulhumale Jetty`",
+                    parse_mode="Markdown", reply_markup=back_main_kb("operator"))
+                return
+            elif state == OP_AWAIT_INVOICE_TEXT:
+                await update.message.reply_text(
+                    "⚠️ I couldn't read that invoice. Please use this simple format:\n\n"
+                    "`Customer Name\n30/07/26 15:00\nHulhumale Jetty to Sandbank\nReturn Hulhumale Jetty\n7500 MVR`",
+                    parse_mode="Markdown", reply_markup=back_main_kb("operator"))
+                return
+
     # ── OPERATOR TEXT INVOICE FLOW ──────────────────────────────────────────
     if state == OP_AWAIT_INVOICE_LOCATION:
         if is_cancel(text):
@@ -2208,7 +2266,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parsed = (temp or {}).get("invoice_parsed") or {}
         if not parsed:
             await set_user_state(user.id, OP_IDLE, {}, role="operator")
-            await update.message.reply_text("⚠️ Invoice session expired. Please paste the invoice again.")
+            await update.message.reply_text("⚠️ Invoice session expired. Please paste the invoice again.", reply_markup=back_main_kb("operator"))
             return
         location = text.strip()
         bk, link = await create_text_invoice_booking(op, parsed, location)
@@ -3212,7 +3270,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"💰 Total: *{parsed_invoice.get('currency','MVR')} {parsed_invoice['total_amount']}*\n\n"
                     f"📌 Now send the *departure location / jetty*.\n"
                     f"Example: `Jetty No. 1, Male` or `Hulhumale Jetty`",
-                    parse_mode="Markdown")
+                    parse_mode="Markdown", reply_markup=back_main_kb("operator"))
                 return
 
         # Default — route search from text
@@ -3588,7 +3646,23 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     sd   = await get_user_state(user.id)
     temp = sd.get("temp_data", {}) or {}
 
-    if data == "register_operator":
+    if data == "main_menu":
+        op = await get_operator(user.id)
+        role = "operator" if (op and op.get("status") == "approved") else "customer"
+        await set_user_state(user.id, OP_IDLE if role == "operator" else CX_IDLE, {}, role=role)
+        await query.message.reply_text(
+            "🏠 *Main Menu*\n\nChoose an option below 👇",
+            parse_mode="Markdown", reply_markup=main_kb(role))
+
+    elif data == "op_create_invoice":
+        op = await get_operator(user.id)
+        if not op or op.get("status") != "approved":
+            await query.answer("Operator account required.", show_alert=True)
+            return
+        await set_user_state(user.id, OP_AWAIT_INVOICE_TEXT, {}, role="operator")
+        await query.message.reply_text(invoice_help_text(), parse_mode="Markdown", reply_markup=invoice_help_kb())
+
+    elif data == "register_operator":
         await start_op_reg(update, ctx)
 
     elif data.startswith("inv_upload_"):
@@ -6162,16 +6236,8 @@ async def main():
         if not op or op.get("status") != "approved":
             await u.message.reply_text("⚠️ Operator account required.")
             return
-        await u.message.reply_text(
-            "🧾 *Create Invoice by Text*\n\n"
-            "Paste invoice details like this:\n\n"
-            "`Customer Name\n"
-            "30/07/26 15:00\n"
-            "Hulhumale Jetty to Sandbank\n"
-            "Return Hulhumale Jetty\n"
-            "7500 MVR`\n\n"
-            "Then I will ask for the departure location/jetty and create the PDF + shareable payment link.",
-            parse_mode="Markdown")
+        await set_user_state(u.effective_user.id, OP_AWAIT_INVOICE_TEXT, {}, role="operator")
+        await u.message.reply_text(invoice_help_text(), parse_mode="Markdown", reply_markup=invoice_help_kb())
     async def cmd_mybookings_shortcut(u, c):
         await run_callback_shortcut(u, c, "cx_my_bookings")
     async def cmd_help_full(u, c):
