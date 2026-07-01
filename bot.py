@@ -34,7 +34,7 @@ from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, Image as RLImage
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 import boat_requests
 
@@ -111,6 +111,7 @@ COMMON_PLACES = [
 def clean_place_name(name: str) -> str:
     return " ".join(str(name or "").strip().split()).title()
 WEBAPP_URL       = os.environ.get("WEBAPP_URL", "")  # Optional Mini App URL for admin/operator web app
+BOT_USERNAME     = os.environ.get("BOT_USERNAME", "SamugaTravelsBot").lstrip("@")
 
 # ── STATES ────────────────────────────────────────────────────────────────────
 OP_IDLE="op_idle"; OP_AWAIT_BUSINESS_NAME="op_await_business_name"
@@ -2178,6 +2179,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if args and args[0].startswith("inv_"):
         await show_invoice_to_customer(update, ctx, args[0].replace("inv_", "").strip())
         return
+    if args and args[0] == "adminpanel":
+        await send_admin_panel_private_button(update, ctx)
+        return
     sd = await get_user_state(user.id)
     role = sd.get("role","customer")
     if role == "operator":
@@ -2421,19 +2425,57 @@ async def _resolve_target_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return None
     return None
 
-async def cmd_adminpanel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Post Mini App admin panel button inside the Samuga Travels team group."""
-    chat_id = update.effective_chat.id if update.effective_chat else 0
-    if chat_id not in (ADMIN_GROUP_ID, ADMIN_TEAM_GROUP_ID) and update.effective_user.id not in SUPER_ADMINS:
-        await update.message.reply_text("⛔ Use this inside the Samuga Travels team group.")
-        return
+def _admin_panel_webapp_url() -> str:
+    """Return Mini App URL opened directly on admin panel."""
+    if not WEBAPP_URL:
+        return ""
+    sep = "&" if "?" in WEBAPP_URL else "?"
+    return f"{WEBAPP_URL}{sep}admin=1"
+
+async def send_admin_panel_private_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Send a real Telegram Mini App button in private chat.
+
+    Group URL buttons open as a normal browser and do not pass Telegram WebApp
+    user data. Admin access needs WebApp initData, so the group button deep-links
+    the user to the bot private chat first; the private chat then opens WebApp.
+    """
     if not WEBAPP_URL:
         await update.message.reply_text("⚠️ WEBAPP_URL is not set in Railway.")
         return
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛠 Open Admin Panel", url=WEBAPP_URL)]])
+    url = _admin_panel_webapp_url()
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛠 Open Admin Panel", web_app=WebAppInfo(url=url))]])
     await update.message.reply_text(
         "🛠 *Samuga Travels Admin Panel*\n\n"
-        "Manage bookings, operators, boat requests, payments and reports.\n\n"
+        "Tap below to open the secure Mini App admin panel.\n\n"
+        "Only approved team admins can access it.",
+        parse_mode="Markdown",
+        reply_markup=kb,
+    )
+
+async def cmd_adminpanel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Post/open Mini App admin panel access."""
+    chat = update.effective_chat
+    chat_id = chat.id if chat else 0
+    user_id = update.effective_user.id if update.effective_user else 0
+    if not WEBAPP_URL:
+        await update.message.reply_text("⚠️ WEBAPP_URL is not set in Railway.")
+        return
+
+    # In private chat we can use a real Telegram WebApp button, which provides
+    # initData so api.py can verify the user and show the admin panel.
+    if chat and chat.type == "private":
+        await send_admin_panel_private_button(update, ctx)
+        return
+
+    if chat_id not in (ADMIN_GROUP_ID, ADMIN_TEAM_GROUP_ID) and user_id not in SUPER_ADMINS:
+        await update.message.reply_text("⛔ Use this inside the Samuga Travels team group.")
+        return
+
+    deep_link = f"https://t.me/{BOT_USERNAME}?start=adminpanel"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛠 Open Admin Panel", url=deep_link)]])
+    await update.message.reply_text(
+        "🛠 *Samuga Travels Admin Panel*\n\n"
+        "Tap below. Telegram will open the bot private chat, then tap *Open Admin Panel*.\n\n"
         "Only approved team admins can open the admin panel.",
         parse_mode="Markdown",
         reply_markup=kb,
