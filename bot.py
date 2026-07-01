@@ -113,6 +113,7 @@ ADMIN_AWAIT_LOGO="admin_await_logo"
 ADMIN_AWAIT_REVIEW_TEXT="admin_await_review_text"
 # Subscription states
 OP_AWAIT_SUB_SLIP="op_await_sub_slip"
+OP_AWAIT_INVOICE_LOCATION="op_await_invoice_location"
 
 # ── SMART INPUT HELPERS ──────────────────────────────────────────────────────
 def normalize_input(text: str) -> str:
@@ -277,6 +278,110 @@ def parse_bulk_departures(text: str):
                 "full_route": " → ".join(parts)
             })
     return results if results else None
+
+
+def _parse_invoice_date(raw: str):
+    """Parse operator invoice dates such as 22/06/26, 22-06-2026, 2026-06-22."""
+    from datetime import datetime as _dt
+    raw = (raw or "").strip().replace(".", "/").replace("-", "/")
+    for fmt in ["%d/%m/%y", "%d/%m/%Y", "%Y/%m/%d"]:
+        try:
+            return _dt.strptime(raw, fmt).date()
+        except ValueError:
+            pass
+    return None
+
+def _parse_invoice_amount(line: str):
+    """Return (amount, currency) from values like 7500, 7500rf, Price 7500mvr, 500 usd."""
+    import re
+    txt = (line or "").strip().lower().replace(",", "")
+    m = re.search(r"(?:price\s*)?([0-9]+(?:\.[0-9]+)?)\s*(mvr|rf|mrf|usd|dollar|dollars)?", txt)
+    if not m:
+        return None, "MVR"
+    currency = (m.group(2) or "mvr").upper()
+    if currency in ["RF", "MRF"]:
+        currency = "MVR"
+    if currency in ["DOLLAR", "DOLLARS"]:
+        currency = "USD"
+    return float(m.group(1)), currency
+
+def parse_operator_invoice_text(text: str) -> dict | None:
+    """Flexible invoice parser for operator free-text invoices.
+
+    Expected loose shape:
+      Customer/business name
+      Date [time] OR daypart time
+      Route from to destination
+      Return destination (optional)
+      Price amount
+    """
+    import re
+    lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
+    if len(lines) < 3:
+        return None
+
+    customer_name = lines[0]
+    travel_date = None
+    departure_time = None
+    route_from = route_to = return_to = None
+    total_amount = None
+    currency = "MVR"
+
+    # date + optional time can be on one line
+    time_re = re.compile(r"(\d{1,2}\s*[:;.]\s*\d{2}\s*(?:am|pm)?|\d{1,2}\s*(?:am|pm))", re.I)
+    date_re = re.compile(r"(\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}|\d{4}[/.\-]\d{1,2}[/.\-]\d{1,2})")
+
+    for line in lines[1:]:
+        low = line.lower().strip()
+        # amount/price line
+        if "price" in low or re.search(r"\d+\s*(mvr|rf|mrf|usd|dollar|dollars)$", low) or re.fullmatch(r"\d+(?:\.\d+)?", low):
+            amt, cur = _parse_invoice_amount(line)
+            if amt is not None:
+                total_amount, currency = amt, cur
+                continue
+        # date/time line
+        dm = date_re.search(line)
+        if dm:
+            travel_date = _parse_invoice_date(dm.group(1))
+            tm = time_re.search(line[dm.end():] or line)
+            if tm:
+                departure_time = parse_time_24hr(tm.group(1).replace(";", ":"))
+            continue
+        # separate daypart/time line
+        tm = time_re.search(line)
+        if tm and not departure_time:
+            departure_time = parse_time_24hr(tm.group(1).replace(";", ":"))
+            continue
+        # return line
+        if low.startswith("return"):
+            return_to = re.sub(r"^return\s*", "", line, flags=re.I).strip().title()
+            continue
+        # route line: accepts first ' to '
+        if re.search(r"\bto\b", line, flags=re.I):
+            parts = re.split(r"\bto\b", line, maxsplit=1, flags=re.I)
+            if len(parts) == 2:
+                route_from = parts[0].strip().title()
+                route_to = parts[1].strip().title()
+
+    if not (customer_name and travel_date and route_from and route_to and total_amount):
+        return None
+    if not departure_time:
+        departure_time = "TBA"
+    return {
+        "customer_name": customer_name.strip(),
+        "travel_date": str(travel_date),
+        "departure_time": departure_time,
+        "route_from": route_from,
+        "route_to": route_to,
+        "return_to": return_to,
+        "trip_type": "roundtrip" if return_to else "oneway",
+        "total_amount": total_amount,
+        "currency": currency,
+        "passenger_count": 1,
+    }
+
+def _gen_invoice_code():
+    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
 
 # ── DB POOL ───────────────────────────────────────────────────────────────────
 _pool = None
@@ -1196,6 +1301,81 @@ async def upload_image(file_bytes: bytes, folder: str, filename: str) -> str:
         public_id=filename, overwrite=True, resource_type="image")
     return result["secure_url"]
 
+
+async def generate_invoice_pdf(invoice: dict, operator: dict, invoice_link: str) -> bytes:
+    """Simple PDF invoice for operator-created phone/private-hire bookings."""
+    from reportlab.lib.colors import HexColor
+    from reportlab.platypus import HRFlowable
+    buf = io.BytesIO()
+    ST_NAVY = HexColor('#0D2137'); ST_BLUE = HexColor('#1B6CA8')
+    ST_LIGHT = HexColor('#E8F4FD'); ST_TEXT = HexColor('#1A2733')
+    ST_MUTED = HexColor('#6B8A9E'); ST_ACCENT = HexColor('#00B4D8')
+    doc = SimpleDocTemplate(buf, pagesize=A4, rightMargin=15*mm, leftMargin=15*mm,
+                            topMargin=15*mm, bottomMargin=15*mm)
+    story = []
+    title = Table([[f"SAMUGA TRAVELS INVOICE · {invoice['booking_ref']}"]], colWidths=[175*mm])
+    title.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,-1),ST_NAVY),('TEXTCOLOR',(0,0),(-1,-1),colors.white),
+        ('FONTNAME',(0,0),(-1,-1),'Helvetica-Bold'),('FONTSIZE',(0,0),(-1,-1),13),
+        ('ALIGN',(0,0),(-1,-1),'CENTER'),('PADDING',(0,0),(-1,-1),10)
+    ]))
+    story.append(title); story.append(Spacer(1,4*mm))
+    pstyle = ParagraphStyle('iv', fontName='Helvetica', fontSize=10, textColor=ST_TEXT)
+    hstyle = ParagraphStyle('ih', fontName='Helvetica-Bold', fontSize=9, textColor=ST_MUTED)
+    rows = [
+        [Paragraph('CUSTOMER', hstyle), Paragraph(invoice.get('customer_name',''), pstyle)],
+        [Paragraph('OPERATOR', hstyle), Paragraph(operator.get('business_name',''), pstyle)],
+        [Paragraph('ROUTE', hstyle), Paragraph(f"{invoice.get('inv_route_from')} → {invoice.get('inv_route_to')}", pstyle)],
+        [Paragraph('DATE / TIME', hstyle), Paragraph(f"{invoice.get('travel_date')} @ {invoice.get('inv_departure_time')}", pstyle)],
+        [Paragraph('RETURN', hstyle), Paragraph(invoice.get('inv_return_time') or 'N/A', pstyle)],
+        [Paragraph('LOCATION', hstyle), Paragraph(invoice.get('inv_location') or 'TBA', pstyle)],
+        [Paragraph('TOTAL', hstyle), Paragraph(f"{invoice.get('currency','MVR')} {invoice.get('total_amount')}", ParagraphStyle('total', fontName='Helvetica-Bold', fontSize=12, textColor=ST_BLUE))],
+    ]
+    t = Table(rows, colWidths=[42*mm,133*mm])
+    t.setStyle(TableStyle([
+        ('BACKGROUND',(0,0),(-1,-1),ST_LIGHT),('BOX',(0,0),(-1,-1),1,ST_ACCENT),
+        ('INNERGRID',(0,0),(-1,-1),0.3,HexColor('#D0E8F5')),('PADDING',(0,0),(-1,-1),8),
+        ('VALIGN',(0,0),(-1,-1),'MIDDLE')
+    ]))
+    story.append(t); story.append(Spacer(1,5*mm))
+    story.append(Paragraph('<b>Payment / booking link:</b>', hstyle))
+    story.append(Paragraph(invoice_link, ParagraphStyle('link', fontName='Helvetica', fontSize=8, textColor=ST_BLUE)))
+    story.append(Spacer(1,4*mm)); story.append(HRFlowable(width='100%', thickness=1, color=ST_ACCENT))
+    story.append(Paragraph('Customer must double-check account number and account name before transfer. If money is sent to a wrong bank/account, Samuga Travels and the operator cannot refund it; customer must contact their bank.', ParagraphStyle('note', fontName='Helvetica', fontSize=8, textColor=ST_MUTED, alignment=TA_CENTER, spaceBefore=4)))
+    doc.build(story)
+    return buf.getvalue()
+
+async def create_text_invoice_booking(op: dict, parsed: dict, location: str):
+    """Create an operator invoice from parsed text and update route coverage."""
+    ref = gen_ref()
+    link = f"https://t.me/SamugaTravelsBot?start=inv_{ref}"
+    return_time = parsed.get('return_to') or None
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO bookings
+              (booking_ref, customer_telegram_id, customer_name, customer_phone,
+               operator_id, schedule_id, travel_date, passenger_count, total_amount,
+               status, is_operator_invoice, invoice_code,
+               inv_route_from, inv_route_to, inv_departure_time, inv_return_time,
+               inv_location, inv_trip_type)
+            VALUES ($1,NULL,$2,'',$3,NULL,$4,$5,$6,'pending_payment',TRUE,$1,
+                    $7,$8,$9,$10,$11,$12)
+        """, ref, parsed['customer_name'], op['id'], parsed['travel_date'],
+            int(parsed.get('passenger_count') or 1), parsed['total_amount'],
+            parsed['route_from'], parsed['route_to'], parsed['departure_time'],
+            return_time, location, parsed.get('trip_type','oneway'))
+        # Add invoice route words to operator coverage so we can later use them in search/profile.
+        await conn.execute("""
+            UPDATE operators
+            SET routes = (
+                SELECT ARRAY(SELECT DISTINCT unnest(COALESCE(routes, ARRAY[]::TEXT[]) || ARRAY[$1,$2]))
+            )
+            WHERE id=$3
+        """, parsed['route_from'], parsed['route_to'], op['id'])
+        bk = await conn.fetchrow("SELECT * FROM bookings WHERE booking_ref=$1", ref)
+    return dict(bk), link
+
 # ── PDF TICKET ────────────────────────────────────────────────────────────────
 SAMUGA_LOGO_URL = "https://res.cloudinary.com/dfhj3clbh/image/upload/samuga_travels/logos/logo_{user_id}"
 
@@ -2014,6 +2194,50 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     state= sd.get("state", CX_IDLE)
     temp = sd.get("temp_data", {}) or {}
     text = (update.message.text or "").strip()
+
+    # ── OPERATOR TEXT INVOICE FLOW ──────────────────────────────────────────
+    if state == OP_AWAIT_INVOICE_LOCATION:
+        if is_cancel(text):
+            await set_user_state(user.id, OP_IDLE, {}, role="operator")
+            await update.message.reply_text("❌ Invoice cancelled.", reply_markup=main_kb("operator"))
+            return
+        op = await get_operator(user.id)
+        if not op or op.get("status") != "approved":
+            await update.message.reply_text("⚠️ Operator account required.")
+            return
+        parsed = (temp or {}).get("invoice_parsed") or {}
+        if not parsed:
+            await set_user_state(user.id, OP_IDLE, {}, role="operator")
+            await update.message.reply_text("⚠️ Invoice session expired. Please paste the invoice again.")
+            return
+        location = text.strip()
+        bk, link = await create_text_invoice_booking(op, parsed, location)
+        try:
+            pdf_bytes = await generate_invoice_pdf({**bk, "currency": parsed.get("currency","MVR")}, op, link)
+            pdf_buf = io.BytesIO(pdf_bytes); pdf_buf.name = f"invoice_{bk['booking_ref']}.pdf"
+            await update.message.reply_document(
+                document=pdf_buf,
+                caption=(
+                    f"🧾 *Invoice Created*\n\n"
+                    f"Ref: `{bk['booking_ref']}`\n"
+                    f"Customer: *{bk['customer_name']}*\n"
+                    f"Route: {bk['inv_route_from']} → {bk['inv_route_to']}\n"
+                    f"Date: {bk['travel_date']} @ {bk['inv_departure_time']}\n"
+                    f"Total: *{parsed.get('currency','MVR')} {bk['total_amount']}*\n\n"
+                    f"Share this link with the customer:\n{link}"
+                ),
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Copy / Open Invoice", url=link)]])
+            )
+        except Exception as e:
+            logger.error(f"Invoice PDF send failed: {e}", exc_info=True)
+            await update.message.reply_text(
+                f"🧾 *Invoice Created*\n\nRef: `{bk['booking_ref']}`\nShare this link:\n{link}",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Open Invoice", url=link)]])
+            )
+        await set_user_state(user.id, OP_IDLE, {}, role="operator")
+        return
 
     # ── REFUND FLOW ──────────────────────────────────────────────────────────
     if state == CX_AWAIT_REFUND_ACCOUNT:
@@ -2970,6 +3194,27 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 ]))
 
     else:
+        # Operator can paste a private-hire/ferry invoice as plain text.
+        op = await get_operator(user.id)
+        if op and op.get("status") == "approved":
+            parsed_invoice = parse_operator_invoice_text(text)
+            if parsed_invoice:
+                await set_user_state(user.id, OP_AWAIT_INVOICE_LOCATION,
+                                     {"invoice_parsed": parsed_invoice}, role="operator")
+                return_line = f"\n🔁 Return: {parsed_invoice.get('return_to')}" if parsed_invoice.get('return_to') else ""
+                await update.message.reply_text(
+                    f"🧾 *Invoice details read*\n\n"
+                    f"👤 Customer: *{parsed_invoice['customer_name']}*\n"
+                    f"📅 Date: *{parsed_invoice['travel_date']}*\n"
+                    f"🕐 Time: *{parsed_invoice['departure_time']}*\n"
+                    f"📍 Route: *{parsed_invoice['route_from']} → {parsed_invoice['route_to']}*"
+                    f"{return_line}\n"
+                    f"💰 Total: *{parsed_invoice.get('currency','MVR')} {parsed_invoice['total_amount']}*\n\n"
+                    f"📌 Now send the *departure location / jetty*.\n"
+                    f"Example: `Jetty No. 1, Male` or `Hulhumale Jetty`",
+                    parse_mode="Markdown")
+                return
+
         # Default — route search from text
         if " to " in text.lower():
             parts = text.lower().split(" to ", 1)
@@ -5912,6 +6157,21 @@ async def main():
         await run_callback_shortcut(u, c, "op_today")
     async def cmd_search_shortcut(u, c):
         await u.message.reply_text("🔍 Type your route to search:\n_Example: Male to Thoddoo_", parse_mode="Markdown")
+    async def cmd_invoice_shortcut(u, c):
+        op = await get_operator(u.effective_user.id)
+        if not op or op.get("status") != "approved":
+            await u.message.reply_text("⚠️ Operator account required.")
+            return
+        await u.message.reply_text(
+            "🧾 *Create Invoice by Text*\n\n"
+            "Paste invoice details like this:\n\n"
+            "`Customer Name\n"
+            "30/07/26 15:00\n"
+            "Hulhumale Jetty to Sandbank\n"
+            "Return Hulhumale Jetty\n"
+            "7500 MVR`\n\n"
+            "Then I will ask for the departure location/jetty and create the PDF + shareable payment link.",
+            parse_mode="Markdown")
     async def cmd_mybookings_shortcut(u, c):
         await run_callback_shortcut(u, c, "cx_my_bookings")
     async def cmd_help_full(u, c):
@@ -5928,6 +6188,7 @@ async def main():
                 "/bookings — Pending bookings\n"
                 "/fleet — Manage your boats\n"
                 "/today — Today\'s schedule\n"
+                "/invoice — Create invoice from text\n"
                 "/status — Your account status\n"
                 "/urgent — Request urgent review\n"
                 "/cancel — Cancel current action\n"
@@ -5960,6 +6221,8 @@ async def main():
         app.add_handler(CommandHandler(cmd, lambda u, c: run_callback_shortcut(u, c, "op_monthly_report")))
     for cmd in ["search", "searchboats", "book"]:
         app.add_handler(CommandHandler(cmd, cmd_search_shortcut))
+    for cmd in ["invoice", "createinvoice", "bill"]:
+        app.add_handler(CommandHandler(cmd, cmd_invoice_shortcut))
     for cmd in ["help", "commands"]:
         app.add_handler(CommandHandler(cmd, cmd_help_full))
     app.add_handler(CallbackQueryHandler(handle_callback))
