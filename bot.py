@@ -1599,14 +1599,26 @@ async def generate_invoice_pdf(invoice: dict, operator: dict, invoice_link: str)
     story.append(Spacer(1, 3*mm))
 
     # ── Title band ───────────────────────────────────────────────────────────
-    title = Table([[f"SAMUGA TRAVELS INVOICE · {invoice['booking_ref']}"]], colWidths=[175*mm])
+    # Keep the invoice title perfectly centered inside the navy bar.
+    # Using a Paragraph + fixed row height avoids the text sitting too high/low.
+    title_style = ParagraphStyle(
+        'invoice_title_bar',
+        fontName='Helvetica-Bold',
+        fontSize=11.2,
+        leading=12.2,
+        textColor=ST_WHITE,
+        alignment=TA_CENTER,
+    )
+    title_text = Paragraph(f"SAMUGA TRAVELS INVOICE · {_esc(invoice['booking_ref'])}", title_style)
+    title = Table([[title_text]], colWidths=[175*mm], rowHeights=[8.6*mm])
     title.setStyle(TableStyle([
         ('BACKGROUND',(0,0),(-1,-1),ST_NAVY),
-        ('TEXTCOLOR',(0,0),(-1,-1),ST_WHITE),
-        ('FONTNAME',(0,0),(-1,-1),'Helvetica-Bold'),
-        ('FONTSIZE',(0,0),(-1,-1),13),
         ('ALIGN',(0,0),(-1,-1),'CENTER'),
-        ('PADDING',(0,0),(-1,-1),9)
+        ('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+        ('LEFTPADDING',(0,0),(-1,-1),0),
+        ('RIGHTPADDING',(0,0),(-1,-1),0),
+        ('TOPPADDING',(0,0),(-1,-1),0),
+        ('BOTTOMPADDING',(0,0),(-1,-1),0),
     ]))
     story.append(title)
     story.append(Spacer(1,4*mm))
@@ -2050,9 +2062,10 @@ async def finish_text_invoice_from_location(msg, ctx, user_id: int, op: dict, pa
                     f"Date: {bk['travel_date']} @ {bk['inv_departure_time']}\n"
                     f"Location: {bk.get('inv_location') or location}\n"
                     f"Total: {parsed.get('currency','MVR')} {bk['total_amount']}\n\n"
-                    f"Tap Open Invoice below and share it with the customer."
+                    f"Customer payment link:\n{link}\n\n"
+                    f"Copy this link and send it to the customer. The button below opens the same link."
                 ),
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📋 Open Invoice", url=link)],
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔗 Copy / Share Customer Link", url=link)],
                                                    [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
             )
         except Exception as e:
