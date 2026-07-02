@@ -816,8 +816,31 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         dbctx["last_bot_answer"] = last_bot_answer
         topic = _detect_support_topic(text, last_topic)
         kb_ans, kb_topic, kb_human = _kb_answer(topic, text, role, dbctx, last_topic)
+
+        # ── REPEAT GUARD ────────────────────────────────────────────────────
+        # If the canned KB answer is (nearly) identical to what we JUST sent,
+        # the customer is asking a follow-up the KB can't distinguish. Don't
+        # repeat — fall through to Gemini for a smarter reply, and if the same
+        # thing keeps happening, offer human support.
+        history = temp.get("conversation_history") or []
+        if kb_ans and last_bot_answer:
+            def _norm(x): return re.sub(r"\s+", " ", (x or "").strip().lower())[:200]
+            if _norm(kb_ans) == _norm(last_bot_answer):
+                # Count how many times we've repeated recently
+                recent_bot = [_norm(h.get("bot","")) for h in history[-3:]]
+                repeats = recent_bot.count(_norm(kb_ans))
+                if repeats >= 2:
+                    # Repeated twice already → escalate to human, don't KB again
+                    kb_ans = ("It looks like I keep giving you the same answer and I'm "
+                              "not solving your problem. Let me connect you with Samuga "
+                              "Travels support so a person can help you directly.")
+                    kb_human = True
+                    kb_topic = "human_support"
+                else:
+                    # First repeat → skip KB, let Gemini try a fresh angle
+                    kb_ans = None
+
         if kb_ans:
-            history = temp.get("conversation_history") or []
             history.append({"user": text[:500], "bot": kb_ans[:500]})
             temp.update({"last_topic": kb_topic or topic or last_topic or "general",
                          "last_user_message": text, "last_bot_answer": kb_ans[:900],
@@ -846,7 +869,14 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             await _send_alert(ctx, deps, "Weak Telegram Samuga Assist answer", f"Question: {text}\n\nAnswer: {ans[:700]}", user.id)
             needs_human_button = True
             ans = "I’m not fully sure about this. Would you like me to connect you with Samuga Travels support?"
-        history = temp.get("conversation_history") or []
+
+        # If Gemini's answer is essentially the same as the previous one, escalate.
+        def _norm2(x): return re.sub(r"\s+", " ", (x or "").strip().lower())[:200]
+        if last_bot_answer and _norm2(ans) == _norm2(last_bot_answer):
+            ans = ("I don't seem to be giving you new information. Let me connect you "
+                   "with Samuga Travels support so someone can help you directly.")
+            needs_human_button = True
+
         history.append({"user": text[:500], "bot": ans[:500]})
         temp.update({"last_topic": topic or last_topic or "general",
                      "last_user_message": text, "last_bot_answer": ans[:900],
