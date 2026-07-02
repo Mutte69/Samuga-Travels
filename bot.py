@@ -36,6 +36,33 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
+from telegram.error import BadRequest
+
+async def send_admin_msg(bot, text: str, thread_id=None, **kwargs):
+    """Send a message to the admin group topic; if the topic was deleted,
+    fall back to General so admin alerts are NEVER silently lost."""
+    from telegram.error import BadRequest as _BR
+    try:
+        return await bot.send_message(ADMIN_GROUP_ID, text,
+                                      message_thread_id=thread_id, **kwargs)
+    except _BR as e:
+        if thread_id and "thread not found" in str(e).lower():
+            logger.warning(f"Admin topic {thread_id} missing — falling back to General")
+            return await bot.send_message(ADMIN_GROUP_ID, text, **kwargs)
+        raise
+
+async def send_admin_photo(bot, photo, caption: str, thread_id=None, **kwargs):
+    """Photo variant of send_admin_msg with the same topic fallback."""
+    from telegram.error import BadRequest as _BR
+    try:
+        return await bot.send_photo(ADMIN_GROUP_ID, photo=photo, caption=caption,
+                                    message_thread_id=thread_id, **kwargs)
+    except _BR as e:
+        if thread_id and "thread not found" in str(e).lower():
+            logger.warning(f"Admin topic {thread_id} missing — falling back to General")
+            return await bot.send_photo(ADMIN_GROUP_ID, photo=photo, caption=caption, **kwargs)
+        raise
+
 import boat_requests
 import support_ai
 
@@ -2661,8 +2688,8 @@ async def cmd_urgent(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         InlineKeyboardButton("❌ Reject", callback_data=f"reject_op_{op_id}")
     ]])
     try:
-        await ctx.bot.send_message(ADMIN_GROUP_ID, urgent_msg, parse_mode="Markdown",
-                                   message_thread_id=ADMIN_THREAD_ID, reply_markup=kb)
+        await send_admin_msg(ctx.bot, urgent_msg, thread_id=ADMIN_THREAD_ID,
+                             parse_mode="Markdown", reply_markup=kb)
         await update.message.reply_text(
             "🚨 *Urgent request sent!*\n\n"
             "Our team has been notified and will review your application as soon as possible.\n\n"
@@ -4152,8 +4179,9 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 [InlineKeyboardButton("❌ Not Received / Wrong Transfer", callback_data=f"not_received_{inv_bk_id}")]
             ])
             if bk["payment_mode"] == "samuga_managed":
-                await ctx.bot.send_photo(ADMIN_GROUP_ID, photo=photo.file_id, caption=caption,
-                                         parse_mode="Markdown", message_thread_id=ADMIN_THREAD_ID, reply_markup=buttons)
+                await send_admin_photo(ctx.bot, photo.file_id, caption,
+                                       thread_id=ADMIN_THREAD_ID,
+                                       parse_mode="Markdown", reply_markup=buttons)
             else:
                 await ctx.bot.send_photo(op["telegram_id"], photo=photo.file_id, caption=caption,
                                          parse_mode="Markdown", reply_markup=buttons)
@@ -4283,16 +4311,16 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
         # Notify admin
         try:
-            await ctx.bot.send_photo(ADMIN_GROUP_ID,
-                photo=photo.file_id,
-                caption=(
+            await send_admin_photo(ctx.bot,
+                photo.file_id,
+                (
                     f"💳 *Subscription Payment*\n\n"
                     f"🏢 *{op_row['business_name']}*\n"
                     f"💰 Amount: MVR {amount}\n\n"
                     f"Approve to activate 30 days."
                 ),
+                thread_id=ADMIN_THREAD_ID,
                 parse_mode="Markdown",
-                message_thread_id=ADMIN_THREAD_ID,
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton("✅ Approve — Activate 30 Days", callback_data=f"sub_approve_{sub_id}")],
                     [InlineKeyboardButton("❌ Reject Payment", callback_data=f"sub_reject_{sub_id}")]
@@ -5772,8 +5800,8 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton("❌ Reject", callback_data=f"reject_op_{op_id}")
             ]])
             try:
-                await ctx.bot.send_message(ADMIN_GROUP_ID, urgency_msg,
-                    parse_mode="Markdown", message_thread_id=ADMIN_THREAD_ID, reply_markup=kb)
+                await send_admin_msg(ctx.bot, urgency_msg, thread_id=ADMIN_THREAD_ID,
+                    parse_mode="Markdown", reply_markup=kb)
                 await query.answer("🚨 Urgent request sent to admin!", show_alert=True)
                 await query.edit_message_text(
                     "🚨 *Urgent review request sent!*\n\n"
@@ -6360,11 +6388,9 @@ async def notify_admin_new_op(ctx, user, temp: dict, op_id: int = 0):
             logger.error(f"❌ Admin notify fallback FAILED: {e2}")
     try:
         if temp.get("logo_url"):
-            await ctx.bot.send_photo(ADMIN_GROUP_ID, photo=temp["logo_url"],
-                                     caption="🖼️ Operator Logo", message_thread_id=ADMIN_THREAD_ID)
+            await send_admin_photo(ctx.bot, temp["logo_url"], "🖼️ Operator Logo", thread_id=ADMIN_THREAD_ID)
         if temp.get("owner_id_photo_url"):
-            await ctx.bot.send_photo(ADMIN_GROUP_ID, photo=temp["owner_id_photo_url"],
-                                     caption="🪪 Owner ID", message_thread_id=ADMIN_THREAD_ID)
+            await send_admin_photo(ctx.bot, temp["owner_id_photo_url"], "🪪 Owner ID", thread_id=ADMIN_THREAD_ID)
     except Exception as e:
         logger.error(f"❌ Admin photo send FAILED: {e}")
 
