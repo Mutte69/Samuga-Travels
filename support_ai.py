@@ -476,7 +476,9 @@ async def _forward_user_text_to_open_support(update: Update, ctx: ContextTypes.D
         )
     except Exception:
         pass
-    await update.message.reply_text("✅ Sent to Samuga Travels support.")
+    # Silent customer-side forwarding: do not add an extra confirmation bubble.
+    # The customer already sees their own sent message in Telegram; admin replies
+    # will appear normally in this same chat.
     return True
 
 
