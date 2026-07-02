@@ -202,21 +202,45 @@ Samuga Travels support rules:
 
 
 def _gemini_prompt(user_text: str, role: str, db_context: dict) -> str:
+    # Build conversation history from rolling window (last 4 turns)
+    history = db_context.get("conversation_history") or []
+    history_text = ""
+    if history:
+        turns = []
+        for turn in history[-4:]:
+            turns.append(f"Customer: {turn.get('user','')}")
+            if turn.get('bot'):
+                turns.append(f"Samuga Assist: {turn.get('bot','')}")
+        history_text = "\n".join(turns)
+    else:
+        # Fallback to single-turn context for backwards compatibility
+        if db_context.get("last_user_message"):
+            history_text = (f"Customer: {db_context.get('last_user_message') or ''}\n"
+                           f"Samuga Assist: {db_context.get('last_bot_answer') or ''}")
+
     return f"""{_rulebook()}
 
 User role: {role}
-Previous support topic: {db_context.get("last_topic") or "none"}
-Previous user message: {db_context.get("last_user_message") or "none"}
-Previous assistant answer: {db_context.get("last_bot_answer") or "none"}
-Database context JSON:
-{json.dumps(db_context, ensure_ascii=False, default=str)[:9000]}
+Current support topic: {db_context.get("last_topic") or "none"}
 
-User message:
+IMPORTANT: Read the full conversation history below before answering.
+Never repeat the same answer if the customer is asking a follow-up.
+If the customer says "I already did that" or "that didn't work" or refers to a previous message,
+acknowledge it and give a DIFFERENT, more specific answer or offer human support.
+If you already gave the same answer and the customer is still stuck, always offer: HANDOVER_NEEDED
+
+Conversation so far:
+{history_text or "No previous messages."}
+
+Database context JSON:
+{json.dumps({k:v for k,v in db_context.items() if k not in ("conversation_history","last_user_message","last_bot_answer")}, ensure_ascii=False, default=str)[:8000]}
+
+Customer's new message:
 {user_text}
 
-Write the best support reply now.
+Write the best support reply now. Be specific and address their exact situation.
 If you can answer/help, answer directly and do not mention human support.
-If the user clearly asks for a human or you cannot answer safely, end the reply with exactly: HANDOVER_NEEDED"""
+If the customer clearly asks for a human, you cannot answer safely, or you have already tried to help with the same issue twice, end the reply with exactly: HANDOVER_NEEDED"""
 
 
 def _call_gemini_sync(prompt: str) -> str | None:
@@ -793,7 +817,11 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         topic = _detect_support_topic(text, last_topic)
         kb_ans, kb_topic, kb_human = _kb_answer(topic, text, role, dbctx, last_topic)
         if kb_ans:
-            temp.update({"last_topic": kb_topic or topic or last_topic or "general", "last_user_message": text, "last_bot_answer": kb_ans[:900]})
+            history = temp.get("conversation_history") or []
+            history.append({"user": text[:500], "bot": kb_ans[:500]})
+            temp.update({"last_topic": kb_topic or topic or last_topic or "general",
+                         "last_user_message": text, "last_bot_answer": kb_ans[:900],
+                         "conversation_history": history[-6:]})
             await deps["set_user_state"](user.id, SUPPORT_AI_CHAT, temp, role=role)
             rows = []
             if kb_human:
@@ -818,7 +846,11 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             await _send_alert(ctx, deps, "Weak Telegram Samuga Assist answer", f"Question: {text}\n\nAnswer: {ans[:700]}", user.id)
             needs_human_button = True
             ans = "I’m not fully sure about this. Would you like me to connect you with Samuga Travels support?"
-        temp.update({"last_topic": topic or last_topic or "general", "last_user_message": text, "last_bot_answer": ans[:900]})
+        history = temp.get("conversation_history") or []
+        history.append({"user": text[:500], "bot": ans[:500]})
+        temp.update({"last_topic": topic or last_topic or "general",
+                     "last_user_message": text, "last_bot_answer": ans[:900],
+                     "conversation_history": history[-6:]})
         await deps["set_user_state"](user.id, SUPPORT_AI_CHAT, temp, role=role)
         rows = []
         if needs_human_button:

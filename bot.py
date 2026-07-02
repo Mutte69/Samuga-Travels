@@ -4402,11 +4402,68 @@ async def handle_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown")
 
     else:
-        # Allow cancel via text — but if they sent a photo we just guide them
-        await update.message.reply_text(
-            "⚠️ Wasn't expecting an image right now.\n\n"
-            "Type `cancel` to go back to the main menu, or /start to restart.",
-            parse_mode="Markdown")
+        # Customer may send a payment slip without tapping "Upload Slip" first.
+        # Check if they have a booking in pending_payment; if so, handle it gracefully.
+        handled_stray = False
+        try:
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                stray_bk = await conn.fetchrow("""
+                    SELECT * FROM bookings
+                    WHERE customer_telegram_id=$1 AND status='pending_payment'
+                    ORDER BY created_at DESC LIMIT 1
+                """, user.id)
+            if stray_bk:
+                ref = stray_bk["booking_ref"]
+                url = await upload_image(file_bytes, "private/payment_slips", f"slip_{ref}")
+                pool = await get_pool()
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE bookings SET payment_slip_url=$1, status='pending_confirmation' WHERE id=$2",
+                        url, stray_bk["id"])
+                    op = await conn.fetchrow("SELECT * FROM operators WHERE id=$1", stray_bk["operator_id"]) if stray_bk["operator_id"] else None
+                await set_user_state(user.id, CX_BOOKING_COMPLETE, {"booking_ref": ref, "booking_id": stray_bk["id"]})
+                await update.message.reply_text(
+                    f"✅ *Payment slip received!*\n\n"
+                    f"📋 Booking Ref: `{ref}`\n\n"
+                    f"Your booking is being reviewed. You'll receive your confirmed ticket within *5–10 minutes*. "
+                    f"Please do not resend your slip — we have it!",
+                    parse_mode="Markdown")
+                # Notify reviewer
+                try:
+                    caption = (
+                        f"🧾 *Payment Slip Received (self-upload)*\n\n"
+                        f"📋 `{ref}`\n"
+                        f"👤 {stray_bk.get('customer_name') or 'Customer'}\n"
+                        f"💰 MVR {stray_bk.get('total_amount') or '?'}\n\n"
+                        f"Verify and confirm to send ticket."
+                    )
+                    buttons = InlineKeyboardMarkup([
+                        [InlineKeyboardButton("✅ Confirm & Send Ticket", callback_data=f"confirm_booking_{stray_bk['id']}")],
+                        [InlineKeyboardButton("❌ Not Received / Wrong Transfer", callback_data=f"not_received_{stray_bk['id']}")]
+                    ])
+                    pm = stray_bk.get("payment_mode","")
+                    if pm == "samuga_managed":
+                        await send_admin_photo(ctx.bot, photo.file_id, caption,
+                                               thread_id=ADMIN_THREAD_ID,
+                                               parse_mode="Markdown", reply_markup=buttons)
+                    elif op and op.get("telegram_id"):
+                        await ctx.bot.send_photo(op["telegram_id"], photo=photo.file_id,
+                                                 caption=caption, parse_mode="Markdown", reply_markup=buttons)
+                    else:
+                        await send_admin_photo(ctx.bot, photo.file_id, caption,
+                                               thread_id=ADMIN_THREAD_ID,
+                                               parse_mode="Markdown", reply_markup=buttons)
+                except Exception as e:
+                    logger.error(f"Stray slip notify error: {e}")
+                handled_stray = True
+        except Exception as e:
+            logger.error(f"Stray photo handler error: {e}")
+        if not handled_stray:
+            await update.message.reply_text(
+                "⚠️ Wasn't expecting an image right now.\n\n"
+                "Type `cancel` to go back to the main menu, or /start to restart.",
+                parse_mode="Markdown")
 
 # ── CALLBACK HANDLER ──────────────────────────────────────────────────────────
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
