@@ -2909,7 +2909,17 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     # ── SAMUGA ASSIST / SUPPORT TICKETS ─────────────────────────────────────
+    # This must run BEFORE booking/search/date parsing. If a user is inside
+    # support, their text is chat text, not a route like "No Need → Help".
     if await support_ai.handle_support_message(update, ctx, boat_request_deps()):
+        return
+
+    # Extra safety net: if support_ai did not consume a support-state message
+    # because of stale temp_data / closed ticket / deploy mismatch, do not let
+    # normal booking/search logic run on it. This prevents support chat text
+    # from becoming fake routes/dates/passenger input.
+    if str(state or "").startswith("support_"):
+        logger.warning(f"Blocked normal flow for support state {state} from user {user.id}")
         return
 
     # ── ADMIN / TEAM GROUP TEXT SAFETY ───────────────────────────────────────

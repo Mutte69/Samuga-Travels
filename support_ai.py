@@ -72,7 +72,7 @@ def _answer_for(category: str, role: str) -> str:
         "invoice": (
             "🧾 Invoice Help\n\n"
             "Operator invoices create a customer payment link and PDF invoice. The first price entered is the customer price shown on the invoice.\n\n"
-            "For Samuga Managed Payment, the customer pays Samuga Travels. For Operator Direct Payment, the customer pays the assigned operator."
+            "Customers should follow the payment details shown on their booking or invoice. Internal payment routing is handled by Samuga Travels."
         ),
     }
     return "🤖 Samuga Assist\n\n" + answers.get(category, answers["customer"])
@@ -186,8 +186,8 @@ Samuga Travels support rules:
 - IMPORTANT LANGUAGE RULE: If the user writes in English, reply ONLY in English. Do not use Romanized Dhivehi words like ge, ah, kurey, kurevey, vaane, mi, thima. If the user writes in Thaana script, reply in simple Thaana Dhivehi. If the user writes Latin-Dhivehi mixed with English, prefer clear English unless the user asks for Dhivehi.
 - Use the database context as truth. Do not claim payment is confirmed unless status shows confirmed/paid or the context clearly says so.
 - Never reveal Samuga margin, operator cost, internal admin notes, hidden IDs, or private URLs.
-- For Samuga Managed Payment, customer pays Samuga Travels and operator gets customer details after admin confirms payment.
-- For Operator Direct Payment, customer pays assigned operator and operator confirms the slip.
+- Never reveal internal payment modes, operator cost, Samuga margin, or admin-only payment routing.
+- Customers/operators should follow the payment details shown on the booking/invoice and dashboard.
 - If payment is pending: explain slip may be missing or under review.
 - If wrong bank/account transfer: Samuga Travels and operator cannot refund; user must contact their bank.
 - If no boat is available: tell customer to use Request a Boat and wait for Samuga to contact operators.
@@ -303,7 +303,7 @@ def _detect_support_topic(text: str, last_topic: str | None = None) -> str | Non
     if any(k in t for k in ["admin", "human", "agent", "staff", "support team", "person", "talk to"]):
         return "human_support"
     if any(k in t for k in ["samuga managed", "operator direct", "managed payment", "direct payment"]):
-        return "payment_modes"
+        return "payment_upload"
     if any(k in t for k in ["report", "revenue", "monthly", "daily report"]):
         return "reports"
     return None
@@ -356,9 +356,9 @@ def _kb_answer(topic: str | None, text: str, role: str, db_context: dict, last_t
     if topic == "wrong_transfer":
         return ("If money was sent to the wrong bank account or wrong account number, Samuga Travels and the operator may not be able to reverse it directly. Please contact your bank immediately with the transaction reference. You can also share the slip with Samuga Travels support so the team can guide you, but refund/reversal must be handled through the bank.", "wrong_transfer", False)
     if topic == "invoice":
-        return ("Operators can create an invoice from the Telegram bot by entering customer name, date/time, route, return details if any, and price. The bot creates a PDF invoice and a customer payment link. Customer payment then follows Operator Direct or Samuga Managed mode.", "invoice", False)
+        return ("Operators can create an invoice from the Telegram bot by entering customer name, date/time, route, return details if any, and price. The bot creates a PDF invoice and customer payment link. The customer should follow the payment details shown on the invoice/payment screen.", "invoice", False)
     if topic == "payment_modes":
-        return ("Operator Direct Payment means the customer pays the operator account and the operator confirms the slip. Samuga Managed Payment means the customer pays Samuga Travels, Samuga confirms the payment, and the operator receives customer details after confirmation.", "payment_modes", False)
+        return ("Please follow the payment details shown on your booking or invoice. Samuga Travels handles the correct payment routing internally, so customers and operators should not rely on hidden payment mode names.", "payment_upload", False)
     if topic == "cancel_refund":
         return ("For cancellation or changes, open your booking and use the available cancel/change option if shown. Refunds depend on booking status, operator policy, payment mode, and whether the trip has already been confirmed. For urgent cancellation, I can connect you to support.", "cancel_refund", False)
     if topic == "reports":
@@ -408,6 +408,76 @@ def _ticket_admin_kb(ticket_id: int) -> InlineKeyboardMarkup:
 async def _close_support_session_for_user(deps: dict, user_id: int, user_type: str | None = None):
     role = "operator" if str(user_type or "").lower() == "operator" else "customer"
     await deps["set_user_state"](int(user_id), deps["OP_IDLE"] if role == "operator" else deps["CX_IDLE"], {}, role=role)
+
+
+async def _get_open_telegram_support_ticket(deps: dict, user_id: int):
+    """Return the latest open Telegram support ticket for a user.
+
+    This is a recovery guard. If user_states is accidentally reset while a
+    human support ticket is still open, we must still treat incoming private
+    messages as support chat and never pass them to route/date booking logic.
+    Mini App tickets are excluded because their messages are handled by api.py.
+    """
+    pool = await deps["get_pool"]()
+    async with pool.acquire() as conn:
+        return await conn.fetchrow("""
+            SELECT * FROM support_tickets
+            WHERE user_telegram_id=$1
+              AND COALESCE(category,'human') <> 'inapp'
+              AND COALESCE(status,'open') NOT IN ('closed','resolved')
+            ORDER BY updated_at DESC NULLS LAST, created_at DESC NULLS LAST, id DESC
+            LIMIT 1
+        """, int(user_id))
+
+
+async def _forward_user_text_to_open_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deps: dict, ticket, text: str) -> bool:
+    """Forward a Telegram user's message to the active support ticket and return True.
+    Handles end/close words too. This function is used by both normal support
+    state and recovery guard paths.
+    """
+    user = update.effective_user
+    ticket_id = int(ticket["id"])
+    ticket_ref = ticket.get("ticket_ref") or "Support Ticket"
+    user_type = str(ticket.get("user_type") or "customer")
+    if (text or "").strip().lower() in ("end", "close", "cancel", "/cancel", "0", "menu", "end support", "end chat", "stop support"):
+        pool = await deps["get_pool"]()
+        async with pool.acquire() as conn:
+            await conn.execute("""
+                UPDATE support_tickets SET status='closed', resolved_at=NOW(), updated_at=NOW()
+                WHERE id=$1 AND user_telegram_id=$2
+            """, ticket_id, user.id)
+            await conn.execute("""
+                INSERT INTO support_messages (ticket_id, sender_type, sender_telegram_id, message_text)
+                VALUES ($1,'system',$2,$3)
+            """, ticket_id, user.id, "Support session ended by user.")
+        await _close_support_session_for_user(deps, user.id, user_type)
+        await update.message.reply_text("✅ Support chat ended. Returning to main menu.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]))
+        try:
+            await ctx.bot.send_message(deps["ADMIN_GROUP_ID"], f"✅ Support session ended by user\n\nTicket: {ticket_ref}", message_thread_id=deps.get("SUPPORT_THREAD_ID"))
+        except Exception:
+            pass
+        return True
+
+    pool = await deps["get_pool"]()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO support_messages (ticket_id, sender_type, sender_telegram_id, message_text)
+            VALUES ($1,$2,$3,$4)
+        """, ticket_id, user_type, user.id, text)
+        await conn.execute("UPDATE support_tickets SET status='waiting_admin', updated_at=NOW() WHERE id=$1", ticket_id)
+    # Keep/restore the user's support state so the next message is also captured early.
+    await deps["set_user_state"](user.id, SUPPORT_HUMAN_CHAT, {"ticket_id": ticket_id, "ticket_ref": ticket_ref}, role=user_type)
+    try:
+        await ctx.bot.send_message(
+            deps["ADMIN_GROUP_ID"],
+            f"💬 New Telegram support message\n\nTicket: {ticket_ref}\nUser: {_fmt_user(user)}\nTelegram ID: {user.id}\n\n{text}\n\nReply from this topic using the button below.",
+            message_thread_id=deps.get("SUPPORT_THREAD_ID"),
+            reply_markup=_ticket_admin_kb(ticket_id),
+        )
+    except Exception:
+        pass
+    await update.message.reply_text("✅ Sent to Samuga Travels support.")
+    return True
 
 
 async def init_support_db(get_pool):
@@ -762,47 +832,27 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             return True
         temp = sd.get("temp_data", {}) or {}
         ticket_id = int(temp.get("ticket_id", 0) or 0)
-        ticket_ref = temp.get("ticket_ref") or "Support Ticket"
-        if text.lower() in ("end", "close", "cancel", "/cancel", "0", "menu"):
-            pool = await deps["get_pool"]()
-            async with pool.acquire() as conn:
-                t = await conn.fetchrow("""
-                    UPDATE support_tickets SET status='closed', resolved_at=NOW(), updated_at=NOW()
-                    WHERE id=$1 AND user_telegram_id=$2 RETURNING *
-                """, ticket_id, user.id)
+        pool = await deps["get_pool"]()
+        async with pool.acquire() as conn:
+            t = await conn.fetchrow("SELECT * FROM support_tickets WHERE id=$1 AND user_telegram_id=$2", ticket_id, user.id) if ticket_id else None
+        if not t or str(t.get("status") or "").lower() in ("closed", "resolved"):
+            # Try recovery by looking for another open ticket before releasing the user to normal bot flow.
+            t = await _get_open_telegram_support_ticket(deps, user.id)
+        if not t:
             op = await deps["get_operator"](user.id)
             role = "operator" if (op and op.get("status") == "approved") else "customer"
             await deps["set_user_state"](user.id, deps["OP_IDLE"] if role == "operator" else deps["CX_IDLE"], {}, role=role)
-            await update.message.reply_text("✅ Support chat ended. Returning to main menu.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]))
+            await update.message.reply_text("This support session is already closed. You can start a new one with /support.")
             return True
-        if not ticket_id:
-            await update.message.reply_text("Support session could not be found. Please start support again with /support.")
-            return True
-        pool = await deps["get_pool"]()
-        async with pool.acquire() as conn:
-            t = await conn.fetchrow("SELECT id, ticket_ref, status, user_type, user_name FROM support_tickets WHERE id=$1 AND user_telegram_id=$2", ticket_id, user.id)
-            if not t or str(t.get("status") or "").lower() in ("closed", "resolved"):
-                op = await deps["get_operator"](user.id)
-                role = "operator" if (op and op.get("status") == "approved") else "customer"
-                await deps["set_user_state"](user.id, deps["OP_IDLE"] if role == "operator" else deps["CX_IDLE"], {}, role=role)
-                await update.message.reply_text("This support session is already closed. You can start a new one with /support.")
-                return True
-            await conn.execute("""
-                INSERT INTO support_messages (ticket_id, sender_type, sender_telegram_id, message_text)
-                VALUES ($1,$2,$3,$4)
-            """, ticket_id, str(t.get("user_type") or "user"), user.id, text)
-            await conn.execute("UPDATE support_tickets SET status='waiting_admin', updated_at=NOW() WHERE id=$1", ticket_id)
-        try:
-            await ctx.bot.send_message(
-                deps["ADMIN_GROUP_ID"],
-                f"💬 New Telegram support message\n\nTicket: {ticket_ref}\nUser: {_fmt_user(user)}\nTelegram ID: {user.id}\n\n{text}\n\nReply from this topic using the button below.",
-                message_thread_id=deps.get("SUPPORT_THREAD_ID"),
-                reply_markup=_ticket_admin_kb(ticket_id),
-            )
-        except Exception:
-            pass
-        await update.message.reply_text("✅ Sent to Samuga Travels support.")
-        return True
+        return await _forward_user_text_to_open_support(update, ctx, deps, t, text)
+
+    # Recovery guard: even if user_states was overwritten/reset while a Telegram
+    # support ticket is still open, do NOT let text fall through to booking/search.
+    # This prevents messages like "No need to help" becoming route searches.
+    if update.effective_chat and getattr(update.effective_chat, "type", "") == "private" and text and not text.startswith("/"):
+        t = await _get_open_telegram_support_ticket(deps, user.id)
+        if t:
+            return await _forward_user_text_to_open_support(update, ctx, deps, t, text)
 
     if state == SUPPORT_AWAIT_ISSUE:
         if not text:
@@ -841,11 +891,10 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             # Mini App tickets stay inside the Mini App chat. Do not send the user a Telegram DM/card for every admin reply.
             await update.message.reply_text(f"✅ Reply saved for {ticket_ref}. User will see it inside the Mini App chat.")
         else:
-            await ctx.bot.send_message(
-                target,
-                text,
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ End Support Chat", callback_data=f"support_user_end_{ticket_id}")]]),
-            )
+            # Send only the admin's actual message. The initial support
+            # connection message already has an End Support Chat button, and
+            # the user can also type "end" / "close" to end the session.
+            await ctx.bot.send_message(target, text)
             await update.message.reply_text(f"✅ Reply sent to user for {ticket_ref}.")
         await deps["set_user_state"](user.id, deps["CX_IDLE"], {}, role="admin")
         return True
