@@ -57,6 +57,40 @@ def _parse_price(text: str):
     return Decimal(m.group(1)), cur
 
 
+def _parse_dual_prices(text: str):
+    """Parse an admin message containing customer and/or operator prices.
+
+    Accepts flexible one-message formats like:
+        Customer price 4500
+        Operator price 3800 mvr
+    or 'cx 120 usd' / 'op 1500'. Currency auto-detects per line:
+    usd/$/dollar -> USD, rf/mrf/mvr/nothing -> MVR.
+    A bare single price with no labels is treated as customer price.
+
+    Returns dict: {"customer": (Decimal, cur) | None, "operator": (Decimal, cur) | None}
+    """
+    result = {"customer": None, "operator": None}
+    lines = [l.strip() for l in str(text or "").splitlines() if l.strip()]
+    unlabeled = []
+    for line in lines:
+        low = line.lower()
+        price, cur = _parse_price(line)
+        if price is None or price <= 0:
+            continue
+        if "$" in line:
+            cur = "USD"
+        if re.search(r"\b(customer|cust|cx|client)\b", low):
+            result["customer"] = (price, cur)
+        elif re.search(r"\b(operator|op|boat|owner)\b", low):
+            result["operator"] = (price, cur)
+        else:
+            unlabeled.append((price, cur))
+    # A single bare number = customer price (matches old single-price flow)
+    if not result["customer"] and not result["operator"] and len(unlabeled) == 1:
+        result["customer"] = unlabeled[0]
+    return result
+
+
 def _parse_int(text: str):
     m = re.search(r"\d+", str(text or ""))
     return int(m.group()) if m else None
@@ -302,7 +336,7 @@ async def _submit_customer_request(update: Update, ctx: ContextTypes.DEFAULT_TYP
 
 
 
-async def _assign_offer_and_create_invoice(ctx: ContextTypes.DEFAULT_TYPE, deps: dict, admin_user_id: int, offer_id: int, reply_message, payment_mode: str = "operator_direct", customer_price=None):
+async def _assign_offer_and_create_invoice(ctx: ContextTypes.DEFAULT_TYPE, deps: dict, admin_user_id: int, offer_id: int, reply_message, payment_mode: str = "operator_direct", customer_price=None, customer_currency=None):
     """Assign an offer, create invoice/booking, and notify customer/operator.
     Used by both operator-submitted offers and admin manual assignments.
     """
@@ -400,7 +434,7 @@ async def _assign_offer_and_create_invoice(ctx: ContextTypes.DEFAULT_TYPE, deps:
             f"Date: {req['travel_date']} @ {req.get('preferred_time') or 'Flexible'}\n"
             f"Passengers: {req.get('passenger_count') or 1}\n"
             f"Trip type: {req.get('trip_type') or 'oneway'}\n"
-            f"Price: {offer.get('currency') or 'MVR'} {_money(customer_price_dec)}\n\n"
+            f"Price: {customer_currency or offer.get('currency') or 'MVR'} {_money(customer_price_dec)}\n\n"
             f"Transfer to {receiver_label}:\n{pay_accounts}\n\n"
             f"⚠️ Please double-check account number and account name before transfer.\n"
             f"If money is sent to a wrong bank/account, Samuga Travels and the operator cannot refund it. You must contact your bank.\n"
@@ -435,9 +469,9 @@ async def _assign_offer_and_create_invoice(ctx: ContextTypes.DEFAULT_TYPE, deps:
             f"✅ Assigned to {op_row.get('business_name')}\n\n"
             f"Invoice/booking created: {booking['booking_ref']}\n"
             f"Payment mode: {'Samuga managed' if payment_mode == 'samuga_managed' else 'Operator direct'}\n"
-            f"Customer price: {offer.get('currency') or 'MVR'} {_money(customer_price_dec)}\n"
+            f"Customer price: {customer_currency or offer.get('currency') or 'MVR'} {_money(customer_price_dec)}\n"
             f"Operator cost: {offer.get('currency') or 'MVR'} {_money(operator_cost)}\n"
-            f"Margin: {offer.get('currency') or 'MVR'} {_money(samuga_margin)}\n\n"
+            f"Margin: {(customer_currency or offer.get('currency') or 'MVR') if (customer_currency or 'MVR') == (offer.get('currency') or 'MVR') else 'mixed'} {_money(samuga_margin)}\n\n"
             f"Customer has been sent the payment details and upload button.")
     except Exception as e:
         logger.error(f"Boat request assign/create invoice failed: {e}", exc_info=True)
@@ -496,44 +530,77 @@ async def handle_boat_request_message(update: Update, ctx: ContextTypes.DEFAULT_
         if not deps["is_admin"](user.id, update.message.chat_id):
             await update.message.reply_text("⚠️ Admin only.")
             return True
-        price, currency = _parse_price(text)
         request_id = int(temp.get("boat_request_id") or 0)
         operator_id = int(temp.get("operator_id") or 0)
         if not request_id or not operator_id:
-            await update.message.reply_text("⚠️ Manual assignment session expired.", reply_markup=_main_menu_kb())
+            await update.message.reply_text("⚠️ Manual assignment session expired. Tap Assign Operator on the request again.")
             await deps["set_user_state"](user.id, deps.get("CX_IDLE", "cx_idle"), {})
             return True
-        if not price or price <= 0:
-            await update.message.reply_text("⚠️ Send the customer price for this trip. Example: 7500 MVR")
+        prices = _parse_dual_prices(text)
+        cust, op_cost = prices.get("customer"), prices.get("operator")
+        if not cust and not op_cost:
+            await update.message.reply_text(
+                "⚠️ Couldn't read a price. Reply in one message like:\n\n"
+                "Customer price 4500\nOperator price 3800")
             return True
+        if op_cost and not cust:
+            await update.message.reply_text(
+                f"✅ Operator price saved: {op_cost[1]} {_money(op_cost[0])}\n\n"
+                "⚠️ Now also send the CUSTOMER price. Example: Customer price 4500")
+            await deps["set_user_state"](user.id, ADMIN_AWAIT_BR_MANUAL_PRICE,
+                                         {**temp, "op_cost": str(op_cost[0]), "op_cur": op_cost[1]})
+            return True
+        # Merge a previously-saved operator price if customer arrives in a second message
+        if not op_cost and temp.get("op_cost"):
+            op_cost = (Decimal(str(temp["op_cost"])), temp.get("op_cur", "MVR"))
+
         pool = await deps["get_pool"]()
         async with pool.acquire() as conn:
             req = await conn.fetchrow("SELECT * FROM boat_requests WHERE id=$1", request_id)
             op = await conn.fetchrow("SELECT * FROM operators WHERE id=$1 AND status='approved'", operator_id)
-            if not req or req["status"] in ("assigned", "closed", "cancelled"):
-                await update.message.reply_text("⚠️ This request is already closed or assigned.", reply_markup=_main_menu_kb())
-                await deps["set_user_state"](user.id, deps.get("CX_IDLE", "cx_idle"), {})
-                return True
-            if not op:
-                await update.message.reply_text("⚠️ Operator not found or not approved.", reply_markup=_main_menu_kb())
-                await deps["set_user_state"](user.id, deps.get("CX_IDLE", "cx_idle"), {})
-                return True
-            offer = await conn.fetchrow("""
-                INSERT INTO boat_request_offers (request_id, operator_id, price, currency, operator_note, status)
-                VALUES ($1,$2,$3,$4,'Manual admin assignment','pending_admin')
-                ON CONFLICT (request_id, operator_id)
-                DO UPDATE SET price=$3, currency=$4, operator_note='Manual admin assignment', status='pending_admin', created_at=NOW()
-                RETURNING *
-            """, request_id, operator_id, price, currency)
-            await conn.execute("UPDATE boat_requests SET status='offer_received', updated_at=NOW() WHERE id=$1 AND status!='assigned'", request_id)
-            await _event(conn, request_id, "admin", user.id, "manual_offer_created", f"Admin selected {op['business_name']} at {currency} {price}")
-        await deps["set_user_state"](user.id, ADMIN_AWAIT_BR_MANUAL_PAYMODE, {"offer_id": offer["id"], "customer_price": str(price)})
+        if not req or req["status"] in ("assigned", "closed", "cancelled"):
+            await update.message.reply_text("⚠️ This request is already closed or assigned.")
+            await deps["set_user_state"](user.id, deps.get("CX_IDLE", "cx_idle"), {})
+            return True
+        if not op:
+            await update.message.reply_text("⚠️ Operator not found or not approved.")
+            await deps["set_user_state"](user.id, deps.get("CX_IDLE", "cx_idle"), {})
+            return True
+
+        # ── Build confirmation summary ──────────────────────────────────
+        lines = [f"🧾 Confirm prices for {req['request_ref']}",
+                 f"Route: {req['route_from']} → {req['route_to']}",
+                 f"Operator: {op['business_name']}", ""]
+        lines.append(f"👤 Customer pays: {cust[1]} {_money(cust[0])}")
+        warn = ""
+        if op_cost:
+            lines.append(f"🚤 Operator gets: {op_cost[1]} {_money(op_cost[0])}")
+            if cust[1] == op_cost[1]:
+                margin = cust[0] - op_cost[0]
+                lines.append(f"💼 Samuga margin: {cust[1]} {_money(margin)}")
+                if margin < 0:
+                    warn = ("\n\n🚨 WARNING: Operator price is HIGHER than customer price — "
+                            f"you would LOSE {cust[1]} {_money(-margin)} on this trip. "
+                            "Double-check before confirming!")
+                elif margin == 0:
+                    warn = "\n\n⚠️ Note: margin is zero on this trip."
+            else:
+                lines.append("💼 Margin: mixed currencies — not auto-calculated. Check manually.")
+        else:
+            lines.append("🏦 Mode: customer pays operator directly (no operator price given).")
+        lines.append("\nCustomer will see ONLY the customer price. Operator will see ONLY the operator price.")
+
+        new_temp = {"boat_request_id": request_id, "operator_id": operator_id,
+                    "cust_price": str(cust[0]), "cust_cur": cust[1]}
+        if op_cost:
+            new_temp["op_cost"] = str(op_cost[0]); new_temp["op_cur"] = op_cost[1]
+        await deps["set_user_state"](user.id, ADMIN_AWAIT_BR_MANUAL_PRICE, new_temp)
         await update.message.reply_text(
-            "✅ Price saved. Choose payment mode for this request:\n\n"
-            "🏦 Operator Direct = customer pays operator.\n"
-            "💼 Samuga Managed = customer pays Samuga Travels, then Samuga handles operator.",
-            reply_markup=_payment_mode_kb(offer["id"], allow_edit=False)
-        )
+            "\n".join(lines) + warn,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Confirm & Send", callback_data=f"br_dp_ok_{request_id}"),
+                 InlineKeyboardButton("❌ Cancel", callback_data=f"br_dp_cancel_{request_id}")]
+            ]))
         return True
 
     if state == ADMIN_AWAIT_BR_MANAGED_OPERATOR_COST:
@@ -632,6 +699,84 @@ async def handle_boat_request_callback(update: Update, ctx: ContextTypes.DEFAULT
     user = query.from_user
     data = query.data or ""
 
+    # ── DUAL-PRICE CONFIRM / CANCEL ─────────────────────────────────────────
+    if data.startswith("br_dp_cancel_"):
+        if not deps["is_admin"](user.id, query.message.chat_id):
+            await query.answer("Admin only", show_alert=True)
+            return True
+        await deps["set_user_state"](user.id, deps.get("CX_IDLE", "cx_idle"), {})
+        await query.answer("Cancelled")
+        try:
+            await query.message.edit_text("❌ Price entry cancelled. Tap Assign Operator on the request to start again.")
+        except Exception:
+            pass
+        return True
+
+    if data.startswith("br_dp_ok_"):
+        if not deps["is_admin"](user.id, query.message.chat_id):
+            await query.answer("Admin only", show_alert=True)
+            return True
+        request_id = int(data.split("_")[-1])
+        sd_now = await deps["get_user_state"](user.id)
+        t = sd_now.get("temp_data", {}) or {}
+        if int(t.get("boat_request_id") or 0) != request_id or not t.get("cust_price"):
+            await query.answer("Session expired — tap Assign Operator again.", show_alert=True)
+            return True
+        operator_id = int(t.get("operator_id") or 0)
+        cust_price = Decimal(str(t["cust_price"]))
+        cust_cur = t.get("cust_cur", "MVR")
+        has_op_cost = bool(t.get("op_cost"))
+        op_cost = Decimal(str(t.get("op_cost") or "0"))
+        op_cur = t.get("op_cur", "MVR")
+
+        pool = await deps["get_pool"]()
+        async with pool.acquire() as conn:
+            req = await conn.fetchrow("SELECT * FROM boat_requests WHERE id=$1", request_id)
+            op = await conn.fetchrow("SELECT * FROM operators WHERE id=$1 AND status='approved'", operator_id)
+            if not req or req["status"] in ("assigned", "closed", "cancelled"):
+                await query.answer("Already closed or assigned.", show_alert=True)
+                await deps["set_user_state"](user.id, deps.get("CX_IDLE", "cx_idle"), {})
+                return True
+            if not op:
+                await query.answer("Operator not found.", show_alert=True)
+                await deps["set_user_state"](user.id, deps.get("CX_IDLE", "cx_idle"), {})
+                return True
+            # Offer row stores the OPERATOR side; customer price kept separately
+            offer_price = op_cost if has_op_cost else cust_price
+            offer_cur = op_cur if has_op_cost else cust_cur
+            offer = await conn.fetchrow("""
+                INSERT INTO boat_request_offers (request_id, operator_id, price, currency, operator_note, status, customer_price)
+                VALUES ($1,$2,$3,$4,'Manual admin assignment','pending_admin',$5)
+                ON CONFLICT (request_id, operator_id)
+                DO UPDATE SET price=$3, currency=$4, operator_note='Manual admin assignment',
+                              status='pending_admin', customer_price=$5, created_at=NOW()
+                RETURNING *
+            """, request_id, operator_id, offer_price, offer_cur, cust_price)
+            await conn.execute("UPDATE boat_requests SET status='offer_received', updated_at=NOW() WHERE id=$1 AND status!='assigned'", request_id)
+            if has_op_cost:
+                await conn.execute("UPDATE boat_request_offers SET operator_cost=$1 WHERE id=$2", op_cost, offer["id"])
+            await _event(conn, request_id, "admin", user.id, "manual_offer_created",
+                         f"Admin assigned {op['business_name']} — customer {cust_cur} {cust_price}" +
+                         (f", operator {op_cur} {op_cost}" if has_op_cost else ""))
+        await deps["set_user_state"](user.id, deps.get("CX_IDLE", "cx_idle"), {})
+        try:
+            await query.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        if has_op_cost:
+            # Full dual-price = Samuga managed assignment straight away
+            return await _assign_offer_and_create_invoice(
+                ctx, deps, user.id, offer["id"], query.message,
+                payment_mode="samuga_managed", customer_price=cust_price,
+                customer_currency=cust_cur)
+        # Customer-only price: admin still chooses payment mode
+        await query.message.reply_text(
+            "✅ Customer price saved. Choose payment mode for this request:\n\n"
+            "🏦 Operator Direct = customer pays operator.\n"
+            "💼 Samuga Managed = customer pays Samuga Travels, then Samuga handles operator.",
+            reply_markup=_payment_mode_kb(offer["id"], allow_edit=False))
+        return True
+
     if data == "br_start_request":
         sd = await deps["get_user_state"](user.id)
         t = sd.get("temp_data", {}) or {}
@@ -708,10 +853,15 @@ async def handle_boat_request_callback(update: Update, ctx: ContextTypes.DEFAULT
             return True
         await deps["set_user_state"](user.id, ADMIN_AWAIT_BR_MANUAL_PRICE, {"boat_request_id": request_id, "operator_id": operator_id})
         await query.message.reply_text(
-            "💰 Send the customer price for this trip.\n\n"
-            "This is the price customer will see on the invoice.\n\n"
-            "Example: 7500 MVR",
-            reply_markup=_main_menu_kb()
+            f"💰 Send prices for {req['request_ref']} ({req['route_from']} → {req['route_to']})\n\n"
+            "Reply in ONE message:\n\n"
+            "Customer price 4500\n"
+            "Operator price 3800\n\n"
+            "• Customer sees only the customer price.\n"
+            "• Operator sees only the operator price.\n"
+            "• Currency auto-detects (MVR default, write 'usd' for dollars).\n"
+            "• Send only a customer price if the customer pays the operator directly.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data=f"br_dp_cancel_{request_id}")]])
         )
         return True
 

@@ -2946,6 +2946,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         logger.warning(f"Blocked normal flow for support state {state} from user {user.id}")
         return
 
+    # ── BOAT REQUEST MARKETPLACE FLOW ───────────────────────────────────────
+    # MUST run BEFORE the admin-group guard: admins reply with prices inside
+    # the admin topics (e.g. "Customer price 4500"), and the guard below would
+    # otherwise swallow those messages before this handler ever sees them.
+    if await boat_requests.handle_boat_request_message(update, ctx, boat_request_deps()):
+        return
+
     # ── ADMIN / TEAM GROUP TEXT SAFETY ───────────────────────────────────────
     # In Samuga Travels admin topics, normal text must NEVER start customer
     # booking/search flows. Admins may type random notes, jokes, or support
@@ -2983,9 +2990,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     parse_mode="Markdown", reply_markup=back_main_kb("operator"))
                 return
 
-    # ── BOAT REQUEST MARKETPLACE FLOW ───────────────────────────────────────
-    if await boat_requests.handle_boat_request_message(update, ctx, boat_request_deps()):
-        return
+    # (Boat request marketplace flow already handled above, before the
+    #  admin-group guard.)
 
     # ── OPERATOR TEXT INVOICE FLOW ──────────────────────────────────────────
     if state == OP_AWAIT_INVOICE_LOCATION:
