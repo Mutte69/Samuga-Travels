@@ -35,16 +35,9 @@ def _fmt_user(u) -> str:
 
 
 def _support_kb() -> InlineKeyboardMarkup:
-    # Human handover is still available when the user asks for it or when AI cannot help,
-    # but we do not show it as the first option. Samuga Assist should try first.
+    # Samuga Assist is the main support entry. Keep the customer side clean.
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("Ask Samuga Assist", callback_data="support_ai_chat")],
-        [InlineKeyboardButton("👤 Customer Help", callback_data="support_cat_customer"),
-         InlineKeyboardButton("🚤 Operator Help", callback_data="support_cat_operator")],
-        [InlineKeyboardButton("💳 Payment Issue", callback_data="support_cat_payment"),
-         InlineKeyboardButton("🎫 Ticket Issue", callback_data="support_cat_ticket")],
-        [InlineKeyboardButton("🚤 Boat Request", callback_data="support_cat_boat_request"),
-         InlineKeyboardButton("🧾 Invoice Help", callback_data="support_cat_invoice")],
         [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
     ])
 
@@ -340,8 +333,8 @@ async def cmd_support(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deps: dict
     await update.effective_message.reply_text(
         "Customer Support\n\n"
         "Hi, I’m Samuga Assist — your Samuga Travels support assistant.\n\n"
-        "I can help with bookings, payments, tickets, boat requests, invoices, operator accounts and schedules.\n\n"
-        "Ask Samuga Assist first. If I can’t help, I’ll connect you to the Samuga Travels team.",
+        "Ask Samuga Assist about bookings, payments, tickets, boat requests, invoices, operator accounts, schedules, or app usage.\n\n"
+        "If I can’t help safely, I’ll offer to connect you to the Samuga Travels team.",
         reply_markup=_support_kb(),
     )
 
@@ -357,7 +350,8 @@ async def cmd_support_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deps: d
         "Tell me what you need help with. I can help with bookings, payments, tickets, boat requests, invoices, operator accounts, schedules, and app usage.\n\n"
         "If I cannot help safely, I’ll offer to connect you to the Samuga Travels team.",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+            [InlineKeyboardButton("✅ End Support Chat", callback_data="ai_end_chat")],
+            [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
         ]),
     )
 
@@ -410,9 +404,8 @@ async def _create_support_ticket(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
 
     await deps["set_user_state"](user.id, SUPPORT_HUMAN_CHAT, {"ticket_id": ticket_id, "ticket_ref": ref}, role=user_type)
     await update.effective_message.reply_text(
-        f"✅ You’re connected to Samuga Travels support.\n\n"
-        f"Ticket: {ref}\n"
-        f"Our team will reply here in this chat. You can keep sending messages here until the session is ended.",
+        "✅ You’re connected to Samuga Travels support.\n\n"
+        "Our team will reply here in this chat. You can keep sending messages here until the session is ended.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ End Support Chat", callback_data=f"support_user_end_{ticket_id}")]]),
     )
 
@@ -447,7 +440,7 @@ async def handle_support_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             _answer_for(category, role),
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("Ask Samuga Assist", callback_data="support_ai_chat")],
-                [InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
             ]),
         )
         return True
@@ -462,9 +455,60 @@ async def handle_support_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE
             "If I cannot help safely, I’ll offer to connect you to the Samuga Travels team.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ End Support Chat", callback_data="ai_end_chat")],
-                [InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
+                [InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
             ]),
         )
+        return True
+
+    if data.startswith("support_user_end_"):
+        ticket_id = int(data.rsplit("_", 1)[-1])
+        pool = await deps["get_pool"]()
+        async with pool.acquire() as conn:
+            t = await conn.fetchrow("""
+                UPDATE support_tickets SET status='closed', resolved_at=NOW(), updated_at=NOW()
+                WHERE id=$1 AND user_telegram_id=$2 RETURNING *
+            """, ticket_id, user.id)
+        op = await deps["get_operator"](user.id)
+        role = "operator" if (op and op.get("status") == "approved") else "customer"
+        await deps["set_user_state"](user.id, deps["OP_IDLE"] if role == "operator" else deps["CX_IDLE"], {}, role=role)
+        await q.message.reply_text("✅ Support chat ended. Returning to main menu.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]))
+        try:
+            if t:
+                await ctx.bot.send_message(deps["ADMIN_GROUP_ID"], f"✅ Support session ended by user\n\nTicket: {t['ticket_ref']}", message_thread_id=deps.get("SUPPORT_THREAD_ID"))
+        except Exception:
+            pass
+        return True
+
+    if data.startswith("support_admin_end_"):
+        if not deps["is_admin"](user.id, update.effective_chat.id if update.effective_chat else 0):
+            await q.answer("Admin only", show_alert=True)
+            return True
+        ticket_id = int(data.rsplit("_", 1)[-1])
+        pool = await deps["get_pool"]()
+        async with pool.acquire() as conn:
+            t = await conn.fetchrow("""
+                UPDATE support_tickets SET status='closed', resolved_at=NOW(), updated_at=NOW(), assigned_admin_id=$2
+                WHERE id=$1 RETURNING *
+            """, ticket_id, user.id)
+            if t:
+                await conn.execute("""
+                    INSERT INTO support_messages (ticket_id, sender_type, sender_telegram_id, message_text)
+                    VALUES ($1,'system',$2,$3)
+                """, ticket_id, user.id, "✅ Support chat ended by Samuga Travels team.")
+        if not t:
+            await q.message.reply_text("Ticket not found.")
+            return True
+        await _close_support_session_for_user(deps, int(t["user_telegram_id"]), t.get("user_type"))
+        if str(t.get("category") or "").lower() != "inapp":
+            try:
+                await ctx.bot.send_message(
+                    t["user_telegram_id"],
+                    "✅ Support chat ended by Samuga Travels team.\n\nThank you for contacting Samuga Travels.",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]])
+                )
+            except Exception:
+                pass
+        await q.message.reply_text(f"✅ Support session ended for {t['ticket_ref']}.")
         return True
 
     if data == "support_human":
@@ -566,7 +610,7 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         if needs_human_button:
             rows.append([InlineKeyboardButton("Talk to Human", callback_data="support_human")])
         rows.append([InlineKeyboardButton("Ask another question", callback_data="support_ai_chat")])
-        rows.append([InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
+        rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
         await update.message.reply_text(ans[:3900], reply_markup=InlineKeyboardMarkup(rows))
         return True
 
@@ -614,7 +658,7 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             )
         except Exception:
             pass
-        await update.message.reply_text("✅ Sent to Samuga Travels support. We’ll reply here.")
+        await update.message.reply_text("✅ Sent to Samuga Travels support.")
         return True
 
     if state == SUPPORT_AWAIT_ISSUE:
@@ -656,7 +700,7 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         else:
             await ctx.bot.send_message(
                 target,
-                f"💬 Samuga Travels Support\n\nTicket: {ticket_ref}\n\n{text}\n\nReply here if you need more help. The support session stays open until our team ends it.",
+                text,
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ End Support Chat", callback_data=f"support_user_end_{ticket_id}")]]),
             )
             await update.message.reply_text(f"✅ Reply sent to user for {ticket_ref}.")

@@ -2912,6 +2912,19 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if await support_ai.handle_support_message(update, ctx, boat_request_deps()):
         return
 
+    # ── ADMIN / TEAM GROUP TEXT SAFETY ───────────────────────────────────────
+    # In Samuga Travels admin topics, normal text must NEVER start customer
+    # booking/search flows. Admins may type random notes, jokes, or support
+    # replies; only explicit commands/callback states should do work here.
+    chat = update.effective_chat
+    chat_id = chat.id if chat else 0
+    chat_type = getattr(chat, "type", "") if chat else ""
+    if chat_type in ("group", "supergroup") and chat_id in (ADMIN_GROUP_ID, ADMIN_TEAM_GROUP_ID):
+        # support_ai handled real support replies above when the admin was in
+        # SUPPORT_ADMIN_REPLY state. Everything else in team/admin group is
+        # ignored so the bot does not answer with customer booking menus.
+        return
+
     # ── OPERATOR INVOICE AUTO-DETECT ─────────────────────────────────────────
     # Operators may just paste invoice details without using /invoice.
     # If the text looks like an invoice, switch into invoice flow even if they
