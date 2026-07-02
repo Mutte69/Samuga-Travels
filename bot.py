@@ -1276,7 +1276,7 @@ async def handle_location(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     temp = sd.get("temp_data", {}) or {}
     tracking_sched = temp.get("tracking_schedule_id")
     if not tracking_sched: return
-    today = datetime.now().date()
+    today = now_mvt().date()
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute("""
@@ -2186,6 +2186,30 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await send_admin_panel_private_button(update, ctx)
         return
     sd = await get_user_state(user.id)
+
+    # ── SUPPORT-AWARE /start ────────────────────────────────────────────────
+    # If the user is inside an active human support session, /start must NOT
+    # dump them into the booking menu (their next text would silently go to
+    # support while the menu says "type your route"). Politely tell them
+    # support is active and offer to end it.
+    cur_state = str(sd.get("state") or "")
+    if cur_state == support_ai.SUPPORT_HUMAN_CHAT:
+        ticket_id = (sd.get("temp_data") or {}).get("ticket_id")
+        end_cb = f"support_user_end_{ticket_id}" if ticket_id else "ai_end_chat"
+        await update.message.reply_text(
+            "💬 *You're currently in a support chat.*\n\n"
+            "Any message you send goes to our support team.\n"
+            "To go back to booking, end the support chat first 👇",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ End Support Chat", callback_data=end_cb)
+            ]]))
+        return
+    if cur_state.startswith("support_"):
+        # AI chat or awaiting-issue states: /start safely exits back to menu
+        await set_user_state(user.id, CX_IDLE, {}, role=sd.get("role", "customer"))
+        sd = await get_user_state(user.id)
+
     role = sd.get("role","customer")
     if role == "operator":
         op = await get_operator(user.id)
@@ -2701,7 +2725,7 @@ async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not op or op.get("status") != "approved":
         await update.message.reply_text("⚠️ Operator account required.")
         return
-    today = datetime.now().date()
+    today = now_mvt().date()
     pool = await get_pool()
     async with pool.acquire() as conn:
         scheds = await conn.fetch("""
@@ -2734,7 +2758,7 @@ async def cmd_stoptrack(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE boat_locations SET is_active=FALSE WHERE operator_id=$1 AND travel_date=$2",
-            op["id"], datetime.now().date())
+            op["id"], now_mvt().date())
     await set_user_state(user.id, OP_IDLE, {})
     await update.message.reply_text(
         "📍 *Tracking stopped.* Customers notified.\n\nGreat trip! 🌊",
@@ -2743,7 +2767,7 @@ async def cmd_stoptrack(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_locate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Customer checks live location of their boat"""
     user = update.effective_user
-    today = datetime.now().date()
+    today = now_mvt().date()
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow("""
@@ -3298,7 +3322,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         change_type = t2.get("change_type")
         sched_id = t2.get("change_sched_id")
         from datetime import timedelta as _td4
-        tomorrow = datetime.now().date() + _td4(days=1)
+        tomorrow = now_mvt().date() + _td4(days=1)
         pool = await get_pool()
 
         if change_type == "time":
@@ -3715,7 +3739,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "⚠️ Couldn\'t read that date 😅\n\nTry formats like:\n`30-06-2026` or `30/06/2026`",
                 parse_mode="Markdown")
             return
-        if travel_date < datetime.now().date():
+        if travel_date < now_mvt().date():
             await update.message.reply_text("⚠️ Date cannot be in the past.")
             return
 
@@ -3989,7 +4013,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             rt = parts[1].strip().title()
             await set_user_state(user.id, CX_AWAIT_DATE, {"route_from": rf, "route_to": rt})
             from datetime import timedelta
-            today = datetime.now().date()
+            today = now_mvt().date()
             dates = [today + timedelta(days=i) for i in range(4)]
             date_buttons = [[InlineKeyboardButton(
                 f"{'Today' if i==0 else 'Tomorrow' if i==1 else d.strftime('%a %d %b')}",
@@ -4460,7 +4484,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await set_user_state(user.id, CX_IDLE, {})
             return
         from datetime import timedelta
-        today = datetime.now().date()
+        today = now_mvt().date()
         dates = [today + timedelta(days=i) for i in range(4)]
         date_buttons = [[InlineKeyboardButton(
             f"{'Today' if i==0 else 'Tomorrow' if i==1 else d.strftime('%a %d %b')}",
@@ -5053,7 +5077,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not op:
             return
         from datetime import timedelta as _td
-        today = datetime.now().date()
+        today = now_mvt().date()
         tomorrow = today + _td(days=1)
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -5137,7 +5161,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         parts = data.split("_")
         sched_id = int(parts[2])
-        date_token = parts[3] if len(parts) > 3 else datetime.now().strftime("%Y%m%d")
+        date_token = parts[3] if len(parts) > 3 else now_mvt().strftime("%Y%m%d")
         manifest_date = datetime.strptime(date_token, "%Y%m%d").date()
         pool = await get_pool()
         async with pool.acquire() as conn:
@@ -5241,7 +5265,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         sched_id = int(parts_s[2])
         new_boat = parts_s[3]
         from datetime import timedelta as _td2
-        tomorrow = datetime.now().date() + _td2(days=1)
+        tomorrow = now_mvt().date() + _td2(days=1)
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute("""
@@ -5273,7 +5297,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("cancel_today_"):
         sched_id = int(data.split("_")[-1])
         from datetime import timedelta as _td3
-        tomorrow = datetime.now().date() + _td3(days=1)
+        tomorrow = now_mvt().date() + _td3(days=1)
         pool = await get_pool()
         async with pool.acquire() as conn:
             await conn.execute("""
@@ -5708,7 +5732,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             sched = await conn.fetchrow("SELECT * FROM schedules WHERE id=$1", sched_id)
             pax = await conn.fetchval(
                 "SELECT COUNT(*) FROM bookings WHERE schedule_id=$1 AND travel_date=$2 AND status='confirmed'",
-                sched_id, datetime.now().date())
+                sched_id, now_mvt().date())
         await set_user_state(user.id, OP_TRACKING_ACTIVE,
                              {"tracking_schedule_id": sched_id})
         await query.edit_message_text(
@@ -6780,7 +6804,7 @@ async def job_payment_confirmation_watchdog(ctx: ContextTypes.DEFAULT_TYPE):
 async def job_morning_ping(ctx: ContextTypes.DEFAULT_TYPE):
     """20:00 MVT — ping all operators to prepare tomorrow's schedules"""
     from datetime import timedelta as _td
-    tomorrow = datetime.now().date() + _td(days=1)
+    tomorrow = now_mvt().date() + _td(days=1)
     pool = await get_pool()
     async with pool.acquire() as conn:
         # Get all approved operators with active schedules
