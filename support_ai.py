@@ -205,6 +205,9 @@ def _gemini_prompt(user_text: str, role: str, db_context: dict) -> str:
     return f"""{_rulebook()}
 
 User role: {role}
+Previous support topic: {db_context.get("last_topic") or "none"}
+Previous user message: {db_context.get("last_user_message") or "none"}
+Previous assistant answer: {db_context.get("last_bot_answer") or "none"}
 Database context JSON:
 {json.dumps(db_context, ensure_ascii=False, default=str)[:9000]}
 
@@ -246,6 +249,123 @@ def _looks_like_human_request(text: str) -> bool:
     t = (text or "").lower()
     keys = ["human", "agent", "staff", "admin", "person", "call me", "talk to", "މީހ", "އެޖެންޓ", "އެހީ"]
     return any(k in t for k in keys)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Samuga Assist conversation brain / knowledge base
+# ─────────────────────────────────────────────────────────────────────────────
+_GREETING_RE = re.compile(r"^(hi|hello|hey|salam|assalaamu alaikum|ހައި|ސަލާމް|އައްސަލާމް)(\s|!|\.|،|$)", re.I)
+_SHORT_FOLLOWUP_RE = re.compile(r"^(why|how|where|what|yes|no|ok|okay|ކީއްވެ|ކިހިނެއް|ކޮބައި)$", re.I)
+
+
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip().lower())
+
+
+def _reply_language(text: str, previous_language: str | None = None) -> str:
+    # Only use Dhivehi when the user actually types Thaana. Mixed Latin/Dhivehi-English stays English.
+    if re.search(r"[ހ-޿]", text or ""):
+        return "dhivehi"
+    return previous_language or "english"
+
+
+def _detect_support_topic(text: str, last_topic: str | None = None) -> str | None:
+    t = _normalize_text(text)
+    if not t:
+        return None
+    if _GREETING_RE.match(t):
+        return "greeting"
+    if _SHORT_FOLLOWUP_RE.match(t) and last_topic:
+        return last_topic
+    if any(k in t for k in ["wrong account", "wrong bank", "wrong transfer", "sent money wrong", "wrong number", "ރަނގަޅު ނޫން އެކައުންޓ"]):
+        return "wrong_transfer"
+    if any(k in t for k in ["payment", "paid", "slip", "transfer", "ޕޭމަންޓ", "ސްލިޕ"]):
+        if any(k in t for k in ["pending", "review", "not confirmed", "no ticket", "ޓިކެޓ"]):
+            return "payment_pending"
+        return "payment_upload"
+    if any(k in t for k in ["ticket", "qr", "boarding", "boarded", "ޓިކެޓ"]):
+        return "ticket"
+    if any(k in t for k in ["operator account", "register as operator", "become operator", "apply as operator", "operator akah", "operator ah", "އޮޕަރޭޓަރ"]):
+        if any(k in t for k in ["pending", "review", "approve", "approved", "under review"]):
+            return "operator_pending"
+        return "operator_register"
+    if any(k in t for k in ["add route", "more route", "routes", "add schedule", "schedule", "add trip", "more trips", "add boat", "new route"]):
+        return "operator_add_routes"
+    if any(k in t for k in ["invoice", "bill", "create invoice", "customer invoice"]):
+        return "invoice"
+    if any(k in t for k in ["request boat", "no boat", "boat request", "private hire", "find boat"]):
+        return "boat_request"
+    if any(k in t for k in ["book", "booking", "cheap ticket", "price", "prices", "fare", "search route", "route search"]):
+        return "booking_search"
+    if any(k in t for k in ["cancel", "refund", "change date", "change booking"]):
+        return "cancel_refund"
+    if any(k in t for k in ["admin", "human", "agent", "staff", "support team", "person", "talk to"]):
+        return "human_support"
+    if any(k in t for k in ["samuga managed", "operator direct", "managed payment", "direct payment"]):
+        return "payment_modes"
+    if any(k in t for k in ["report", "revenue", "monthly", "daily report"]):
+        return "reports"
+    return None
+
+
+def _safe_context_flags(db_context: dict) -> dict:
+    op = db_context.get("operator") or {}
+    bookings = db_context.get("recent_bookings") or []
+    boat_requests = db_context.get("boat_requests") or []
+    return {
+        "is_operator": bool(op),
+        "operator_status": str(op.get("status") or "").lower(),
+        "operator_name": op.get("business_name") or op.get("owner_name") or "your operator account",
+        "has_recent_booking": bool(bookings),
+        "latest_booking_status": str((bookings[0] or {}).get("status") or "").lower() if bookings else "",
+        "has_boat_request": bool(boat_requests),
+    }
+
+
+def _kb_answer(topic: str | None, text: str, role: str, db_context: dict, last_topic: str | None = None) -> tuple[str | None, str | None, bool]:
+    """Return (answer, topic_to_store, needs_human). Uses rules before Gemini so common support is reliable."""
+    flags = _safe_context_flags(db_context or {})
+    t = _normalize_text(text)
+    if topic == "greeting":
+        return ("Hi 👋 I’m Samuga Assist. I can help with bookings, payments, tickets, boat requests, invoices, operator accounts, schedules, and app usage. What do you need help with?", last_topic or "general", False)
+    if _SHORT_FOLLOWUP_RE.match(t) and not last_topic:
+        return ("Sure — what do you need help with? You can ask about a booking, payment, ticket, boat request, invoice, or operator account.", "general", False)
+    if topic == "operator_register":
+        if flags["is_operator"] and flags["operator_status"] == "approved":
+            return (f"You already have an approved operator account for {flags['operator_name']}. To manage it, open Profile → Operator Dashboard. From there you can check bookings, requests, schedules, reports, and payments.", "operator_register", False)
+        if flags["is_operator"] and flags["operator_status"] in ("pending", "under_review"):
+            return ("Your operator application is under review. If it has been more than 24 hours, open Profile and tap 🔔 Ping Samuga Travels so the team can check it.", "operator_pending", False)
+        return ("To register as an operator, open the Samuga Travels Mini App → Profile → Register as Operator / Apply as Operator. Add your business details, boat details, contact number, bank accounts, logo and ID photo if requested. After you submit, Samuga Travels will review and approve the account.", "operator_register", False)
+    if topic == "operator_pending":
+        return ("Operator applications are reviewed by the Samuga Travels team. If your application is still pending after 24 hours, open Profile in the Mini App and tap 🔔 Ping Samuga Travels. The team will receive an alert to check your application.", "operator_pending", False)
+    if topic == "operator_add_routes":
+        if flags["is_operator"] and flags["operator_status"] == "approved":
+            return ("To add more routes, add schedules/trips for those routes. Open Profile → Operator Dashboard → Schedules/Today → Add Schedule, then enter From, To, date, time, seats, and price. Those schedules help customers find your boat. If you need Samuga Travels to manually edit your route coverage, I can connect you to support.", "operator_add_routes", False)
+        return ("Routes are managed through an approved operator account. First register or get your operator account approved. After approval, open Profile → Operator Dashboard and add schedules/trips for the routes you operate.", "operator_add_routes", False)
+    if topic == "booking_search":
+        return ("To book, search your route in the Mini App or type the route in the Telegram bot, then choose your date, boat, passenger count, and contact details. If no boat is available, tap 🚤 Request a Boat and Samuga Travels will check with operators.", "booking_search", False)
+    if topic == "boat_request":
+        return ("If no scheduled boat is available, use 🚤 Request a Boat. Add From, To, date, preferred time, passengers, trip type, contact number, pickup/jetty and notes. Samuga Travels will contact operators and notify you when a boat is found.", "boat_request", False)
+    if topic == "payment_upload":
+        return ("After you transfer payment, open your booking/payment link and tap 💳 Pay / Upload Slip. Upload a clear payment slip. The operator or Samuga Travels team will review it depending on the payment mode.", "payment_upload", False)
+    if topic == "payment_pending":
+        return ("Your booking stays pending when the payment slip has not been uploaded yet or is still under review. If you already uploaded the slip, please wait for confirmation. If it is urgent or taking too long, I can connect you to Samuga Travels support.", "payment_pending", False)
+    if topic == "ticket":
+        return ("Your ticket is sent after payment is confirmed. If you uploaded the slip but did not receive a ticket, the payment may still be under review. Check My Trips / My Bookings, or ask support to check your booking reference.", "ticket", False)
+    if topic == "wrong_transfer":
+        return ("If money was sent to the wrong bank account or wrong account number, Samuga Travels and the operator may not be able to reverse it directly. Please contact your bank immediately with the transaction reference. You can also share the slip with Samuga Travels support so the team can guide you, but refund/reversal must be handled through the bank.", "wrong_transfer", False)
+    if topic == "invoice":
+        return ("Operators can create an invoice from the Telegram bot by entering customer name, date/time, route, return details if any, and price. The bot creates a PDF invoice and a customer payment link. Customer payment then follows Operator Direct or Samuga Managed mode.", "invoice", False)
+    if topic == "payment_modes":
+        return ("Operator Direct Payment means the customer pays the operator account and the operator confirms the slip. Samuga Managed Payment means the customer pays Samuga Travels, Samuga confirms the payment, and the operator receives customer details after confirmation.", "payment_modes", False)
+    if topic == "cancel_refund":
+        return ("For cancellation or changes, open your booking and use the available cancel/change option if shown. Refunds depend on booking status, operator policy, payment mode, and whether the trip has already been confirmed. For urgent cancellation, I can connect you to support.", "cancel_refund", False)
+    if topic == "reports":
+        return ("Operators can view reports in Profile → Operator Dashboard → Report. Reports can include bookings, pending payments, confirmed trips, cancellations, seats sold, and revenue. Admin can see wider reports from the Admin Panel.", "reports", False)
+    if topic == "human_support":
+        return ("I can connect you to Samuga Travels support. Would you like to talk to a human support agent?", "human_support", True)
+    return (None, last_topic, False)
 
 def _ai_answer_is_weak(user_text: str, answer: str) -> bool:
     a = (answer or "").strip()
@@ -590,8 +710,28 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             return True
         op = await deps["get_operator"](user.id)
         role = "operator" if (op and op.get("status") == "approved") else "customer"
-        await update.message.reply_text("Checking your Samuga Travels details...")
+        temp = sd.get("temp_data", {}) or {}
+        last_topic = temp.get("last_topic")
+        last_user_message = temp.get("last_user_message")
+        last_bot_answer = temp.get("last_bot_answer")
         dbctx = await _support_db_context(deps, user.id)
+        dbctx["last_topic"] = last_topic
+        dbctx["last_user_message"] = last_user_message
+        dbctx["last_bot_answer"] = last_bot_answer
+        topic = _detect_support_topic(text, last_topic)
+        kb_ans, kb_topic, kb_human = _kb_answer(topic, text, role, dbctx, last_topic)
+        if kb_ans:
+            temp.update({"last_topic": kb_topic or topic or last_topic or "general", "last_user_message": text, "last_bot_answer": kb_ans[:900]})
+            await deps["set_user_state"](user.id, SUPPORT_AI_CHAT, temp, role=role)
+            rows = []
+            if kb_human:
+                rows.append([InlineKeyboardButton("Talk to Human", callback_data="support_human")])
+            rows.append([InlineKeyboardButton("Ask another question", callback_data="support_ai_chat")])
+            rows.append([InlineKeyboardButton("✅ End Support Chat", callback_data="ai_end_chat")])
+            rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
+            await update.message.reply_text(kb_ans[:3900], reply_markup=InlineKeyboardMarkup(rows))
+            return True
+        await update.message.reply_text("Checking your Samuga Travels details...")
         try:
             ans = await _ask_gemini(text, role, dbctx)
         except Exception as e:
@@ -606,10 +746,13 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             await _send_alert(ctx, deps, "Weak Telegram Samuga Assist answer", f"Question: {text}\n\nAnswer: {ans[:700]}", user.id)
             needs_human_button = True
             ans = "I’m not fully sure about this. Would you like me to connect you with Samuga Travels support?"
+        temp.update({"last_topic": topic or last_topic or "general", "last_user_message": text, "last_bot_answer": ans[:900]})
+        await deps["set_user_state"](user.id, SUPPORT_AI_CHAT, temp, role=role)
         rows = []
         if needs_human_button:
             rows.append([InlineKeyboardButton("Talk to Human", callback_data="support_human")])
         rows.append([InlineKeyboardButton("Ask another question", callback_data="support_ai_chat")])
+        rows.append([InlineKeyboardButton("✅ End Support Chat", callback_data="ai_end_chat")])
         rows.append([InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
         await update.message.reply_text(ans[:3900], reply_markup=InlineKeyboardMarkup(rows))
         return True
