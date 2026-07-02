@@ -597,7 +597,7 @@ async def _create_support_ticket(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     await deps["set_user_state"](user.id, SUPPORT_HUMAN_CHAT, {"ticket_id": ticket_id, "ticket_ref": ref}, role=user_type)
     await update.effective_message.reply_text(
         "✅ You’re connected to Samuga Travels support.\n\n"
-        "Our team will reply here in this chat. You can keep sending messages here until the session is ended.",
+        "An agent will join this chat as soon as possible. Replies may take around 5–10 minutes. You can keep sending messages here until the session is ended.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ End Support Chat", callback_data=f"support_user_end_{ticket_id}")]]),
     )
 
