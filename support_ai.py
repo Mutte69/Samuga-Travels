@@ -17,6 +17,7 @@ from telegram.ext import ContextTypes
 SUPPORT_AWAIT_ISSUE = "support_await_issue"
 SUPPORT_ADMIN_REPLY = "support_admin_reply"
 SUPPORT_AI_CHAT = "support_ai_chat"
+SUPPORT_HUMAN_CHAT = "support_human_chat"
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash").strip()
@@ -283,6 +284,19 @@ async def _send_alert(ctx: ContextTypes.DEFAULT_TYPE, deps: dict, where: str, de
         pass
 
 
+def _ticket_admin_kb(ticket_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("💬 Reply to User", callback_data=f"support_admin_reply_{ticket_id}"),
+         InlineKeyboardButton("✅ End Session", callback_data=f"support_admin_end_{ticket_id}")],
+        [InlineKeyboardButton("✅ Mark Resolved", callback_data=f"support_admin_resolve_{ticket_id}")],
+    ])
+
+
+async def _close_support_session_for_user(deps: dict, user_id: int, user_type: str | None = None):
+    role = "operator" if str(user_type or "").lower() == "operator" else "customer"
+    await deps["set_user_state"](int(user_id), deps["OP_IDLE"] if role == "operator" else deps["CX_IDLE"], {}, role=role)
+
+
 async def init_support_db(get_pool):
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -338,12 +352,10 @@ async def cmd_support_ai(update: Update, ctx: ContextTypes.DEFAULT_TYPE, deps: d
     op = await deps["get_operator"](user.id)
     role = "operator" if (op and op.get("status") == "approved") else "customer"
     await deps["set_user_state"](user.id, SUPPORT_AI_CHAT, {}, role=role)
-    status_line = "Smart support is active." if GEMINI_API_KEY else "Smart support key is not set yet, but I can still guide you with support rules."
     await update.effective_message.reply_text(
         "Ask Samuga Assist\n\n"
-        f"{status_line}\n\n"
-        "Send your question in English, Dhivehi, or mixed Dhivehi-English.\n"
-        "Example: I uploaded payment but no ticket yet.",
+        "Tell me what you need help with. I can help with bookings, payments, tickets, boat requests, invoices, operator accounts, schedules, and app usage.\n\n"
+        "If I cannot help safely, I’ll offer to connect you to the Samuga Travels team.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
         ]),
@@ -385,10 +397,7 @@ async def _create_support_ticket(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
         f"Issue:\n{issue_text}\n\n"
         f"Status: Open"
     )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("💬 Reply to User", callback_data=f"support_admin_reply_{ticket_id}"),
-         InlineKeyboardButton("✅ Mark Resolved", callback_data=f"support_admin_resolve_{ticket_id}")],
-    ])
+    kb = _ticket_admin_kb(ticket_id)
     try:
         await ctx.bot.send_message(
             deps["ADMIN_GROUP_ID"],
@@ -399,12 +408,12 @@ async def _create_support_ticket(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
     except Exception:
         await ctx.bot.send_message(deps["ADMIN_GROUP_ID"], text, reply_markup=kb)
 
-    await deps["set_user_state"](user.id, deps["OP_IDLE"] if user_type == "operator" else deps["CX_IDLE"], {}, role=user_type)
+    await deps["set_user_state"](user.id, SUPPORT_HUMAN_CHAT, {"ticket_id": ticket_id, "ticket_ref": ref}, role=user_type)
     await update.effective_message.reply_text(
-        f"✅ Support ticket created.\n\n"
+        f"✅ You’re connected to Samuga Travels support.\n\n"
         f"Ticket: {ref}\n"
-        f"Samuga Travels team has been notified. We’ll reply here in this chat.",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]),
+        f"Our team will reply here in this chat. You can keep sending messages here until the session is ended.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ End Support Chat", callback_data=f"support_user_end_{ticket_id}")]]),
     )
 
 
@@ -447,14 +456,12 @@ async def handle_support_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         op = await deps["get_operator"](user.id)
         role = "operator" if (op and op.get("status") == "approved") else "customer"
         await deps["set_user_state"](user.id, SUPPORT_AI_CHAT, {}, role=role)
-        status_line = "Gemini smart answers are active." if GEMINI_API_KEY else "Smart AI key is not set yet, but I can still guide you with support rules."
         await q.message.reply_text(
-            "🤖 Ask Samuga Assist\n\n"
-            f"{status_line}\n\n"
-            "Send your question in English, Dhivehi, or mixed Dhivehi-English.\n"
-            "Example: I uploaded payment but no ticket yet.",
+            "Ask Samuga Assist\n\n"
+            "Tell me what you need help with. I can help with bookings, payments, tickets, boat requests, invoices, operator accounts, schedules, and app usage.\n\n"
+            "If I cannot help safely, I’ll offer to connect you to the Samuga Travels team.",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Ask Samuga Assist", callback_data="support_ai_chat")],
+                [InlineKeyboardButton("✅ End Support Chat", callback_data="ai_end_chat")],
                 [InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")],
             ]),
         )
@@ -484,8 +491,15 @@ async def handle_support_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE
         if not t:
             await q.message.reply_text("Ticket not found.")
             return True
-        await deps["set_user_state"](user.id, SUPPORT_ADMIN_REPLY, {"ticket_id": ticket_id, "target_user_id": t["user_telegram_id"], "ticket_ref": t["ticket_ref"]}, role="admin")
-        await q.message.reply_text(f"💬 Send your reply for ticket {t['ticket_ref']} now.")
+        await deps["set_user_state"](user.id, SUPPORT_ADMIN_REPLY, {"ticket_id": ticket_id, "target_user_id": t["user_telegram_id"], "ticket_ref": t["ticket_ref"], "ticket_category": t.get("category")}, role="admin")
+        cat = str(t.get("category") or "").lower()
+        if cat == "inapp":
+            await q.message.reply_text(
+                f"💬 Send your reply for ticket {t['ticket_ref']} now.\n\n"
+                "This is a Mini App support ticket, so your reply will appear inside the in-app chat only. It will not DM the user in Telegram."
+            )
+        else:
+            await q.message.reply_text(f"💬 Send your reply for ticket {t['ticket_ref']} now.")
         return True
 
     if data.startswith("support_admin_resolve_"):
@@ -500,11 +514,13 @@ async def handle_support_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE
                 WHERE id=$1 RETURNING *
             """, ticket_id, user.id)
         if t:
-            await q.message.reply_text(f"✅ Ticket {t['ticket_ref']} marked resolved.")
-            try:
-                await ctx.bot.send_message(t["user_telegram_id"], f"✅ Your support ticket {t['ticket_ref']} has been marked resolved by Samuga Travels.")
-            except Exception:
-                pass
+            await _close_support_session_for_user(deps, int(t["user_telegram_id"]), t.get("user_type"))
+            await q.message.reply_text(f"✅ Ticket {t['ticket_ref']} marked resolved and session ended.")
+            if str(t.get("category") or "").lower() != "inapp":
+                try:
+                    await ctx.bot.send_message(t["user_telegram_id"], f"✅ Your support ticket {t['ticket_ref']} has been marked resolved by Samuga Travels.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]))
+                except Exception:
+                    pass
         return True
 
     return False
@@ -548,10 +564,57 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
             ans = "I’m not fully sure about this. Would you like me to connect you with Samuga Travels support?"
         rows = []
         if needs_human_button:
-            rows.append([InlineKeyboardButton("Contact Samuga Team", callback_data="support_human")])
+            rows.append([InlineKeyboardButton("Talk to Human", callback_data="support_human")])
         rows.append([InlineKeyboardButton("Ask another question", callback_data="support_ai_chat")])
         rows.append([InlineKeyboardButton("↩️ Support Menu", callback_data="support_start"), InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")])
         await update.message.reply_text(ans[:3900], reply_markup=InlineKeyboardMarkup(rows))
+        return True
+
+    if state == SUPPORT_HUMAN_CHAT:
+        if not text:
+            return True
+        temp = sd.get("temp_data", {}) or {}
+        ticket_id = int(temp.get("ticket_id", 0) or 0)
+        ticket_ref = temp.get("ticket_ref") or "Support Ticket"
+        if text.lower() in ("end", "close", "cancel", "/cancel", "0", "menu"):
+            pool = await deps["get_pool"]()
+            async with pool.acquire() as conn:
+                t = await conn.fetchrow("""
+                    UPDATE support_tickets SET status='closed', resolved_at=NOW(), updated_at=NOW()
+                    WHERE id=$1 AND user_telegram_id=$2 RETURNING *
+                """, ticket_id, user.id)
+            op = await deps["get_operator"](user.id)
+            role = "operator" if (op and op.get("status") == "approved") else "customer"
+            await deps["set_user_state"](user.id, deps["OP_IDLE"] if role == "operator" else deps["CX_IDLE"], {}, role=role)
+            await update.message.reply_text("✅ Support chat ended. Returning to main menu.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="main_menu")]]))
+            return True
+        if not ticket_id:
+            await update.message.reply_text("Support session could not be found. Please start support again with /support.")
+            return True
+        pool = await deps["get_pool"]()
+        async with pool.acquire() as conn:
+            t = await conn.fetchrow("SELECT id, ticket_ref, status, user_type, user_name FROM support_tickets WHERE id=$1 AND user_telegram_id=$2", ticket_id, user.id)
+            if not t or str(t.get("status") or "").lower() in ("closed", "resolved"):
+                op = await deps["get_operator"](user.id)
+                role = "operator" if (op and op.get("status") == "approved") else "customer"
+                await deps["set_user_state"](user.id, deps["OP_IDLE"] if role == "operator" else deps["CX_IDLE"], {}, role=role)
+                await update.message.reply_text("This support session is already closed. You can start a new one with /support.")
+                return True
+            await conn.execute("""
+                INSERT INTO support_messages (ticket_id, sender_type, sender_telegram_id, message_text)
+                VALUES ($1,$2,$3,$4)
+            """, ticket_id, str(t.get("user_type") or "user"), user.id, text)
+            await conn.execute("UPDATE support_tickets SET status='waiting_admin', updated_at=NOW() WHERE id=$1", ticket_id)
+        try:
+            await ctx.bot.send_message(
+                deps["ADMIN_GROUP_ID"],
+                f"💬 New Telegram support message\n\nTicket: {ticket_ref}\nUser: {_fmt_user(user)}\nTelegram ID: {user.id}\n\n{text}\n\nReply from this topic using the button below.",
+                message_thread_id=deps.get("SUPPORT_THREAD_ID"),
+                reply_markup=_ticket_admin_kb(ticket_id),
+            )
+        except Exception:
+            pass
+        await update.message.reply_text("✅ Sent to Samuga Travels support. We’ll reply here.")
         return True
 
     if state == SUPPORT_AWAIT_ISSUE:
@@ -585,13 +648,19 @@ async def handle_support_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE,
                 INSERT INTO support_messages (ticket_id, sender_type, sender_telegram_id, message_text)
                 VALUES ($1,'admin',$2,$3)
             """, ticket_id, user.id, text)
-        await ctx.bot.send_message(
-            target,
-            f"💬 Samuga Travels Support\n\nTicket: {ticket_ref}\n\n{text}\n\nReply here if you need more help.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("Contact Samuga Team", callback_data="support_human")]]),
-        )
+            trow = await conn.fetchrow("SELECT category FROM support_tickets WHERE id=$1", ticket_id)
+        ticket_category = str((trow or {}).get("category") or temp.get("ticket_category") or "").lower()
+        if ticket_category == "inapp":
+            # Mini App tickets stay inside the Mini App chat. Do not send the user a Telegram DM/card for every admin reply.
+            await update.message.reply_text(f"✅ Reply saved for {ticket_ref}. User will see it inside the Mini App chat.")
+        else:
+            await ctx.bot.send_message(
+                target,
+                f"💬 Samuga Travels Support\n\nTicket: {ticket_ref}\n\n{text}\n\nReply here if you need more help. The support session stays open until our team ends it.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ End Support Chat", callback_data=f"support_user_end_{ticket_id}")]]),
+            )
+            await update.message.reply_text(f"✅ Reply sent to user for {ticket_ref}.")
         await deps["set_user_state"](user.id, deps["CX_IDLE"], {}, role="admin")
-        await update.message.reply_text(f"✅ Reply sent to user for {ticket_ref}.")
         return True
 
     return False
